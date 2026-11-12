@@ -3522,6 +3522,66 @@ hm_m2v_missing(const char *class, const char *selector)
 	hm_print("metal2vulkan: no -[%s %s]\n", class, selector);
 }
 
+/*
+ * The processes shown the device besides the window server: those whose Metal was seen to work (a comma-separated
+ * list; none yet). Upstream HackiOS tried iconservicesagent on iOS 27 (RenderBox's custom effects, CoreImage's stitched
+ * kernels); boot-arg metal_procs=NAME,NAME shows the device to named processes, to work on them one by one, where
+ * metal_all=1 shows it to every process.
+ */
+#define HM_SHOWN        ""
+
+/* whether this process is the window server, the client the CoreAnimation-only parts of this plug-in were made for */
+static bool
+hm_window_server(void)
+{
+	static int is = -1;
+
+	if (is < 0) {
+		const char *name = getprogname();
+
+		is = name != NULL && strcmp(name, "backboardd") == 0;
+	}
+	return is != 0;
+}
+
+/* whether the process NAME is shown the device: the window server, HM_SHOWN, metal_procs=NAME,NAME, or every process
+ * with metal_all=1 (boot-args, then /var/tmp/metal.args) */
+static bool
+hm_shown(const char *name)
+{
+	char args[1024] = "", list[512];
+	size_t size = sizeof(args) - 1;
+	const char *at;
+
+	if (name == NULL) {
+		return false;
+	}
+	if (strcmp(name, "backboardd") == 0) {
+		return true;
+	}
+	if (hm_bootargs(args, &size) != 0) {
+		args[0] = 0;
+	}
+	if (strstr(args, "metal_all=1") != NULL) {
+		return true;
+	}
+	snprintf(list, sizeof(list), "%s", HM_SHOWN);
+	if ((at = strstr(args, "metal_procs=")) != NULL) {
+		size_t used = strlen(list);
+
+		snprintf(list + used, sizeof(list) - used, ",%.*s", (int)strcspn(at + 12, " \n"), at + 12);
+	}
+	for (char *word = list, *next; word != NULL; word = next) {
+		if ((next = strchr(word, ',')) != NULL) {
+			*next++ = 0;
+		}
+		if (*word != 0 && strcmp(word, name) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool
 hm_boot_arg_set(const char *what)
 {
@@ -3533,20 +3593,16 @@ hm_boot_arg_set(const char *what)
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
 {
-	/* (hakios) the window server alone is shown the device: every other client of this image's Metal (SpringBoard
-	 * through SiriUICore, mediaserverd, ...) finds pipeline libraries made for Apple's GPUs with no default.metallib
-	 * beside them and aborts, while without a device it takes the road it takes today. Boot-arg metal_all=1: all. */
+	/* (hakios) the window server is shown the device, and the processes of hm_shown(): every other client of this
+	 * image's Metal (SpringBoard through SiriUICore, mediaserverd, ...) finds pipeline libraries made for Apple's GPUs
+	 * with no default.metallib beside them and aborts, while without a device it takes the road it takes today.
+	 * Boot-arg metal_all=1: all; metal_procs=NAME,NAME: those too. */
 	{
-		static int all = -1;
-		char args[1024] = "";
-		size_t size = sizeof(args) - 1;
 		const char *name = getprogname();
 
-		if (all < 0) {
-			all = hm_bootargs(args, &size) == 0 && strstr(args, "metal_all=1") != NULL;
-		}
-		if (!all && (name == NULL || strcmp(name, "backboardd") != 0)) {
-			HM_ONCE("%s is not shown the device: the window server alone is (metal_all=1: every process)\n", name ? name : "?");
+		if (!hm_shown(name)) {
+			HM_ONCE("%s is not shown the device: the window server is%s%s (metal_all=1: every process; "
+			    "metal_procs=NAME,NAME: those too)\n", name ? name : "?", HM_SHOWN[0] ? ", and " : "", HM_SHOWN);
 			return nil;     /* (not released: before -init, _MTLDevice's -dealloc reads what -init never set) */
 		}
 	}
@@ -4017,6 +4073,9 @@ hm_align(hakios_metal_device *gpu)
 - (NSUInteger)linearTextureAlignmentBytes { return (hm_align(_gpu) & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
 - (NSUInteger)deviceLinearTextureAlignmentBytes { return (hm_align(_gpu) & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
 - (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return (hm_align(_gpu) & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
+/* where a texture over a buffer's bytes (a texture buffer) may start: what the texture processor takes from memory as it
+ * lies, 64 bytes; the zero a missing method returned said any offset would do */
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format { (void)format; return 64; }
 - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
 {
 	struct objc_super up = { self, class_getSuperclass([HakiosMetalDevice class]) };
@@ -9944,7 +10003,9 @@ hm_spec_off(void)
 - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count
 {
 	_specBinding = -1;
-	if (!hm_spec_off() && hakios_metal_program_stage_words(_program, 1) >= 4096) {
+	/* (CoreAnimation's uber shaders, in the window server alone: upstream saw RenderBox's uber_fragment read its buffer 6
+	 * the same way in iconservicesagent, and specialised on it draw icons with pieces missing that its own program draws) */
+	if (!hm_spec_off() && hakios_metal_program_stage_words(_program, 1) >= 4096 && hm_window_server()) {
 		for (unsigned i = 0; i < hakios_metal_program_resource_count(_program, 1); i++) {
 			unsigned kind, index, size;
 
