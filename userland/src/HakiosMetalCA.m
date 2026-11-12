@@ -1498,8 +1498,11 @@ HM_REFUSES_OUT_LOUD
 	NSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */
 	struct hm_ft_rec *_ftrace;               /* metal_trace=frame: this buffer being recorded, else NULL */
 	BOOL _hsr;                               /* metal_hsr: drawn with hidden surface removal by depth */
+	NSMutableArray *_arenas;                 /* HakiosMetalBuffer: the arenas its encoders' small bytes are in (hm_arena_*) */
+	NSUInteger _arenaUsed;                   /* ...of the last of them */
 }
 - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue;
+- (HakiosMetalBuffer *)hakiosArenaBytes:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset;
 - (void)hakiosTurnAtCommit:(id)texture;
 - (hakios_metal_cb *)hakiosCommandBuffer;
 - (double)hakiosCreatedAt;
@@ -7166,7 +7169,72 @@ HM_REFUSES_OUT_LOUD
  * The command buffer: hakios-metal's, with Metal's handlers and slot bookkeeping around it
  * ============================================================================================================ */
 
+/*
+ * Small bytes for a stage -- -setVertexBytes:, -setFragmentBytes:, -setBytes: -- in arenas of HM_ARENA_BYTES that a
+ * command buffer takes from a pool and gives back when it is freed, its GPU work done (hakios_metal_cb_free waits for one
+ * in flight). Each had a buffer of its own before, made through the kernel (upstream HackiOS measured about a
+ * millisecond each on its phone, and 520-546 buffers in 2 s once CoreAnimation's path rectangles came this way).
+ */
+#define HM_ARENA_BYTES (64 * 1024)
+#define HM_ARENA_ALIGN 256          /* (as a constant buffer's binding wants it) */
+#define HM_ARENA_POOL 32
+static pthread_mutex_t hm_arena_lock = PTHREAD_MUTEX_INITIALIZER;
+static NSMutableArray *hm_arena_pool;
+
+/* an arena, retained: the pool's or a new one */
+static HakiosMetalBuffer *
+hm_arena_take(id<MTLDevice> device)
+{
+	HakiosMetalBuffer *arena = nil;
+
+	pthread_mutex_lock(&hm_arena_lock);
+	if ([hm_arena_pool count] != 0) {
+		arena = [[hm_arena_pool lastObject] retain];
+		[hm_arena_pool removeLastObject];
+	}
+	pthread_mutex_unlock(&hm_arena_lock);
+	return arena != nil ? arena : [device newBufferWithLength:HM_ARENA_BYTES options:0];
+}
+
+static void
+hm_arenas_give(NSArray *arenas)
+{
+	pthread_mutex_lock(&hm_arena_lock);
+	if (hm_arena_pool == nil) hm_arena_pool = [[NSMutableArray alloc] init];
+	for (HakiosMetalBuffer *arena in arenas) {
+		if ([hm_arena_pool count] < HM_ARENA_POOL) [hm_arena_pool addObject:arena];
+	}
+	pthread_mutex_unlock(&hm_arena_lock);
+}
+
 @implementation HakiosMetalCommandBuffer
+
+/* LENGTH bytes copied into this buffer's arena: the arena, and where in it at *OFFSET; nil for more than an arena holds
+ * or with metal_arena=0 (the caller makes a buffer of its own then) */
+- (HakiosMetalBuffer *)hakiosArenaBytes:(const void *)bytes length:(NSUInteger)length offset:(NSUInteger *)offset
+{
+	static int off = -1;
+	const NSUInteger room = (length + HM_ARENA_ALIGN - 1) & ~(NSUInteger)(HM_ARENA_ALIGN - 1);
+	HakiosMetalBuffer *arena;
+
+	if (off < 0) off = hm_boot_arg_set("metal_arena=0") ? 1 : 0;
+	if (off || length == 0 || room > HM_ARENA_BYTES) return nil;
+	@synchronized (self) {
+		arena = [_arenas lastObject];
+		if (arena == nil || _arenaUsed + room > HM_ARENA_BYTES) {
+			arena = hm_arena_take([self device]);
+			if (arena == nil) return nil;
+			if (_arenas == nil) _arenas = [[NSMutableArray alloc] init];
+			[_arenas addObject:arena];
+			[arena release];
+			_arenaUsed = 0;
+		}
+		*offset = _arenaUsed;
+		_arenaUsed += room;
+	}
+	memcpy((uint8_t *)[arena contents] + *offset, bytes, length);
+	return arena;
+}
 
 /* _MTLCommandBuffer declares conformance to nothing, and MPSCommandBufferImageCache tests conformsToProtocol: before it
  * asks the buffer anything else; a NO there ended mediaserverd 59 times. */
@@ -7249,6 +7317,9 @@ HM_REFUSES_OUT_LOUD
 	if (_cb != NULL) {
 		hakios_metal_cb_free(_cb);   /* one in flight is waited for inside; one completed is not */
 	}
+	/* (its GPU work is over now: the arenas may be written again) */
+	if (_arenas != nil) hm_arenas_give(_arenas);
+	[_arenas release];
 	[_scheduled release];
 	[_completed release];
 	[_signals release];
@@ -9606,6 +9677,13 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
  * buffer is the encoder's until -endEncoding; hakios-metal keeps it alive past that until the GPU is done with it. */
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
+	NSUInteger at = 0;
+	HakiosMetalBuffer *arena = [_commandBuffer hakiosArenaBytes:bytes length:length offset:&at];
+
+	if (arena != nil) {
+		[self setBuffer:arena offset:at atIndex:index];
+		return;
+	}
 	HakiosMetalBuffer *buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
 
 	if (buffer == nil) {
@@ -10515,7 +10593,14 @@ hm_spec_queue(void)
 /* Metal's shorthand for small constant data: a buffer here, because that is what a stage's binding is. The scratch buffer
  * is the encoder's until -endEncoding; hakios-metal keeps it alive past that until the GPU is done with it. */
 - (HakiosMetalBuffer *)hakiosScratch:(const void *)bytes length:(NSUInteger)length stage:(const char *)stage index:(NSUInteger)index
+			      offset:(NSUInteger *)offset
 {
+	HakiosMetalBuffer *arena = [_commandBuffer hakiosArenaBytes:bytes length:length offset:offset];
+
+	if (arena != nil) {
+		return arena;
+	}
+	*offset = 0;
 	HakiosMetalBuffer *buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
 
 	if (buffer == nil) {
@@ -10532,19 +10617,21 @@ hm_spec_queue(void)
 
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	HakiosMetalBuffer *buffer = [self hakiosScratch:bytes length:length stage:"vertex" index:index];
+	NSUInteger offset = 0;
+	HakiosMetalBuffer *buffer = [self hakiosScratch:bytes length:length stage:"vertex" index:index offset:&offset];
 
 	if (buffer != nil) {
-		[self setVertexBuffer:buffer offset:0 atIndex:index];
+		[self setVertexBuffer:buffer offset:offset atIndex:index];
 	}
 }
 
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	HakiosMetalBuffer *buffer = [self hakiosScratch:bytes length:length stage:"fragment" index:index];
+	NSUInteger offset = 0;
+	HakiosMetalBuffer *buffer = [self hakiosScratch:bytes length:length stage:"fragment" index:index offset:&offset];
 
 	if (buffer != nil) {
-		[self setFragmentBuffer:buffer offset:0 atIndex:index];
+		[self setFragmentBuffer:buffer offset:offset atIndex:index];
 	}
 }
 
