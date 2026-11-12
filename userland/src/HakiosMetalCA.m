@@ -3946,6 +3946,18 @@ hm_print_callers(const char *what)
 /* true of this SoC: the GPU reads the same DRAM the processor does, and every buffer here is mapped on both sides */
 - (BOOL)hasUnifiedMemory { return YES; }
 
+/* CoreImage sizes its caches by these two (asked in iconservicesagent at its first context): all of the phone's memory
+ * is shared with the GPU and none of it is the GPU's alone, as hasUnifiedMemory says. The zeros a missing method gave
+ * told it the GPU had no memory at all. */
+- (uint64_t)sharedMemorySize
+{
+	uint64_t bytes = 0;
+	size_t size = sizeof(bytes);
+
+	return sysctlbyname("hw.memsize", &bytes, &size, NULL, 0) == 0 ? bytes : 0;
+}
+- (uint64_t)dedicatedMemorySize { return 0; }
+
 /* Where a texture's rows lie in memory this device did not lay out -- an IOSurface, a buffer -- they must start at a
  * multiple of 64 bytes and be a multiple of 64 bytes apart: the a6xx reads a texture's pitch and writes a render
  * target's in 64-byte units (hakios-metal's texture.cpp: wrapSurface, overBuffer). These are the device's answers to
