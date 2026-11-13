@@ -86,8 +86,11 @@ std::shared_ptr<Buffer> newBufferNoCopy(Gpu& gpu, void* bytes, uint64_t length, 
 std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset);
 // IOSurface SURFACE_ID's memory as a Buffer, *INFO what the kernel says of the surface. One Buffer per surface while it
 // lives: a second ask for the same surface gets the same Buffer (the kernel's handle for it is one), so that the
-// handle is closed once, by the last owner. nullptr with *why.
+// handle is closed once, by the last owner. The last four wrapped are kept past their last user, a surface wrapped
+// again then answered without the kernel (the window server wraps its display's page anew every frame). nullptr with *why.
 std::shared_ptr<Buffer> surfaceBuffer(Gpu& gpu, uint32_t surfaceId, SurfaceInfo* info, std::string* why);
+// B, which surfaceBuffer gave for a texture that was then refused, not kept for the next wrap
+void forgetSurfaceBuffer(const Gpu* gpu, const std::shared_ptr<Buffer>& b);
 
 // A depth of setHsr's keeps its contents from pass to pass (anexo 32/03 P1): its Z levels are handed out in one
 // decreasing run over all the passes drawn with it, so what an earlier pass left there is always behind (a larger Z)
