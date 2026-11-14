@@ -9,6 +9,8 @@ Q draws 108 refused 0 submits 1 words 764538 loads 13846 stream d698bc618ddb8101
 R draws 108 refused 0 submits 1 words 4939 loads 432 stream acf5e230f050aa3e state f90a178aa327c3f2 names 34 1745727537486b27
 G draws 1 refused 0 submits 1 words 602 loads 4 stream 70b09a33bff42227 state f7616e282bf666a6 names 6 5fa93d36f82a0959
 H draws 1 refused 0 submits 1 words 654 loads 4 stream 03f40241a9bc8e8f state f7616e282bf666a6 names 6 5fa93d36f82a0959
+V draws 7 refused 0 submits 1 words 812 loads 28 stream 8109cdf8335272b7 state 40b4d36d85dac543 names 12 b76caaacc36efe2c
+W draws 7 refused 0 submits 1 words 38182 loads 774 stream 51532e0a6802940e state ecbafb20949de800 names 13 7577c36a0f68970a
 J draws 20 refused 0 submits 1 words 1508 loads 76 stream 000c0e69e22f980d state 57cf1cdb921b5d8b names 29 e691fe78504f6547
 K draws 110 refused 0 submits 1 words 1076337 loads 20540 stream b2756b1fb08745b9 state a942c0d9e9c42add names 43 16baf0bd0ce02d8d
 L draws 110 refused 0 submits 1 words 5953 loads 404 stream 1100c23193797e7b state 32718647260908a1 names 42 edf0cac69d2bc050
