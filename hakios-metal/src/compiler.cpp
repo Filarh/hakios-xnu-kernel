@@ -249,8 +249,21 @@ struct Translation {
 // AIR to NIR: the front end, with the module's function constants as the pipeline supplied them (the rest not
 // supplied: the front end tells the module so, and reads them as zero)
 // a load of the known buffer at a constant offset inside its bytes: those bytes, as the load's components
+// (what compileStage did for this thread: takeCompileTimes)
+thread_local CompileTimes tCompileTimes;
+double microsecondsSince(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
+}
+void noteFrontEnd(std::chrono::steady_clock::time_point began) { tCompileTimes.frontEndUs += microsecondsSince(began); }
+void noteFolded(std::chrono::steady_clock::time_point began) { tCompileTimes.foldedUs += microsecondsSince(began); }
+
+struct KnownFold {
+    const KnownBuffer* known;
+    std::vector<uint8_t>* reads;   // (as long as the known bytes) 0xff where a load was folded, when asked for
+};
 bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
-    const KnownBuffer* known = static_cast<const KnownBuffer*>(data);
+    const KnownFold* fold = static_cast<const KnownFold*>(data);
+    const KnownBuffer* known = fold->known;
     if (intr->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(intr->src[0]) || !nir_src_is_const(intr->src[1])) return false;
     if (nir_src_as_uint(intr->src[0]) != known->binding) return false;
     const unsigned bits = intr->def.bit_size, comps = intr->def.num_components;
@@ -262,12 +275,16 @@ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
         memcpy(&v, known->bytes.data() + at + c * (bits / 8), bits / 8);   // (little-endian, as the GPU reads it)
         values[c] = nir_const_value_for_raw_uint(v, bits);
     }
+    if (fold->reads != nullptr && fold->reads->size() == known->bytes.size()) {
+        for (uint64_t i = at; i < at + uint64_t(comps) * (bits / 8); i++) (*fold->reads)[size_t(i)] = 0xff;
+    }
     b->cursor = nir_before_instr(&intr->instr);
     nir_def_replace(&intr->def, nir_build_imm(b, comps, bits, values));
     return true;
 }
 
-bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr) {
+bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr,
+               std::vector<uint8_t>* reads = nullptr) {
     t.mem = ralloc_context(nullptr);
     air_constant_value* constants = nullptr;
     unsigned numConstants = air_module_function_constants(t.mem, bitcode, size, &constants);
@@ -283,18 +300,23 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
     options.constants = constants;
     options.num_constants = numConstants;
     const char* error = nullptr;
+    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
     t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &t.info, &error);
+    noteFrontEnd(began);
     if (t.nir == nullptr) return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
     // the known buffer's reads folded, its offsets folded first (a field's offset is the front end's arithmetic on the
     // pointer), until nothing more folds: a value read may decide the offset of another read
     // (called directly, not under NIR_PASS: a debug build validates the whole shader after each, and an uber shader
     // takes rounds of this. nir_copy_prop's own answer does not count: on CoreAnimation's uber shader it says it made
     // progress every time, 21 000 rounds and on)
+    KnownFold fold{known, reads};
+    const std::chrono::steady_clock::time_point folding = std::chrono::steady_clock::now();
     for (bool progress = known != nullptr; progress;) {
         nir_copy_prop(t.nir);
         progress = nir_opt_constant_folding(t.nir);
-        progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, &fold) || progress;
     }
+    if (known != nullptr) noteFolded(folding);
     return true;
 }
 
@@ -1100,7 +1122,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known);
+                                                const KnownBuffer* known, std::vector<uint8_t>* reads);
 }  // namespace
 
 // A stage compiled as turnip compiles it, unless that spills: ir3's preamble pass hoists what is uniform into a
@@ -1279,10 +1301,6 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
 }  // namespace
 
 namespace {
-thread_local CompileTimes tCompileTimes;
-double microsecondsSince(std::chrono::steady_clock::time_point t) {
-    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
-}
 // a stage of that name in the writable cache or in a seed, or nullptr
 std::unique_ptr<CompiledStage> stageCacheFind(const std::string& name, const std::string& cached) {
     if (!cached.empty()) {
@@ -1299,6 +1317,81 @@ std::unique_ptr<CompiledStage> stageCacheFind(const std::string& name, const std
         }
     }
     return nullptr;
+}
+}  // namespace
+
+namespace {
+// The known buffers a function was compiled for, kept beside its stages: one file a function (its bitcode, constants,
+// IBO base, the buffer's binding and length), a record a compilation -- the bytes the compilation read (a mask), their
+// values, and the name of the stage's file. A buffer that holds those values where the mask is set is that stage.
+std::string knownIndexName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer& known) {
+    KnownBuffer shape;
+    shape.binding = known.binding;
+    const uint32_t length = uint32_t(known.bytes.size());
+    shape.bytes.assign(reinterpret_cast<const uint8_t*>(&length), reinterpret_cast<const uint8_t*>(&length) + 4);
+    std::string name = stageCacheName(bitcode, size, constants, iboBase, &shape);
+    if (name.size() > 6) name.replace(name.size() - 6, 6, ".known");   // (".stage")
+    return name;
+}
+constexpr size_t kStageNameBytes = 40;   // "/" + 32 hex digits + ".stage", and the rest zeros
+
+std::unique_ptr<CompiledStage> knownIndexFind(const std::string& dir, const std::string& index, const KnownBuffer& known) {
+    if (dir.empty() || index.empty()) return nullptr;
+    FILE* f = fopen((dir + index).c_str(), "rb");
+    if (f == nullptr) return nullptr;
+    std::string data;
+    char chunk[16384];
+    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data.append(chunk, n);
+    fclose(f);
+    const size_t length = known.bytes.size(), record = 2 * length + kStageNameBytes;
+    for (size_t at = 0; length != 0 && at + record <= data.size(); at += record) {
+        const uint8_t* mask = reinterpret_cast<const uint8_t*>(data.data()) + at;
+        const uint8_t* values = mask + length;
+        bool same = true;
+        for (size_t i = 0; same && i < length; i++) same = ((known.bytes[i] ^ values[i]) & mask[i]) == 0;
+        if (!same) continue;
+        char name[kStageNameBytes + 1] = {};
+        memcpy(name, values + length, kStageNameBytes);
+        if (name[0] != '/' || strchr(name + 1, '/') != nullptr) continue;   // (a file of this directory, nothing else)
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) {
+            s->knownReads.assign(mask, mask + length);
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+// in the writable cache, then in each seed
+std::unique_ptr<CompiledStage> knownIndexFindAnywhere(const std::string& index, const KnownBuffer& known) {
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir != nullptr && dir[0] != 0) {
+        if (std::unique_ptr<CompiledStage> s = knownIndexFind(dir, index, known)) return s;
+    }
+    const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+    for (const char* p = seed; p != nullptr && *p != 0;) {
+        const char* colon = strchr(p, ':');
+        const std::string d(p, colon != nullptr ? size_t(colon - p) : strlen(p));
+        p = colon != nullptr ? colon + 1 : nullptr;
+        if (std::unique_ptr<CompiledStage> s = knownIndexFind(d, index, known)) return s;
+    }
+    return nullptr;
+}
+
+// one record more, in the writable cache: written whole in one append, so that two processes' records do not mix
+void knownIndexNote(const std::string& index, const KnownBuffer& known, const std::vector<uint8_t>& reads, const std::string& stageName) {
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir == nullptr || dir[0] == 0 || index.empty() || stageName.empty() || stageName.size() > kStageNameBytes ||
+        reads.size() != known.bytes.size()) {
+        return;
+    }
+    std::string record(reinterpret_cast<const char*>(reads.data()), reads.size());
+    for (size_t i = 0; i < known.bytes.size(); i++) record.push_back(char(known.bytes[i] & reads[i]));
+    record.append(stageName);
+    record.append(kStageNameBytes - stageName.size(), char(0));
+    FILE* f = fopen((std::string(dir) + index).c_str(), "ab");
+    if (f == nullptr) return;
+    fwrite(record.data(), 1, record.size(), f);
+    fclose(f);
 }
 }  // namespace
 
@@ -1319,7 +1412,17 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
     const std::string cached = stageCacheWritable(name);
-    if (std::unique_ptr<CompiledStage> s = stageCacheFind(name, cached)) {
+    // (for a known buffer: the stages compiled for buffers that hold what this one holds where it matters)
+    const std::string index = known != nullptr && !name.empty() ? knownIndexName(bitcode, size, constants, iboBase, *known) : std::string();
+    auto found = [&]() -> std::unique_ptr<CompiledStage> {
+        if (std::unique_ptr<CompiledStage> s = stageCacheFind(name, cached)) {
+            // (filed under the very bytes, by a build that kept no reads: it stands for these bytes and no others)
+            if (known != nullptr) s->knownReads.assign(known->bytes.size(), 0xff);
+            return s;
+        }
+        return known != nullptr ? knownIndexFindAnywhere(index, *known) : nullptr;
+    };
+    if (std::unique_ptr<CompiledStage> s = found()) {
         tCompileTimes.cached++;
         tCompileTimes.loadedUs += microsecondsSince(began);
         return s;
@@ -1329,29 +1432,35 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     std::lock_guard<std::mutex> g(gCompilerLock);
     tCompileTimes.waitedUs += microsecondsSince(asked);
     // (while this thread waited another may have compiled the very stage: its file is there now)
-    if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
-            tCompileTimes.cached++;
-            return s;
-        }
+    if (std::unique_ptr<CompiledStage> s = found()) {
+        tCompileTimes.cached++;
+        return s;
     }
     const std::chrono::steady_clock::time_point compiling = std::chrono::steady_clock::now();
     if (theCompiler() == nullptr) {
         refuse(why, "ir3 has no compiler for chip 0x06030500");
         return nullptr;
     }
-    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
+    std::vector<uint8_t> reads(known != nullptr ? known->bytes.size() : 0, 0), readsWithout = reads;
+    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known, known != nullptr ? &reads : nullptr);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
         chosen = std::move(with);
     } else {
         theCompiler()->has_preamble = false;
         std::string whyNot;
-        std::unique_ptr<CompiledStage> without = compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known);
+        std::unique_ptr<CompiledStage> without =
+            compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known, known != nullptr ? &readsWithout : nullptr);
         theCompiler()->has_preamble = true;
+        // (the folding comes before the preamble pass: both compilations read the same bytes; their union, to be sure)
+        for (size_t i = 0; i < reads.size(); i++) reads[i] |= readsWithout[i];
         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
     }
     if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
+    if (chosen != nullptr && known != nullptr) {
+        chosen->knownReads = reads;
+        if (!cached.empty()) knownIndexNote(index, *known, reads, name);
+    }
     tCompileTimes.compiled++;
     tCompileTimes.compiledUs += microsecondsSince(compiling);
     return chosen;
@@ -1361,9 +1470,9 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known) {
+                                                const KnownBuffer* known, std::vector<uint8_t>* reads) {
     Translation t;
-    if (!translate(bitcode, size, t, why, constants, known)) return nullptr;
+    if (!translate(bitcode, size, t, why, constants, known, reads)) return nullptr;
     // the stage is the module's named metadata (air.vertex / air.fragment / air.kernel: air_to_nir.c module_stage)
     const std::string name = t.info.entry_point ? t.info.entry_point : "the function";
     switch (t.nir->info.stage) {

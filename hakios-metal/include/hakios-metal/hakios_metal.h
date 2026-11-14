@@ -291,6 +291,11 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
  * descriptor and sample count come with it. NULL with the reason. */
 hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
+/* Which of the bytes a specialised PROGRAM was compiled for decided anything: MASK[i] 0xff for a byte its compilation
+ * read, 0 for one it did not (a structure's padding, a field no branch taken looks at). A buffer that holds the same
+ * bytes where the mask is set is drawn by this very program. Writes at most LENGTH bytes and returns how many the
+ * program has; 0 for a program that was not specialised, or NULL. */
+unsigned hakios_metal_program_known_reads(hakios_metal_program *program, unsigned char *mask, unsigned length);
 /* What making programs cost the calling thread since it last asked (the counts start again): the stages asked for,
  * those read from the stage cache and those compiled, and the microseconds spent waiting for the compiler while
  * another thread compiled, reading cached stages, and compiling. Any pointer may be NULL. */

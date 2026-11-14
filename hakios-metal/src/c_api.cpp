@@ -1268,6 +1268,13 @@ hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const St
 
 extern "C" {
 
+unsigned hakios_metal_program_known_reads(hakios_metal_program* p, unsigned char* mask, unsigned length) {
+    if (p == nullptr || p->program == nullptr || p->program->fs == nullptr) return 0;
+    const std::vector<uint8_t>& reads = p->program->fs->knownReads;
+    if (mask != nullptr) memcpy(mask, reads.data(), std::min<size_t>(length, reads.size()));
+    return unsigned(reads.size());
+}
+
 void hakios_metal_compile_times(unsigned* stages, unsigned* cached, unsigned* compiled, double* waitedUs, double* loadedUs, double* compiledUs) {
     const CompileTimes t = takeCompileTimes();
     if (stages != nullptr) *stages = t.stages;

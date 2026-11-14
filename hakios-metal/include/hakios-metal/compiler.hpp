@@ -91,6 +91,11 @@ struct CompiledStage {
     bool writesMemory = true;                // the NIR stores to or does atomics on a device buffer (or global memory); false only when it was looked at and does not
     std::string name;
     std::string listing;
+    // A stage compiled for a KnownBuffer: the bytes of it the compilation read, 0xff each, and 0 for those that decided
+    // nothing -- any buffer that holds the same bytes where this is 0xff compiles to this very stage. As long as the
+    // KnownBuffer's bytes; empty for a stage compiled for none, and all 0xff for one whose reads are not known (a file
+    // of the cache from before they were kept: it stands for exactly the bytes it was compiled for).
+    std::vector<uint8_t> knownReads;
 };
 
 // a VS and an FS linked for one colour format (render.hpp's Program), owning both stages
@@ -130,6 +135,11 @@ using FunctionConstants = std::vector<FunctionConstant>;
 // buffer at constant offsets inside BYTES compiled as those values, so that the branches they decide are decided once,
 // here, rather than in every fragment. CoreAnimation's uber shader (fixed_frag_lph_cpf) picks its path through 15 000
 // instructions by the 52 bytes of its FragmentShaderConfig: compiled for one configuration it is 16 to 48 instructions.
+// The stage depends on the bytes the compilation read and on no others (CompiledStage::knownReads): a structure's
+// padding, which whoever fills the buffer leaves as it was, decides nothing. The cache files a stage compiled for a
+// KnownBuffer under what it read: a buffer that differs in the rest alone is found there, not compiled again (the
+// phone's cache held one stage of CoreAnimation's 377 times over, each compiled for its own three bytes of garbage
+// after the last field).
 struct KnownBuffer {
     uint32_t binding = 0;
     std::vector<uint8_t> bytes;
@@ -143,6 +153,9 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
 struct CompileTimes {
     uint32_t stages = 0, cached = 0, compiled = 0;
     double waitedUs = 0, loadedUs = 0, compiledUs = 0;
+    // ...and of the compiling: the front end (AIR to NIR) and the folding of a known buffer's reads; the rest is the
+    // lowering and ir3
+    double frontEndUs = 0, foldedUs = 0;
 };
 CompileTimes takeCompileTimes();
 // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
