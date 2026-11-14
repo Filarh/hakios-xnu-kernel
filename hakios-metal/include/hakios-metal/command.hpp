@@ -164,7 +164,12 @@ public:
     // what each costs, beside what it was (a draw pass with its target's size and its draws, a copy, a clear, a
     // dispatch). Read once the buffer has completed. metal_fps names a frame's slowest passes with it.
     enum PassKind : uint32_t { kPassDraw = 0, kPassCopy = 1, kPassClear = 2, kPassDispatch = 3 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+    // (TOUCHED: the attachments a tiled pass's draws write or read, as a mask, and above them what the pass was tiled
+    // for -- kPassReads a draw reads its target, kPassBelowBar tiled with fewer draws than the bar for what it holds
+    // (render::gmemWorth), kPassNoLoad its tiles load nothing: what the plug-in's passes and timeline lines print as
+    // "touched")
+    enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
