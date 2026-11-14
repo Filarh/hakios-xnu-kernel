@@ -6365,6 +6365,108 @@ TEST(a_pass_gives_gmem_to_the_attachments_its_draws_touch) {
 
 // The VSC's pipes: the bins of a grid grouped as fd's gmem layout groups them, and no binning at all when a pipe would
 // hold more than the 32 bins CP_SET_BIN_DATA5 can name.
+// A memoryless attachment (MTLStorageModeMemoryless: CoreAnimation's second colour attachment, which its draws write
+// and read back by framebuffer fetch inside the pass, with the store action a colour attachment has by default: Store)
+// lives in the tiles: none of them loads it and none stores it, and its rows in memory are left as they were. The
+// same texture without the storage mode is stored by every tile, as the pass asks. Where one pass of the caller's is
+// recorded as two -- a draw that cannot join the open pass, with Load on every attachment as the plug-in gives every
+// draw of an encoder after its first -- the first half stores it and the second loads it; the second half's end is
+// the pass's.
+TEST(a_memoryless_attachment_is_neither_loaded_nor_stored_by_the_tiles) {
+    const Program mrt{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"};
+    for (int memoryless = 0; memoryless < 2; memoryless++) {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        u->setMemoryless(memoryless != 0);
+        fillCoords(*u, 0x80000000u);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        a.more[0].load = LoadAction::kDontCare;   // (Metal's defaults for a colour attachment)
+        a.more[0].store = StoreAction::kStore;
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        RenderPass later = a;
+        later.load = later.more[0].load = LoadAction::kLoad;
+        CHECK(cb->draw(mrt, later, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto s = r.fake->stats();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(s.faults, 0u);
+        if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+        CHECK_EQ(s.tiles, both.tiles());
+        CHECK_EQ(s.tileLoads, both.tiles());                              // the first attachment's alone, either way
+        CHECK_EQ(s.tileStores, (memoryless ? 1u : 2u) * both.tiles());
+        CHECK_EQ(s.storedPixels, (memoryless ? 1u : 2u) * s.loadedPixels);
+        CHECK((coordsWrong(*u, 0x80000000u) == 0) == (memoryless != 0));   // its rows: untouched, or the tiles' stores
+        const auto times = cb->passTimes();
+        CHECK_EQ(times.size(), size_t(1));
+        if (times.size() == 1) CHECK(times[0].wrote == 3 && times[0].loaded == 1 && times[0].stored == (memoryless ? 1 : 3));
+    }
+    // one pass of the caller's in two here: the second draw's options are another's, and it cannot join
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        u->setMemoryless(true);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        a.more[0].load = LoadAction::kDontCare;
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        RenderPass later = a;
+        later.load = later.more[0].load = LoadAction::kLoad;
+        render::Options binned;
+        binned.gmemBinning = true;
+        CHECK(cb->draw(mrt, later, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto s = r.fake->stats();
+        CHECK(cb->status() == CommandBuffer::kCompleted && s.faults == 0);
+        if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+        CHECK_EQ(s.tiles, 2 * both.tiles());
+        CHECK_EQ(s.tileStores, 3 * both.tiles());   // both attachments by the first half, the first alone by the second
+        CHECK_EQ(s.tileLoads, 3 * both.tiles());    // the first alone by the first half, both by the second
+        const auto times = cb->passTimes();
+        CHECK_EQ(times.size(), size_t(2));
+        if (times.size() == 2) CHECK(times[0].loaded == 1 && times[0].stored == 3 && times[1].loaded == 3 && times[1].stored == 1);
+    }
+    // ...and a pass that begins anew on the same textures (its attachment DontCare again) is owed nothing by the one before
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        u->setMemoryless(true);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        a.more[0].load = LoadAction::kDontCare;
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        render::Options binned;
+        binned.gmemBinning = true;
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto s = r.fake->stats();
+        CHECK(cb->status() == CommandBuffer::kCompleted && s.faults == 0);
+        CHECK_EQ(s.tiles, 2 * both.tiles());
+        CHECK_EQ(s.tileStores, 2 * both.tiles());
+        CHECK_EQ(s.tileLoads, 2 * both.tiles());
+    }
+}
+
 TEST(a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned) {
     render::GmemPlan p;
     uint32_t x = 0, y = 0;

@@ -546,6 +546,12 @@ hakios_metal_texture* hakios_metal_texture_new_levels(hakios_metal_device* d, un
     return r;
 }
 
+void hakios_metal_texture_set_memoryless(hakios_metal_texture* t, int memoryless) {
+    if (t != nullptr) t->texture->setMemoryless(memoryless != 0);
+}
+
+int hakios_metal_texture_memoryless(hakios_metal_texture* t) { return t != nullptr && t->texture->memoryless() ? 1 : 0; }
+
 unsigned hakios_metal_texture_origin(hakios_metal_texture* t) {
     const Texture& x = *t->texture;
     return x.compressed() ? 3 : x.overBufferRows() ? 2 : x.surface() != 0 ? 1 : 0;
@@ -984,6 +990,15 @@ int hakios_metal_cb_pass_access(hakios_metal_cb* cb, unsigned i, unsigned* wrote
     if (i >= t.size()) return -1;
     *wrote = t[i].wrote;
     *read = t[i].read;
+    return 0;
+}
+
+int hakios_metal_cb_pass_moved(hakios_metal_cb* cb, unsigned i, unsigned* loaded, unsigned* stored) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    if (i >= t.size()) return -1;
+    *loaded = t[i].loaded;
+    *stored = t[i].stored;
     return 0;
 }
 

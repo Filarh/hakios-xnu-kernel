@@ -132,6 +132,11 @@ hakios_metal_texture *hakios_metal_texture_new(hakios_metal_device *device, unsi
  * sampled and never drawn into or written by a kernel. NULL with the reason. */
 hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
     unsigned usage);
+/* MTLStorageModeMemoryless: TEXTURE's contents exist only while a render pass draws into it. It keeps its rows (a pass
+ * drawn in sysmem draws into them); the tiles of a GMEM pass neither load nor store it, whatever load and store actions
+ * the pass names for it. Set before the texture is first attached. */
+void hakios_metal_texture_set_memoryless(hakios_metal_texture *texture, int memoryless);
+int hakios_metal_texture_memoryless(hakios_metal_texture *texture);
 /* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own) */
 unsigned hakios_metal_texture_origin(hakios_metal_texture *texture);
 /* ...of LEVELS mip levels (MTLTextureDescriptor.mipmapLevelCount: 1 to floor(log2(max(width, height))) + 1) */
@@ -508,6 +513,8 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *
 /* ...and of a tiled pass, apart: the attachments its draws' fragment stages have an output for (WROTE) and those a draw
  * reads through framebuffer fetch (READ), as masks; -1 past the profiled passes */
 int hakios_metal_cb_pass_access(hakios_metal_cb *cb, unsigned i, unsigned *wrote, unsigned *read);
+/* the attachments the tiles of profiled pass I loaded and stored, as masks (0 and 0 for a sysmem pass); -1 past the passes */
+int hakios_metal_cb_pass_moved(hakios_metal_cb *cb, unsigned i, unsigned *loaded, unsigned *stored);
 int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);
 /* why CB's last pass refused for GMEM was refused ("" when none was); valid while CB lives */
 const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);

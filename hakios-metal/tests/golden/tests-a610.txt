@@ -281,6 +281,7 @@ draw_state_groups_give_each_draw_that_runs_the_state_the_plain_stream_gives_it s
 the_twins_of_the_draw_state_groups_show submits 8 words 253563 draws 1275 loads 3800 stream 1175313443c1f0fb state fc5f1d947f4170f3 names 86 03f88d6dca514ea9
 bins_laid_from_the_render_areas_corner_are_not_the_vscs submits 2 words 3097 draws 10 loads 10 stream 7cd25ae192e2a72f state 16abf57547b8731c names 10 92ae1a2586e14416
 a_pass_gives_gmem_to_the_attachments_its_draws_touch submits 8 words 215546 draws 676 loads 1180 stream 9defd63235c719a4 state aaa025495783bbd5 names 42 ff850aa65d41c62c
+a_memoryless_attachment_is_neither_loaded_nor_stored_by_the_tiles submits 4 words 204114 draws 626 loads 1252 stream edc7dc8b2239c4f8 state 1b680b28b92a9375 names 25 ddc97120730bece7
 a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        24 tiles: waits for idle with the barrier a group 80, in the stream 106, the plain stream 106, every draw ordered 56
 a_fetchs_barrier_runs_where_a_tile_draws_the_fetch submits 5 words 109840 draws 500 loads 1300 stream 003ad3c00efcbda5 state c2bc8fdaa4cf0a01 names 30 7b3e8fd04d1dff98

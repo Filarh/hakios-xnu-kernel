@@ -299,6 +299,14 @@ public:
     // layer size in bytes, and its blocks across and down as log2 (fdl_layout's)
     bool compressed() const { return ubwc_; }
     bool overBufferRows() const { return overBuffer_; }
+    // MTLStorageModeMemoryless: a render target whose contents exist only while a pass draws into it, undefined before
+    // the pass and after it. It has rows like any other texture (a pass drawn in sysmem draws into them); the tiles of a
+    // GMEM pass neither load nor store it, whatever the pass's actions say for it (a colour attachment's default store
+    // action is Store, and that is what CoreAnimation leaves on the one it reads back by framebuffer fetch) -- except
+    // where one pass of the caller's is recorded as two here, and the second has to find what the first drew
+    // (CommandBuffer::closePass). Set once, before the texture is first attached.
+    bool memoryless() const { return memoryless_; }
+    void setMemoryless(bool on) { memoryless_ = on; }
     uint64_t flagAddress() const { return buffer_->gpuAddress() + ubwcOffset_; }
     uint32_t flagPitch() const { return ubwcPitch_; }
     uint32_t flagLayerSize() const { return ubwcLayerSize_; }
@@ -363,6 +371,7 @@ private:
     static std::shared_ptr<Texture> adopt(Texture* t);   // every Texture is made through this: its id, and the registry
     SurfacePlane chroma_{0, 0};   // a two-plane format's second plane, in the buffer
     bool overBuffer_ = false;     // made by overBuffer: its rows a Buffer's, which the CPU writes as it likes
+    bool memoryless_ = false;     // setMemoryless
     bool ubwc_ = false;           // TextureDesc::compressed: TILE6_3 and a flag buffer
     // ...and the linear rows this processor writes and reads (replace, read): copied into the compressed layout by the
     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
