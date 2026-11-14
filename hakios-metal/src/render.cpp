@@ -3412,6 +3412,7 @@ void CommandBuffer::closePass() {
     // (the tiles over the render area alone unless the bisect or a Clear in the tiles has them over the whole window)
     const bool overArea = open_->area[0] <= open_->area[2] && open_->area[1] <= open_->area[3] && !(gmemOff_ & kGmemWholeArea) && open_->clears == 0;
     uint32_t noted = open_->draws;
+    bool belowBar = false;   // (tiled with fewer draws than the bar, for what the pass holds)
     if (open_->dual) {
         // Recorded both ways: the tiles or the sysmem words, head and all, by what the pass turned out to hold
         // (render::gmemWorth) -- or by its draws against the bar alone, the bisect's kGmemByDrawsAlone.
@@ -3438,6 +3439,7 @@ void CommandBuffer::closePass() {
             // (a pass tiled for what it holds counts as a heavy one of its kind: draw() records the next like it both
             // ways again, however few its draws, instead of for sysmem alone)
             if (tiles) noted = std::max(noted, gmemMinDraws_);
+            belowBar = tiles && open_->draws < gmemMinDraws_;
         }
         if (tiles) {
             appendStream(stream_, open_->headGmem);
@@ -3574,7 +3576,8 @@ void CommandBuffer::closePass() {
             uint8_t attached = 0;
             for (uint32_t i = 0; i < kMaxColorOutputs; i++) attached |= (i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture) != nullptr ? 1u << i : 0u;
             profiled_.back().attached = attached;
-            profiled_.back().touched = uint8_t(open_->written | open_->read);
+            profiled_.back().touched = uint16_t(((open_->written | open_->read) & 0xffu) | (open_->read != 0 ? kPassReads : 0u) | (belowBar ? kPassBelowBar : 0u) |
+                                                (load == 0 ? kPassNoLoad : 0u));
         }
     }
     pm4::Stream tail;
