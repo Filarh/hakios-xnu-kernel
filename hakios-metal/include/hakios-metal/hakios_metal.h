@@ -288,6 +288,10 @@ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
+/* what PROGRAM's fragment stage does that a frame trace reports (the plug-in's metal_trace=frame looks for it by name):
+ * bit n (n < 8) where it reads colour attachment n through framebuffer fetch ([[color(n)]] as an argument, the slots
+ * lowerFbRead gives them), bit 8 where it can discard a fragment. 0 for NULL. */
+unsigned hakios_metal_program_fs_traits(hakios_metal_program *program);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
 void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);
