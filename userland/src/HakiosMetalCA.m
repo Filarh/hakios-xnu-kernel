@@ -3811,9 +3811,9 @@ hm_align(void)
 /* The GPU's memory is the kernel's allocation and nothing else: an application's own pages cannot be handed to it as
  * they are. So the bytes are copied into GPU memory as the buffer is made, and the deallocator is kept and called when
  * the buffer goes, as Metal promises. What the copy loses is the sharing: a write by the GPU is not seen in the caller's
- * pages, nor a later write by the caller in the GPU's. QuartzCore's one caller (CA::OGL::MetalContext::
- * copy_image_to_texture) wraps a decoded image to blit it into a texture at once, which loses neither; refusing it had
- * left those textures as whatever memory they were given. */
+ * pages, nor a later write by the caller in the GPU's. QuartzCore wraps a decoded image so to blit it into a texture
+ * at once (CA::OGL::MetalContext::copy_image_to_texture), which loses neither; a texture it keeps over such a buffer
+ * (its client-storage images, by their label in the frame traces) shows the copy and nothing written after it. */
 - (id)newBufferWithBytesNoCopy:(void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
@@ -9142,8 +9142,8 @@ hm_hash_bytes(const uint8_t *p, size_t length)
 }
 
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
- * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 s on the host, and a frame
- * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. */
+ * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 to 1.1 s on the phone, and a
+ * frame must not wait for it). HM_SPEC_MOST contents at most a pipeline; past them the pipeline's own. */
 /* boot-arg metal_spec_mask=0 (a bisect's): a content is another's only when all its bytes are the same, as before the
  * bytes a compilation read were known */
 static BOOL
