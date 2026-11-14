@@ -3058,6 +3058,22 @@ hm_dump_refused(const char *label, id function)
  * look at each recipe and its stage's file: milliseconds. What no recipe holds yet (a pipeline first made in use) is
  * compiled when it is asked for and leaves its recipe for the next start. Boot-arg metal_warmup=0: not run.
  */
+/* The processor's reads and writes of an IOSurface's rows (-replaceRegion:, -getBytes: of a texture over a surface) are
+ * told to the kernel, GEM_CPU_PREP before and GEM_CPU_FINI after (hakios-metal gpu.hpp: Bo::cpuBegin): with xnu 0339's
+ * account the kernel keeps the caches and the memory agreeing only around the accesses it is told of. Boot-arg
+ * metal_cpuprep=0: not told, as before, for holding their cost against their absence. */
+static void
+hm_cpu_access_switch(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+
+	if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_cpuprep=0") != NULL) {
+		hakios_metal_set_cpu_access_announced(0);
+		hm_print("metal_cpuprep=0: the processor's accesses to an IOSurface's rows are not told to the kernel\n");
+	}
+}
+
 static void
 hm_warm_up(void)
 {
@@ -3568,6 +3584,7 @@ hm_boot_arg_set(const char *what)
 		 [_name UTF8String], (unsigned)port,
 		 hakios_metal_has_compiler() ? "in this build" : "NOT in this build (make ios MESA=1): every pipeline will be refused",
 		 _targetName);
+	hm_cpu_access_switch();
 	hm_warm_up();
 	return self;
 }

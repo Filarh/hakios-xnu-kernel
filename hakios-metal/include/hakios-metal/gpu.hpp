@@ -120,6 +120,9 @@ public:
     virtual int64_t nowNs() = 0;
 };
 
+// Whether Bo::cpuBegin and cpuEnd tell the kernel (true by default): false for holding their cost against their absence
+void setCpuAccessAnnounced(bool on);
+
 // HakiosGPU's user client (Darwin only: src/iokit_transport.cpp). nullptr when there is no such service: no gpu=1,
 // no firmware, QEMU, or not the phone.
 std::unique_ptr<Transport> openKernelGpu(std::string* why);

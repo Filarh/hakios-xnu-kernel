@@ -89,6 +89,9 @@ void hakios_metal_buffer_free(hakios_metal_buffer *buffer);
 void *hakios_metal_buffer_contents(hakios_metal_buffer *buffer);
 uint64_t hakios_metal_buffer_length(hakios_metal_buffer *buffer);
 uint64_t hakios_metal_buffer_gpu_address(hakios_metal_buffer *buffer);
+/* whether the processor's reads and writes of an IOSurface's rows are told to the kernel (GEM_CPU_PREP, GEM_CPU_FINI;
+ * 1 by default): 0 for holding their cost against their absence */
+void hakios_metal_set_cpu_access_announced(int on);
 /* whether the kernel takes a program's own memory as GPU memory (xnu patch 0380): what a no-copy buffer needs */
 int hakios_metal_device_shares_memory(hakios_metal_device *device);
 /* -newBufferWithBytesNoCopy:: a buffer that IS the caller's memory [BYTES, BYTES + LENGTH), both multiples of 4096. The

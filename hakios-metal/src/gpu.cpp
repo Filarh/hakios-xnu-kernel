@@ -97,14 +97,17 @@ namespace {
 // msm_drm.h's MSM_PREP_*
 constexpr uint32_t kPrepRead = 0x1, kPrepWrite = 0x2;
 constexpr int64_t kPrepPatienceNs = 2000000000;
+std::atomic<bool> gAnnounceCpu{true};
 }  // namespace
 
+void setCpuAccessAnnounced(bool on) { gAnnounceCpu.store(on, std::memory_order_relaxed); }
+
 void Bo::cpuBegin(bool write) const {
-    if (surface_) (void)gpu_.cpuPrep(*this, write ? kPrepRead | kPrepWrite : kPrepRead, kPrepPatienceNs);
+    if (surface_ && gAnnounceCpu.load(std::memory_order_relaxed)) (void)gpu_.cpuPrep(*this, write ? kPrepRead | kPrepWrite : kPrepRead, kPrepPatienceNs);
 }
 
 void Bo::cpuEnd() const {
-    if (surface_) gpu_.cpuFini(*this);
+    if (surface_ && gAnnounceCpu.load(std::memory_order_relaxed)) gpu_.cpuFini(*this);
 }
 
 bool Gpu::sharesMemory() {
