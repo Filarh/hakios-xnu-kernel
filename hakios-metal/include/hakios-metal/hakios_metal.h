@@ -151,6 +151,8 @@ void hakios_metal_texture_set_memoryless(hakios_metal_texture *texture, int memo
 int hakios_metal_texture_memoryless(hakios_metal_texture *texture);
 /* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own) */
 unsigned hakios_metal_texture_origin(hakios_metal_texture *texture);
+/* whether TEXTURE's rows are a program's own memory (a texture over a no-copy buffer) */
+int hakios_metal_texture_is_program_memory(hakios_metal_texture *texture);
 /* ...of LEVELS mip levels (MTLTextureDescriptor.mipmapLevelCount: 1 to floor(log2(max(width, height))) + 1) */
 hakios_metal_texture *hakios_metal_texture_new_levels(hakios_metal_device *device, unsigned type, unsigned pixel_format,
     unsigned width, unsigned height, unsigned levels, unsigned usage);
@@ -322,6 +324,8 @@ unsigned hakios_metal_program_fs_traits(hakios_metal_program *program);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
 void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);
+/* the no-copy buffers made over a program's own memory since the last call, and their bytes */
+void hakios_metal_shared_counts(unsigned *made, unsigned long long *bytes);
 const char *hakios_metal_program_name(hakios_metal_program *program);   /* "vs+fs" */
 /* STAGE 0 = vertex, 1 = fragment: the resources that stage binds, as hakios_metal_kernel_resource reports a kernel's */
 unsigned hakios_metal_program_resource_count(hakios_metal_program *program, unsigned stage);

@@ -539,17 +539,95 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 @interface HakiosMetalBuffer : _MTLResource {
 	HakiosMetalDevice *_device;
 	hakios_metal_buffer *_buffer;
-	/* a no-copy buffer's own pages and the block Metal promises to call when the buffer goes (see
-	 * -newBufferWithBytesNoCopy:...) */
-	void (^_deallocator)(void *, NSUInteger);
-	void *_callerBytes;
-	NSUInteger _callerLength;
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device length:(NSUInteger)length;
-- (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length;
+/* the caller's own pages [BYTES, BYTES + LENGTH) as the buffer (-newBufferWithBytesNoCopy:...): nil when the kernel
+ * does not share a program's memory with the GPU or the memory is not on whole pages, with the reason printed */
+- (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device noCopyBytes:(void *)bytes length:(NSUInteger)length
+			 deallocator:(void (^)(void *, NSUInteger))deallocator;
 - (hakios_metal_buffer *)hakiosBuffer;
 - (void *)contents;
 @end
+
+/* What a no-copy buffer hands the core for Metal's deallocator: the block and the caller's range. The core calls
+ * hm_nocopy_released once the buffer is gone and the last command buffer that used it has completed (command.hpp,
+ * Buffer), on whichever thread lets go of it last; ARMED false is a buffer whose making failed after the core had it,
+ * whose memory stays the caller's without a call. */
+struct hm_nocopy {
+	void (^deallocator)(void *, NSUInteger);
+	void *bytes;
+	NSUInteger length;
+	BOOL armed;
+};
+
+static void
+hm_nocopy_released(void *context)
+{
+	struct hm_nocopy *n = context;
+
+	if (n->armed && n->deallocator != nil) {
+		n->deallocator(n->bytes, n->length);
+	}
+	if (n->deallocator != nil) {
+		Block_release(n->deallocator);
+	}
+	free(n);
+}
+
+/* metal_nocopy=0's: the deallocator of a no-copy buffer made as a copy, run when the copy goes */
+@interface HakiosMetalDeallocation : NSObject {
+	struct hm_nocopy *_n;
+}
+- (instancetype)initWithNoCopy:(struct hm_nocopy *)n;
+@end
+
+@implementation HakiosMetalDeallocation
+- (instancetype)initWithNoCopy:(struct hm_nocopy *)n
+{
+	self = [super init];
+	if (self != nil) {
+		_n = n;
+	}
+	return self;
+}
+- (void)dealloc
+{
+	hm_nocopy_released(_n);
+	[super dealloc];
+}
+@end
+
+/* A buffer of the program's own memory, for -newBufferWithBytesNoCopy: and for a no-copy texture's rows. ARMED_OUT,
+ * when given, is the context of its deallocator, for a caller that may yet give the memory back without the call. */
+static hakios_metal_buffer *
+hm_nocopy_buffer(HakiosMetalDevice *device, void *bytes, NSUInteger length, void (^deallocator)(void *, NSUInteger),
+		 struct hm_nocopy **armedOut)
+{
+	struct hm_nocopy *n = calloc(1, sizeof(*n));
+	hakios_metal_buffer *b;
+
+	if (n == NULL) {
+		return NULL;
+	}
+	n->deallocator = deallocator != nil ? Block_copy(deallocator) : nil;
+	n->bytes = bytes;
+	n->length = length;
+	n->armed = YES;
+	b = hakios_metal_buffer_new_nocopy([device hakiosDevice], bytes, (uint64_t)length, hm_nocopy_released, n);
+	if (b == NULL) {
+		/* not made: the core never had the context, and the memory stays the caller's without a call */
+		if (n->deallocator != nil) {
+			Block_release(n->deallocator);
+		}
+		free(n);
+		return NULL;
+	}
+	if (armedOut != NULL) {
+		*armedOut = n;
+	}
+	return b;
+}
+
 
 /*
  * A texture: hakios-metal's, one 2D level in GPU memory of its own, laid out as the GPU reads it (linear rows of
@@ -3640,37 +3718,44 @@ hm_print_callers(const char *what)
 /* Where a texture's rows lie in memory this device did not lay out -- an IOSurface, a buffer -- they must start at a
  * multiple of 64 bytes and be a multiple of 64 bytes apart: the a6xx reads a texture's pitch and writes a render
  * target's in 64-byte units (hakios-metal's texture.cpp: wrapSurface, overBuffer). These are the device's answers to
- * whoever lays such memory out.
+ * whoever lays such memory out, and the device gives them when it can serve what they bring on.
  *
- * Boot-arg metal_align says which of them this device answers itself, 64; the rest are the base class's, Apple's own
- * for the profile. Bit 1: iosurfaceTextureAlignmentBytes and iosurfaceReadOnlyTextureAlignmentBytes, which
- * CoreAnimation asks as it makes its Metal context and lays its memory out by (CADeviceSetMinimumAlignment). Bit 2:
- * linearTextureAlignmentBytes, deviceLinear(ReadOnly)TextureAlignmentBytes and
- * minimumLinearTextureAlignmentForPixelFormat:. Both are OFF by default, because with all of them answered
- * CoreAnimation takes nearly every image as client storage (com.apple.coreanimation.image-client-storage:
- * -newBufferWithBytesNoCopy: over the image's own memory and a texture over that buffer) where with the base class's
- * answers it uploads most of them (-replaceRegion:) -- and a no-copy buffer here is not the caller's memory but a
- * copy of it made when the buffer is made. What the caller's memory holds later is never seen: the widgets whose
- * pictures arrive after their buffers were made (the Calendar, the headlines: bitmaps of other processes) were drawn
- * from the empty copy, invisible. Which of the two bits brings client storage on is not established; neither is to
- * be on by default until a no-copy buffer is the memory it names. Without the answers a surface whose rows the GPU
- * cannot take where they lie (2848 bytes for 712 pixels) is read through a copy (-hakiosShadow:), as before. */
+ * What they bring on, read in QuartzCore 20H392: iosurfaceReadOnlyTextureAlignmentBytes, asked as CoreAnimation makes
+ * its Metal context, raises the alignment it lays every bitmap and IOSurface of its own out by
+ * (CADeviceSetMinimumAlignment, 0x188488ac8: format_rowbytes, Shmem::new_bitmap); copy_image_to_texture takes an image
+ * as client storage -- a no-copy buffer over its pages and a texture over its rows -- whenever its pixels and its row
+ * bytes are multiples of deviceLinearReadOnlyTextureAlignmentBytes (0x188484300). The base class answers 4 to the
+ * first and 64 to the second (the first queue's line on merge-7). So with 64 declared, nearly every image is client
+ * storage (7 to 29 MB a command buffer in the traces of merge-6, 0.2 MB without), and those are textures over the
+ * caller's memory: served only where a no-copy buffer IS that memory, which takes the kernel's sharing (xnu patch 0380).
+ * With 4 the IOSurfaces CoreAnimation makes have rows the GPU cannot take where they lie (2848 bytes for 712 pixels),
+ * read through a copy (-hakiosShadow:, N-06).
+ *
+ * Boot-arg metal_align: not given, the device declares 64 for both pairs when the kernel shares a program's memory and
+ * leaves the base class's answers otherwise; given, its bits say which it declares (bit 1 the IOSurface pair, bit 2 the
+ * linear ones: linearTextureAlignmentBytes, deviceLinear(ReadOnly)TextureAlignmentBytes and
+ * minimumLinearTextureAlignmentForPixelFormat:), 0 none -- for holding one against the other. Measured with merge-7,
+ * which copied no-copy buffers: metal_align=1 lost the widgets of opaque background as merge-6 did, metal_align=2 did
+ * not. */
 static unsigned
-hm_align(void)
+hm_align(hakios_metal_device *gpu)
 {
-	static int bits = -1;
+	static int bits = -2;
 
-	if (bits < 0) {
+	if (bits == -2) {
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 		const char *at;
 
-		bits = 0;
+		bits = -1;
 		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_align=")) != NULL) {
 			bits = atoi(at + strlen("metal_align="));
 		}
 	}
-	return (unsigned)bits;
+	if (bits >= 0) {
+		return (unsigned)bits;
+	}
+	return gpu != NULL && hakios_metal_device_shares_memory(gpu) ? 3u : 0u;
 }
 
 /* the base class's answer to a selector of no arguments (64 if it has none) */
@@ -3684,16 +3769,16 @@ hm_align(void)
 	return ((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&up, name);
 }
 
-- (NSUInteger)iosurfaceTextureAlignmentBytes { return (hm_align() & 1) ? 64 : [self hakiosBaseAlignment:_cmd]; }
-- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return (hm_align() & 1) ? 64 : [self hakiosBaseAlignment:_cmd]; }
-- (NSUInteger)linearTextureAlignmentBytes { return (hm_align() & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
-- (NSUInteger)deviceLinearTextureAlignmentBytes { return (hm_align() & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
-- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return (hm_align() & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
+- (NSUInteger)iosurfaceTextureAlignmentBytes { return (hm_align(_gpu) & 1) ? 64 : [self hakiosBaseAlignment:_cmd]; }
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return (hm_align(_gpu) & 1) ? 64 : [self hakiosBaseAlignment:_cmd]; }
+- (NSUInteger)linearTextureAlignmentBytes { return (hm_align(_gpu) & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
+- (NSUInteger)deviceLinearTextureAlignmentBytes { return (hm_align(_gpu) & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return (hm_align(_gpu) & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
 - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
 {
 	struct objc_super up = { self, class_getSuperclass([HakiosMetalDevice class]) };
 
-	if ((hm_align() & 2) || ![up.super_class instancesRespondToSelector:_cmd]) {
+	if ((hm_align(_gpu) & 2) || ![up.super_class instancesRespondToSelector:_cmd]) {
 		return 64;
 	}
 	return ((NSUInteger (*)(struct objc_super *, SEL, MTLPixelFormat))objc_msgSendSuper)(&up, _cmd, format);
@@ -3747,9 +3832,10 @@ hm_align(void)
 					base = (unsigned long)((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&up, name);
 				}
 				hm_print("alignment declared for a texture's rows: over an IOSurface %lu bytes (the base class's: %lu), over a buffer "
-					 "%lu (metal_align=%u: bit 1 the first, bit 2 the second)\n",
+					 "%lu (bits %u: 1 the first, 2 the second; the kernel %s a program's memory with the GPU)\n",
 					 (unsigned long)[self iosurfaceReadOnlyTextureAlignmentBytes], base,
-					 (unsigned long)[self deviceLinearReadOnlyTextureAlignmentBytes], hm_align());
+					 (unsigned long)[self deviceLinearReadOnlyTextureAlignmentBytes], hm_align(_gpu),
+					 hakios_metal_device_shares_memory(_gpu) ? "shares" : "does not share");
 			});
 		}
 	}
@@ -3808,22 +3894,64 @@ hm_align(void)
 	return buffer;
 }
 
-/* The GPU's memory is the kernel's allocation and nothing else: an application's own pages cannot be handed to it as
- * they are. So the bytes are copied into GPU memory as the buffer is made, and the deallocator is kept and called when
- * the buffer goes, as Metal promises. What the copy loses is the sharing: a write by the GPU is not seen in the caller's
- * pages, nor a later write by the caller in the GPU's. QuartzCore wraps a decoded image so to blit it into a texture
- * at once (CA::OGL::MetalContext::copy_image_to_texture), which loses neither; a texture it keeps over such a buffer
- * (its client-storage images, by their label in the frame traces) shows the copy and nothing written after it. */
+/* The caller's own pages, which Metal says the buffer is: the GPU reads what the caller wrote there before a command
+ * buffer using it was committed, whenever it wrote it, and the caller finds there what the GPU wrote once that command
+ * buffer has completed. The kernel holds the pages, gives them GPU addresses and keeps the processor's caches agreeing
+ * with them around the GPU's use (xnu patch 0380); the deallocator runs once the buffer is gone and the last command
+ * buffer that used it has completed. QuartzCore is the one caller in the window server
+ * (CA::OGL::MetalContext::copy_image_to_texture): it wraps an image's own pages so and keeps a texture over them (its
+ * client-storage images), and never uploads that image again -- a copy here showed the image as it was when the
+ * buffer was made, and nothing after (19 §2.9, N-12; the invisible widgets of 03 M21). A kernel without 0380 cannot give
+ * the GPU a program's pages, and a copy is not the caller's memory: nil then, Metal's answer for a buffer it cannot
+ * make, on which QuartzCore uploads the image instead ("nil buffer from memory" in its log). */
+static BOOL
+hm_nocopy_copies(void)
+{
+	static int copies = -1;
+
+	if (copies < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		copies = hm_bootargs(args, &size) == 0 && strstr(args, "metal_nocopy=0") != NULL;
+	}
+	return copies == 1;
+}
+
 - (id)newBufferWithBytesNoCopy:(void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	HakiosMetalBuffer *buffer = [self newBufferWithBytes:bytes length:length options:options];
+	const double began = hm_ft_work_began();
+	HakiosMetalBuffer *buffer;
 
-	HM_ONCE("a no-copy buffer was asked for; its bytes are copied into GPU memory, so neither side sees the other's later "
-		"writes\n");
-	if (buffer != nil && deallocator != nil) {
-		[buffer hakiosSetDeallocator:deallocator bytes:bytes length:length];
+	if (hm_nocopy_copies()) {
+		/* boot-arg metal_nocopy=0: as before, for holding one against the other -- a buffer of the driver's own with
+		 * the bytes copied in now (what the caller writes there later is not seen), the deallocator called with it */
+		HakiosMetalBuffer *copy = [self newBufferWithBytes:bytes length:length options:options];
+		struct hm_nocopy *n = NULL;
+
+		HM_ONCE("metal_nocopy=0: a no-copy buffer is a copy of its bytes made now, a later write to them is not seen\n");
+		if (copy != nil && deallocator != nil && (n = calloc(1, sizeof(*n))) != NULL) {
+			n->deallocator = Block_copy(deallocator);
+			n->bytes = bytes;
+			n->length = length;
+			n->armed = YES;
+			objc_setAssociatedObject(copy, &hm_nocopy_copies, [[[HakiosMetalDeallocation alloc] initWithNoCopy:n] autorelease],
+						 OBJC_ASSOCIATION_RETAIN);
+		}
+		return copy;
 	}
+	if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModePrivate) {
+		hm_print("refused: a no-copy buffer with private storage: the caller's memory is shared memory by what it is; nil\n");
+		return nil;
+	}
+	if (!hakios_metal_device_shares_memory(_gpu)) {
+		HM_ONCE("the kernel does not give the GPU a program's own memory (xnu patch 0380): every no-copy buffer is refused, "
+			"nil, and QuartzCore uploads its images instead\n");
+		return nil;
+	}
+	buffer = [[HakiosMetalBuffer alloc] initWithHakiosDevice:self noCopyBytes:bytes length:length deallocator:deallocator];
+	hm_ft_worked(HM_FT_W_BUFFER, began, buffer != nil ? (uint64_t)length : 0);
 	return buffer;
 }
 
@@ -3886,7 +4014,35 @@ hm_align(void)
 		[texture release];
 		return nil;
 	}
-	HM_ONCE("a no-copy texture was asked for; its bytes are copied into GPU memory, so neither side sees the other's later writes\n");
+	/* rows the GPU takes where they lie, on whole pages the kernel can give it: the texture is the caller's memory, as
+	 * Metal says, through a no-copy buffer under it (whose deallocator is this texture's: it runs once the texture and
+	 * the last command buffer that used it are gone) */
+	if (hakios_metal_device_shares_memory(_gpu) && ((uintptr_t)bytes & 4095) == 0 && (length & 4095) == 0 && pitch % 64 == 0 &&
+	    [descriptor mipmapLevelCount] <= 1 && ([descriptor textureType] == MTLTextureType2D || [descriptor textureType] == MTLTextureType1D)) {
+		struct hm_nocopy *armed = NULL;
+		hakios_metal_buffer *rows = hm_nocopy_buffer(self, bytes, length, deallocator, &armed);
+		hakios_metal_texture *over = NULL;
+
+		if (rows != NULL) {
+			MTLTextureUsage usage = [descriptor usage] == MTLTextureUsageUnknown ? MTLTextureUsageShaderRead : [descriptor usage];
+
+			usage &= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+			over = hakios_metal_texture_new_buffer(rows, (unsigned)[descriptor textureType], (unsigned)[descriptor pixelFormat],
+							       (unsigned)width, (unsigned)height, (unsigned)usage, 0, (uint64_t)pitch);
+			if (over == NULL) {
+				armed->armed = NO;   /* not made: the memory stays the caller's, and the copy below is the texture */
+			}
+			hakios_metal_buffer_free(rows);   /* the texture keeps the core's buffer, and its deallocator with it */
+			if (over != NULL) {
+				HakiosMetalTexture *shared = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:over descriptor:descriptor
+													  usage:usage];
+				[texture release];
+				return shared;
+			}
+		}
+	}
+	HM_ONCE("a no-copy texture whose rows the GPU cannot take where they lie, or with a kernel that does not give the GPU a "
+		"program's memory, is a copy of its bytes made now: a later write to them is not seen\n");
 	[(id<MTLTexture>)texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:bytes bytesPerRow:pitch];
 	if (deallocator != nil) {
 		[texture hakiosSetDeallocator:deallocator bytes:bytes length:length];
@@ -5308,24 +5464,33 @@ HM_REFUSES_OUT_LOUD
 	return self;
 }
 
+- (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device noCopyBytes:(void *)bytes length:(NSUInteger)length
+			 deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	self = [super init];
+	if (self == nil) {
+		return nil;
+	}
+	_buffer = hm_nocopy_buffer(device, bytes, length, deallocator, NULL);
+	if (_buffer == NULL) {
+		hm_print("refused: a no-copy buffer of %lu bytes at %p: %s; nil (QuartzCore then uploads the image)\n",
+			 (unsigned long)length, bytes, hakios_metal_error());
+		[self release];
+		return nil;
+	}
+	_device = [device retain];
+	return self;
+}
+
 - (void)dealloc
 {
 	if (_buffer != NULL) {
-		hakios_metal_buffer_free(_buffer);   /* a command buffer still using it keeps its own reference */
-	}
-	if (_deallocator != nil) {
-		_deallocator(_callerBytes, _callerLength);
-		[_deallocator release];
+		/* a command buffer still using it keeps its own reference; a no-copy buffer's deallocator runs once the
+		 * last one lets go (hm_nocopy_released) */
+		hakios_metal_buffer_free(_buffer);
 	}
 	[_device release];
 	[super dealloc];
-}
-
-- (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length
-{
-	_deallocator = [deallocator copy];
-	_callerBytes = bytes;
-	_callerLength = length;
 }
 
 - (hakios_metal_buffer *)hakiosBuffer { return _buffer; }
@@ -5336,14 +5501,24 @@ HM_REFUSES_OUT_LOUD
 - (NSUInteger)allocatedSize { return [self length]; }
 - (id)device                { return _device; }
 
-/* The memory is write-combined and the GPU reads it through no cache of the processor's, so there is nothing to push
- * out: a no-op that is the truth about this memory, not an omission (and the method is macOS-only in any case). */
+/* The driver's memory is write-combined, and the program's own memory (a no-copy buffer) is cleaned and invalidated in
+ * the processor's caches by the kernel around the GPU's use of its pages (xnu patch 0380): there is nothing to push
+ * out here either way -- a no-op that is the truth about this memory, not an omission (and macOS-only in any case). */
 - (void)didModifyRange:(NSRange)range { (void)range; }
 
-/* what was asked for does not change what was given: one kind of memory, described as what it is */
+/* what was asked for does not change what was given, described as what it is: the driver's memory write-combined, a
+ * no-copy buffer's the caller's own, cached (QuartzCore makes its client-storage texture with the cache mode the buffer
+ * answers, CA::OGL::MetalContext::copy_image_to_texture) */
 - (MTLStorageMode)storageMode               { return MTLStorageModeShared; }
-- (MTLCPUCacheMode)cpuCacheMode             { return MTLCPUCacheModeWriteCombined; }
-- (MTLResourceOptions)resourceOptions       { return MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined; }
+- (MTLCPUCacheMode)cpuCacheMode
+{
+	return hakios_metal_buffer_is_program_memory(_buffer) ? MTLCPUCacheModeDefaultCache : MTLCPUCacheModeWriteCombined;
+}
+- (MTLResourceOptions)resourceOptions
+{
+	return MTLResourceStorageModeShared |
+	       (hakios_metal_buffer_is_program_memory(_buffer) ? MTLResourceCPUCacheModeDefaultCache : MTLResourceCPUCacheModeWriteCombined);
+}
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeDefault; }
 - (id)heap                                  { return nil; }   /* every buffer is its own allocation; nil is Metal's answer for that */
 - (NSUInteger)heapOffset                    { return 0; }
@@ -5590,14 +5765,14 @@ HM_REFUSES_OUT_LOUD
 		else snprintf(memory, sizeof(memory), "t%llu", (unsigned long long)root->_uniqueIdentifier);
 		if (_parent != nil) snprintf(parent, sizeof(parent), " parent=%llu", (unsigned long long)_parent->_uniqueIdentifier);
 		hm_ft_line(ft, "tex id=%llu mem=%s lvl0=%u slice0=%u w=%u h=%u d=%u type=%s fmt=%s levels=%u samples=%u usage=%s storage=%s origin=%s "
-			   "surface=%u%s%s%s%s%s label=%s\n", (unsigned long long)_uniqueIdentifier, memory, level, slice, hakios_metal_texture_width(_texture),
+			   "surface=%u%s%s%s%s%s%s label=%s\n", (unsigned long long)_uniqueIdentifier, memory, level, slice, hakios_metal_texture_width(_texture),
 			   hakios_metal_texture_height(_texture), hakios_metal_texture_depth(_texture), HM_FT_TTYPE(hakios_metal_texture_type(_texture)),
 			   hm_ft_format((unsigned)[self pixelFormat], format, sizeof(format)), hakios_metal_texture_levels(_texture),
 			   hakios_metal_texture_samples(_texture), hm_ft_usage(_usage, usage),
 			   HM_FT_STORAGE((_askedOptions >> MTLResourceStorageModeShift) & 0xf), HM_FT_ORIGIN(hakios_metal_texture_origin(_texture)),
 			   _iosurface != NULL ? (unsigned)IOSurfaceGetID(_iosurface) : 0u, parent, _shadow ? " shadow=1" : "",
 			   _turnedSurface != NULL ? " turned=1" : "", _ycbcr != 0 ? " ycbcr=1" : "", _swizzled ? " swizzled=1" : "",
-			   hm_ft_qs(label, sizeof(label), [self label]));
+			   hakios_metal_texture_is_program_memory(_texture) ? " program=1" : "", hm_ft_qs(label, sizeof(label), [self label]));
 	}
 	return _uniqueIdentifier;
 }
@@ -7419,11 +7594,13 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			memset(hm_fps.bySize, 0, sizeof(hm_fps.bySize));
 		}
 		{
-			unsigned made, reused;
-			unsigned long long bytes;
+			unsigned made, reused, shared;
+			unsigned long long bytes, sharedBytes;
 
 			hakios_metal_buffer_counts(&made, &reused, &bytes);
-			hm_print("fps: ... buffers: %u made (%llu KB), %u taken again from the pool\n", made, bytes >> 10, reused);
+			hakios_metal_shared_counts(&shared, &sharedBytes);
+			hm_print("fps: ... buffers: %u made (%llu KB), %u taken again from the pool; %u over the program's own memory (%llu KB)\n",
+				 made, bytes >> 10, reused, shared, sharedBytes >> 10);
 		}
 		if (hm_fps.drawCalls != 0) {
 			char by[200] = "";
