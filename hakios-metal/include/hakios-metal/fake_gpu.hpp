@@ -191,6 +191,13 @@ public:
     static void (*submitHook)(FakeGpu& gpu, uint64_t address, uint32_t words, void* context);
     static void* submitHookContext;
     const uint8_t* peek(uint64_t iova, uint64_t length) { return at(iova, length); }   // (inside the hook alone)
+    // ...and the buffers the submission names besides its command stream's own, each once: where it lies, and whether
+    // it is named for reading (1), for writing (2) or both (inside the hook alone)
+    struct Named {
+        uint64_t iova;
+        uint32_t flags;
+    };
+    const std::vector<Named>& named() const { return named_; }
 
     // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
     static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
@@ -200,6 +207,7 @@ public:
     static constexpr uint64_t kMaxFrequencyHz = 550000000;
 
 private:
+    std::vector<Named> named_;   // (under the lock: the submission being taken)
     struct UboDescriptor {
         uint64_t base;
         uint32_t vec4s;
