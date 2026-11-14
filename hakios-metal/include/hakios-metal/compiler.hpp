@@ -11,6 +11,7 @@
 // A build without Mesa's libraries (make test with no MESA_BUILD) has this as a refusal by name, nothing else.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -97,6 +98,10 @@ struct CompiledProgram {
     Program program{};
     std::shared_ptr<CompiledStage> vs, fs;
     std::string name;   // "vs+fs"
+    // whether either stage has a resource that is a member of an argument buffer (-1: not looked at yet). A draw with
+    // such a program reads the members off the bound sets before it is encoded (bindArgumentBuffers); one without has
+    // nothing to read there, and is not made to find that out again at every draw.
+    std::atomic<int8_t> argumentBuffers{-1};
 };
 
 // whether a compiler is in this build

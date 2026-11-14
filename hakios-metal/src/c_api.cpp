@@ -134,6 +134,10 @@ struct hakios_metal_cb {
     uint64_t indirectOffset = 0;
     std::shared_ptr<Deferrer> deferrer;   // the queue's, when it records deferred
     std::atomic<int> pending{0};          // jobs posted for this buffer and not yet done
+    // a draw's two tables of bindings and the argument-buffer members it keeps, made here rather than in each draw:
+    // what they take from the heap is taken once a command buffer (drawCommon, one draw at a time)
+    Bindings vsBindings, fsBindings;
+    std::vector<std::shared_ptr<const void>> members;
 };
 struct hakios_metal_texture {
     std::shared_ptr<Texture> texture;   // its Buffer is kept by every command buffer that dispatched over it
@@ -1403,16 +1407,22 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
     std::shared_ptr<Buffer> indirect = std::move(cb->indirect);
     cb->indirect = nullptr;
     // the two [[buffer(n)]] tables by Metal's index (setVertexBuffer / setFragmentBuffer); render::encode reads what each
-    // stage's pushed ranges name and refuses a range with nothing bound by name
-    auto table = [](hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count) {
-        Bindings b;
+    // stage's pushed ranges name and refuses a range with nothing bound by name. (The command buffer's own two tables,
+    // emptied: a draw's bindings were six vectors made and let go a draw.)
+    auto table = [](Bindings& b, hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count) {
+        b.buffers.clear();
         b.buffers.resize(count);
         for (unsigned i = 0; i < count; i++) {
             if (buffers != nullptr && buffers[i] != nullptr) b.buffers[i] = Binding{buffers[i]->buffer.get(), offsets != nullptr ? offsets[i] : 0};
         }
-        return b;
+        b.textures.clear();
+        b.samplers.clear();
+        b.privateMemory = PrivateMemory{};
+        b.sharedBytes = 0;
+        b.nullMask = 0;
     };
-    Bindings vsb = table(vsBuffers, vsOffsets, vsCount);
+    Bindings& vsb = cb->vsBindings;
+    table(vsb, vsBuffers, vsOffsets, vsCount);
     // the vertex stage's textures and samplers, as hakios_metal_cb_set_vertex_textures left them, and its own constexpr
     // samplers past them, as the fragment stage's below
     for (const auto& t : cb->vsTextures) vsb.textures.push_back(t.get());
@@ -1421,7 +1431,8 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         if (vsb.samplers.size() <= index) vsb.samplers.resize(index + 1, nullptr);
         vsb.samplers[index] = &sampler;
     }
-    Bindings fsb = table(fsBuffers, fsOffsets, fsCount);
+    Bindings& fsb = cb->fsBindings;
+    table(fsb, fsBuffers, fsOffsets, fsCount);
     // the fragment stage's [[texture(n)]] and [[sampler(n)]] by Metal's index (setFragmentTexture / setFragmentSamplerState)
     fsb.textures.resize(fsTextureCount, nullptr);
     for (unsigned i = 0; i < fsTextureCount; i++) {
@@ -1436,16 +1447,32 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         if (fsb.samplers.size() <= index) fsb.samplers.resize(index + 1, nullptr);
         fsb.samplers[index] = &sampler;
     }
-    // both stages' argument-buffer members, from what the sets hold, at the indices the front end gave them
-    std::vector<std::shared_ptr<const void>> members;
-    std::string whyMembers;
-    if (!bindArgumentBuffers(p->program->vs->resources, &vsb, &members, &whyMembers) ||
-        !bindArgumentBuffers(p->program->fs->resources, &fsb, &members, &whyMembers)) {
-        failed(whyMembers);
-        cb->cb->refuse(whyMembers);
-        return -1;
+    // both stages' argument-buffer members, from what the sets hold, at the indices the front end gave them -- for a
+    // program that has any (CompiledProgram::argumentBuffers: asked of its resources once, not at every draw; with
+    // none, bindArgumentBuffers changes nothing and was a copy of each stage's buffer table a draw)
+    int8_t hasMembers = p->program->argumentBuffers.load(std::memory_order_relaxed);
+    if (hasMembers < 0) {
+        hasMembers = 0;
+        for (const CompiledStage* s : {p->program->vs.get(), p->program->fs.get()}) {
+            for (const Resource& r : s->resources) {
+                if (r.argbufSet != ~0u) hasMembers = 1;
+            }
+        }
+        p->program->argumentBuffers.store(hasMembers, std::memory_order_relaxed);
     }
-    for (auto& m : members) cb->cb->keepAlive(std::move(m));
+    if (hasMembers != 0) {
+        std::vector<std::shared_ptr<const void>>& members = cb->members;
+        members.clear();
+        std::string whyMembers;
+        if (!bindArgumentBuffers(p->program->vs->resources, &vsb, &members, &whyMembers) ||
+            !bindArgumentBuffers(p->program->fs->resources, &fsb, &members, &whyMembers)) {
+            failed(whyMembers);
+            cb->cb->refuse(whyMembers);
+            return -1;
+        }
+        for (auto& m : members) cb->cb->keepAlive(std::move(m));
+        members.clear();
+    }
     const RenderPass rp = passOf(pass);
     // what MTLRenderCommandEncoder's default viewport covers: the first attachment the pass has, colour before depth
     // (a depth-only pass's is the depth texture)
