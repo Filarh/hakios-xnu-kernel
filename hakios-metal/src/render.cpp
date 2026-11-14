@@ -3455,6 +3455,9 @@ struct DrawCache {
     ProgramFacts pf, pfSys;
     DrawFacts facts, factsSys;
     pm4::Stream scratch, head, headSys;
+    // (closePass's: a tiled pass's draws with registers rewritten, and its draw-state groups)
+    std::vector<uint32_t> moved;
+    DrawStates groups;
     std::vector<uint8_t> staticKey;
     // A command buffer that is done hands this to the queue's next one (CommandQueue::Spare): the frame after draws
     // with the programs of the frame before, and finds each state here without asking the queue under its lock. What
@@ -5126,7 +5129,10 @@ void CommandBuffer::closePass() {
         // with every component masked off keeps the slot's bin to itself, whatever the RB does with a masked write.
         render::GmemPlan plan = open_->plan;
         const auto [W, H] = render::windowOf(open_->pass);
-        std::vector<uint32_t> moved;   // the draws' words with those registers rewritten, when any is
+        // (the lists and streams this makes are the command buffer's own between passes: render.cpp, DrawCache)
+        if (drawCache_ == nullptr) drawCache_ = std::make_shared<render::DrawCache>();
+        std::vector<uint32_t>& moved = drawCache_->moved;   // the draws' words with those registers rewritten, when any is
+        moved.clear();
         {
             uint32_t attached = 0, touched = 0, named = 0;
             for (size_t i = 0; i < w.size();) {
@@ -5166,7 +5172,7 @@ void CommandBuffer::closePass() {
         // (binned when the queue's streams have not overrun and the plan's pipes can name their bins)
         uint32_t perPipeX = 1, perPipeY = 1;
         const bool binned = (open_->options.gmemBinning || gmemBinning_) && queue_.binningOk() && render::gmemPipes(plan, &perPipeX, &perPipeY);
-        render::DrawStates groups;
+        render::DrawStates& groups = drawCache_->groups;
         const uint32_t fetchBy = gmemOff_ & kGmemAllOrdered ? render::kDsFetchOrdered : gmemOff_ & kGmemInlineBarriers ? render::kDsFetchInline : render::kDsFetchGroup;
         const bool grouped = binned && !(gmemOff_ & kGmemPlainBody) &&
                              render::drawStates(body.data(), body.size(), a6xx::CP_SET_DRAW_STATE__0_BINNING | a6xx::CP_SET_DRAW_STATE__0_GMEM, &groups,
@@ -5211,7 +5217,8 @@ void CommandBuffer::closePass() {
             keep(v);
             vsc = v->gpuAddress();
         }
-        pm4::Stream tiles;
+        pm4::Stream& tiles = drawCache_->scratch;
+        tiles.clear();
         // (the copies the draws' loads read, once for every tile and for the binning pass: DrawStates::prologue)
         if (grouped) {
             const std::vector<uint32_t>& pro = groups.prologue;
@@ -5239,9 +5246,13 @@ void CommandBuffer::closePass() {
                                                 (load == 0 ? kPassNoLoad : 0u));
         }
     }
-    pm4::Stream tail;
-    render::encodeEnd(tail, open_->pass, open_->table, open_->options);
-    appendStream(stream_, tail);
+    {
+        pm4::Stream local;
+        pm4::Stream& tail = drawCache_ != nullptr ? drawCache_->head : local;
+        tail.clear();
+        render::encodeEnd(tail, open_->pass, open_->table, open_->options);
+        appendStream(stream_, tail);
+    }
     stampEnd();
     open_.reset();
 }
