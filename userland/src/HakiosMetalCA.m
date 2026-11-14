@@ -609,6 +609,7 @@ static BOOL hm_fps_on(void);                          /* metal_fps: command buff
 static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled rendering where a pass allows it */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
 - (void)hakiosRefreshShadow;
+- (instancetype)hakiosSwizzledBy:(MTLTextureSwizzleChannels)swizzle;
 - (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length;
 - (unsigned)hakiosStorageKind;   /* metal_fps=timeline: 0 a surface's, else 1 + its storage mode */
 - (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft;   /* metal_trace=frame: its id, its tex line written the first time */
@@ -4654,11 +4655,10 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
  * pixel format and the usage bits go to hakios_metal_texture_new as Metal's own numbers, so a format outside its table is
  * refused by the core with the format's name, and nothing here translates them a second time.
  */
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+- (HakiosMetalTexture *)hakiosNewTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
 	hakios_metal_texture *texture;
 	MTLTextureUsage usage;
-	MTLTextureSwizzleChannels swizzle;
 
 	if (hm_timeline_on() && descriptor != nil && [descriptor width] * [descriptor height] >= 500000) {
 		hm_print("timeline: a texture of %lux%lu, format %lu, storage %lu, usage %#lx (not a surface)\n", (unsigned long)[descriptor width],
@@ -4743,13 +4743,6 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 		return hm_refuse_texture([NSString stringWithFormat:@"compression type %ld; this GPU's linear layout is not compressed "
 							    "(lossless, 0, is what every texture here is)", (long)[descriptor compressionType]]);
 	}
-	swizzle = [descriptor swizzle];
-	if (swizzle.red != MTLTextureSwizzleRed || swizzle.green != MTLTextureSwizzleGreen || swizzle.blue != MTLTextureSwizzleBlue ||
-	    swizzle.alpha != MTLTextureSwizzleAlpha) {
-		return hm_refuse_texture([NSString stringWithFormat:@"a swizzle of (%u %u %u %u); only the identity (red 2, green 3, blue 4, "
-							    "alpha 5) is served: the descriptor's own swizzle field carries the format's channel "
-							    "order", swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha]);
-	}
 	/* the mip levels are the core's (texture.hpp: fdl6_layout's rule, which the TP follows): it refuses a count past the
 	 * bottom of the chain with the numbers */
 	if ([descriptor textureType] == MTLTextureType2DMultisample) {
@@ -4799,7 +4792,7 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
  * surface's own pixels (hakios-metal asks the kernel for the surface's memory as a GPU buffer), so drawing into it is
  * drawing into what the compositor reads. A refusal here is LOUD and named, never a quiet nil: the earlier plug-in's
  * nil became a drawable with a nil texture that CoreAnimation asserted on somewhere else. */
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+- (HakiosMetalTexture *)hakiosNewTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
 	if (hm_timeline_on() && descriptor != nil && [descriptor width] * [descriptor height] >= 500000) {
 		hm_print("timeline: a texture of %lux%lu, format %lu, usage %#lx, over surface %u\n", (unsigned long)[descriptor width],
@@ -4980,6 +4973,20 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 	t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
 	[t hakiosSetIOSurface:surface plane:plane];
 	return t;
+}
+
+/* MTLTextureDescriptor.swizzle is how a texture is read, whatever its memory is: a one-channel mask asked for as (R, R,
+ * R, 1), a surface's channels in another order. It was refused for a texture of its own memory and not looked at for
+ * one over an IOSurface, which then read its channels as they lie. Both are made as they were and read through the
+ * swizzle (-hakiosSwizzledBy:). */
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+{
+	return [[self hakiosNewTextureWithDescriptor:descriptor] hakiosSwizzledBy:[descriptor swizzle]];
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	return [[self hakiosNewTextureWithDescriptor:descriptor iosurface:surface plane:plane] hakiosSwizzledBy:[descriptor swizzle]];
 }
 
 /* The other resource kinds, each refused by name: the base class answers these with nil-stubs that say nothing. */
@@ -5746,6 +5753,34 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 - (id)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
 {
 	return [self hakiosViewWithPixelFormat:pixelFormat textureType:type levels:levels slices:slices asked:_cmd];
+}
+
+/* This texture read through SWIZZLE (MTLTextureDescriptor.swizzle): the same memory through a descriptor of its own, as
+ * a swizzled view is -- sampling alone, a store is not swizzled, in Metal either. self, or nil with self released when
+ * the core refuses the swizzle. */
+- (instancetype)hakiosSwizzledBy:(MTLTextureSwizzleChannels)swizzle
+{
+	hakios_metal_texture *swizzled;
+
+	if (swizzle.red == MTLTextureSwizzleRed && swizzle.green == MTLTextureSwizzleGreen && swizzle.blue == MTLTextureSwizzleBlue &&
+	    swizzle.alpha == MTLTextureSwizzleAlpha) {
+		return self;
+	}
+	swizzled = hakios_metal_texture_new_swizzled(_texture, swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha);
+	if (swizzled == NULL) {
+		hm_print("refused: a texture swizzled (%u %u %u %u): %s; nil\n", swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha,
+			 hakios_metal_error());
+		[self release];
+		return nil;
+	}
+	HM_ONCE("a texture was asked for with a swizzle of (%u %u %u %u): it is read through it\n", swizzle.red, swizzle.green, swizzle.blue,
+		swizzle.alpha);
+	if (_parent == nil || _ownsView) hakios_metal_texture_free(_texture);
+	_texture = swizzled;
+	if (_parent != nil) _ownsView = YES;
+	_swizzled = YES;
+	_swizzle = swizzle;
+	return self;
 }
 
 - (id)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices

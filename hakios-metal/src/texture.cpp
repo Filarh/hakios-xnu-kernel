@@ -899,6 +899,7 @@ std::shared_ptr<Texture> Texture::swizzled(const std::shared_ptr<Texture>& textu
     std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
     t->chroma_ = p.chroma_;
     t->layerPitch_ = p.layerPitch_;
+    t->memoryless_ = p.memoryless_;
     // over the parent's: a component naming red reads what the parent's red reads
     for (int c = 0; c < 4; c++) t->swizzle_[c] = swizzle[c] < 2 ? swizzle[c] : p.swizzle_[swizzle[c] - 2];
     return t;
