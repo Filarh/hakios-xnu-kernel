@@ -163,6 +163,27 @@ CompileTimes takeCompileTimes();
 // registers and 512 bytes of spills with the preamble, 21 and none without; its draws 6.6 ms each so, 2.6 without.)
 bool preferWithoutPreamble(const Kernel& with, const Kernel& without);
 
+// Nothing compiled in use: every stage compileStage makes and every kernel compileAir makes is kept twice in the cache
+// directory (HAKIOS_METAL_CACHE) -- the result, filed under this build's key, and what made it: a recipe in
+// recipes/, which names the bitcode by its hash (the bitcode itself in recipes/<hash>.air, once), the function constants,
+// IBO_BASE, and for a known buffer its binding, the bytes the compilation read (a mask) and their values. A recipe does
+// not depend on the build. warmUp compiles every recipe of the writable directory and of each seed
+// (HAKIOS_METAL_CACHE_SEED) whose result this build has not filed yet, in the calling thread, one at a time (the one
+// compiler); the plug-in runs it as the device is made, before the window server draws, so that a driver whose
+// compiler changed (a new key: every stage again) compiles what it compiled before while the boot screen is up, and
+// not when the interface first asks for it. What no recipe holds yet -- a pipeline first made in use -- is compiled
+// when it is asked for, as before, and holds one from then on.
+struct WarmUpReport {
+    uint32_t recipes = 0;          // read, from every directory (each one once)
+    uint32_t cached = 0;           // already filed for this build: nothing to do
+    uint32_t compiled = 0;         // compiled now
+    uint32_t failed = 0;           // refused by the compiler, or whose bitcode is missing or does not read back
+    double milliseconds = 0;       // the whole walk
+    double compileMilliseconds = 0;
+    std::string firstFailure;      // the first refusal, by its recipe and reason
+};
+WarmUpReport warmUp();
+
 // VS and FS linked (render::link, and with Mesa present cross-checked against ir3_link_shaders) for a colour target of
 // COLOR0's format. nullptr with *why: the refusals render.hpp names for a stage (attributes, several colour outputs,
 // depth/stencil/sample-mask writes, framebuffer fetch, buffers/textures/samplers in either stage, a varying the VS does

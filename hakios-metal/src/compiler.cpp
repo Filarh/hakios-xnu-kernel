@@ -5,7 +5,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <set>
+
+#include <dirent.h>
+#include <sys/stat.h>
 
 #ifdef HAKIOS_METAL_MESA
 // Mesa's headers carry their own C++ guards (and templates behind them: no extern "C" around these) and are not clean
@@ -37,6 +42,8 @@ std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* wh
 }
 
 CompileTimes takeCompileTimes() { return {}; }
+
+WarmUpReport warmUp() { return {}; }
 
 std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage>, std::shared_ptr<CompiledStage>, PixelFormat, std::string* why) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
@@ -1092,8 +1099,9 @@ const char* className(uint8_t element) { return element == kElemFloat ? "floats"
 
 bool hasCompiler() { return theCompiler() != nullptr; }
 
-std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
+namespace {
+// a kernel compiled, with the compiler lock held (compileAir: the cache first)
+std::unique_ptr<CompiledKernel> compileAirOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
     if (theCompiler() == nullptr) {
         refuse(why, "ir3 has no compiler for chip 0x06030500");
         return nullptr;
@@ -1119,6 +1127,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
     out->threadgroupArgBase = t.info.threadgroup_arg_base;
     return out;
 }
+}  // namespace
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
@@ -1213,10 +1222,23 @@ std::string stageCacheWritable(const std::string& name) {
     return std::string(dir) + name;
 }
 
+// the Stage or Kernel as the file holds it: its pointers (the words, immediates, name and source it is loaded back with)
+// written as zeros, so that the same compilation makes the same file in any process -- a seed compiled elsewhere is
+// checked against the phone's by its bytes
+Stage fileStage(const Stage& stage) {
+    Stage f = stage;
+    f.k.words = nullptr;
+    f.k.immediates = nullptr;
+    f.k.name = nullptr;
+    f.k.source = nullptr;
+    return f;
+}
+
 void stageCacheSave(const std::string& path, const CompiledStage& s) {
     CacheWriter w;
     w.u32(kCacheMagic);
-    w.raw(&s.stage, sizeof(s.stage));
+    const Stage stage = fileStage(s.stage);
+    w.raw(&stage, sizeof(stage));
     w.u32(uint32_t(s.words.size()));
     w.raw(s.words.data(), s.words.size() * 4);
     w.u32(uint32_t(s.immediates.size()));
@@ -1236,8 +1258,12 @@ void stageCacheSave(const std::string& path, const CompiledStage& s) {
     for (const std::string& v : s.varyingNames) w.str(v);
     w.u32(uint32_t(s.inlineSamplers.size()));
     for (const auto& is : s.inlineSamplers) {
+        // (the sampler's id is makeSampler's count in the process that compiled it: nothing binds an inline sampler by
+        // it, and written as it was it made the same compilation two different files)
+        Sampler sampler = is.second;
+        sampler.id = 0;
         w.u32(is.first);
-        w.raw(&is.second, sizeof(is.second));
+        w.raw(&sampler, sizeof(sampler));
     }
     w.u32(s.iboBase);
     w.u32(s.writesMemory ? 1 : 0);
@@ -1395,6 +1421,338 @@ void knownIndexNote(const std::string& index, const KnownBuffer& known, const st
 }
 }  // namespace
 
+namespace {
+// --- recipes: what a stage or a kernel was compiled from, kept to compile it again before it is asked for ---------
+// A recipe file is the inputs of one compilation, independent of the build: KIND (a stage or a kernel), the bitcode's
+// hash and length, IBO_BASE, the constants as supplied, and for a known buffer its binding, the mask of the bytes the
+// compilation read and their values (0 elsewhere: what was not read decided nothing, and compiling the values alone
+// gives the same stage and the same mask). Its name is a hash of its bytes; the bitcode lies beside it once, by hash.
+constexpr uint32_t kRecipeMagic = 0x43524d48;   // "HMRC"
+constexpr uint32_t kRecipeVersion = 1;
+enum : uint32_t { kRecipeStage = 0, kRecipeKernel = 1 };
+
+struct Hash128 {
+    uint64_t a = 0xcbf29ce484222325ull, b = 0x84222325cbf29ce4ull;
+    void mix(const void* p, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t c = static_cast<const uint8_t*>(p)[i];
+            a = (a ^ c) * 0x100000001b3ull;
+            b = (b ^ c) * 0x1000193ull + (b >> 29);
+        }
+    }
+    std::string hex() const {
+        char t[40];
+        snprintf(t, sizeof(t), "%016llx%016llx", (unsigned long long)a, (unsigned long long)b);
+        return t;
+    }
+};
+
+std::vector<std::string> seedDirectories() {
+    std::vector<std::string> dirs;
+    const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+    for (const char* p = seed; p != nullptr && *p != 0;) {
+        const char* colon = strchr(p, ':');
+        std::string d(p, colon != nullptr ? size_t(colon - p) : strlen(p));
+        p = colon != nullptr ? colon + 1 : nullptr;
+        if (!d.empty()) dirs.push_back(std::move(d));
+    }
+    return dirs;
+}
+
+bool fileExists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// written whole or not at all: to a temporary name, then renamed (two processes writing the same file write the same bytes)
+bool writeWhole(const std::string& path, const void* data, size_t size) {
+    const std::string tmp = path + ".tmp" + std::to_string(uint64_t(uintptr_t(&tmp)) & 0xffff);
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return false;
+    const bool written = fwrite(data, 1, size, f) == size;
+    fclose(f);
+    if (!written || rename(tmp.c_str(), path.c_str()) != 0) {
+        remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool readWhole(const std::string& path, std::string* out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    out->clear();
+    char chunk[65536];
+    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) out->append(chunk, n);
+    fclose(f);
+    return true;
+}
+
+struct Recipe {
+    uint32_t kind = kRecipeStage;
+    Hash128 bitcode;
+    uint64_t bitcodeSize = 0;
+    uint32_t iboBase = 0;
+    FunctionConstants constants;
+    bool known = false;
+    uint32_t binding = 0;
+    std::vector<uint8_t> mask, values;
+};
+
+std::string recipeBytes(const Recipe& r) {
+    CacheWriter w;
+    w.u32(kRecipeMagic);
+    w.u32(kRecipeVersion);
+    w.u32(r.kind);
+    w.raw(&r.bitcode.a, 8);
+    w.raw(&r.bitcode.b, 8);
+    w.raw(&r.bitcodeSize, 8);
+    w.u32(r.iboBase);
+    w.u32(uint32_t(r.constants.size()));
+    for (const FunctionConstant& c : r.constants) {
+        w.u32(c.index);
+        w.raw(&c.bits, 8);
+    }
+    w.u32(r.known ? 1 : 0);
+    w.u32(r.binding);
+    w.u32(uint32_t(r.mask.size()));
+    w.raw(r.mask.data(), r.mask.size());
+    w.raw(r.values.data(), r.values.size());
+    return w.out;
+}
+
+bool recipeParse(const std::string& data, Recipe* r) {
+    CacheReader in{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
+    if (in.u32() != kRecipeMagic || in.u32() != kRecipeVersion) return false;
+    r->kind = in.u32();
+    in.raw(&r->bitcode.a, 8);
+    in.raw(&r->bitcode.b, 8);
+    in.raw(&r->bitcodeSize, 8);
+    r->iboBase = in.u32();
+    const uint32_t n = in.u32();
+    if (!in.ok || n > 4096) return false;
+    r->constants.resize(n);
+    for (FunctionConstant& c : r->constants) {
+        c.index = in.u32();
+        in.raw(&c.bits, 8);
+    }
+    r->known = in.u32() != 0;
+    r->binding = in.u32();
+    const uint32_t length = in.u32();
+    if (!in.ok || length > 65536 || (r->kind != kRecipeStage && r->known)) return false;
+    r->mask.resize(length);
+    r->values.resize(length);
+    in.raw(r->mask.data(), length);
+    in.raw(r->values.data(), length);
+    return in.ok && in.p == in.end && (r->kind == kRecipeStage || r->kind == kRecipeKernel) && r->bitcodeSize != 0;
+}
+
+std::mutex gRecipeLock;
+std::set<std::string> gRecipesNoted;   // in this process: each recipe looked for once
+
+// the recipe of a compilation that gave a result (compiled now, or found), in the writable cache's recipes/; READS the
+// mask of the known buffer's bytes the compilation read (all of them when not known: a stage of a cache that kept none)
+void recipeNote(uint32_t kind, const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known,
+                const std::vector<uint8_t>* reads) {
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir == nullptr || dir[0] == 0 || bitcode == nullptr || size == 0) return;
+    Recipe r;
+    r.kind = kind;
+    r.bitcode.mix(bitcode, size);
+    r.bitcodeSize = size;
+    r.iboBase = iboBase;
+    r.constants = constants;
+    if (known != nullptr) {
+        r.known = true;
+        r.binding = known->binding;
+        r.mask = reads != nullptr && reads->size() == known->bytes.size() ? *reads : std::vector<uint8_t>(known->bytes.size(), 0xff);
+        r.values.resize(known->bytes.size());
+        for (size_t i = 0; i < r.values.size(); i++) r.values[i] = known->bytes[i] & r.mask[i];
+    }
+    const std::string body = recipeBytes(r);
+    Hash128 name;
+    name.mix(body.data(), body.size());
+    const std::string recipes = std::string(dir) + "/recipes";
+    const std::string path = recipes + "/" + name.hex() + ".recipe";
+    {
+        std::lock_guard<std::mutex> g(gRecipeLock);
+        if (!gRecipesNoted.insert(path).second) return;
+    }
+    if (fileExists(path)) return;
+    mkdir(recipes.c_str(), 0755);
+    const std::string air = recipes + "/" + r.bitcode.hex() + ".air";
+    if (!fileExists(air) && !writeWhole(air, bitcode, size)) return;
+    writeWhole(path, body.data(), body.size());
+}
+
+// --- kernels in the cache, as stages are: what compileAir made, filed under a hash of what made it -------------------
+constexpr uint32_t kKernelMagic = 0x4b434d48;   // "HMCK"
+
+std::string kernelCacheName(const void* bitcode, size_t size, const FunctionConstants& constants) {
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+    if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
+    Hash128 h;
+    const char tag[] = "kernel";
+    const uint32_t layout[2] = {uint32_t(sizeof(Kernel)), uint32_t(sizeof(Resource))};
+    h.mix(tag, sizeof(tag));
+    h.mix(kCacheBuild, strlen(kCacheBuild));
+    h.mix(layout, sizeof(layout));
+    h.mix(bitcode, size);
+    for (const FunctionConstant& c : constants) {
+        h.mix(&c.index, sizeof(c.index));
+        h.mix(&c.bits, sizeof(c.bits));
+    }
+    return "/" + h.hex() + ".kernel";
+}
+
+void kernelCacheSave(const std::string& path, const CompiledKernel& k) {
+    CacheWriter w;
+    w.u32(kKernelMagic);
+    Kernel kernel = k.kernel;
+    kernel.words = nullptr;
+    kernel.immediates = nullptr;
+    kernel.name = nullptr;
+    kernel.source = nullptr;
+    w.raw(&kernel, sizeof(kernel));
+    w.u32(uint32_t(k.words.size()));
+    w.raw(k.words.data(), k.words.size() * 4);
+    w.u32(uint32_t(k.immediates.size()));
+    w.raw(k.immediates.data(), k.immediates.size() * 4);
+    w.u32(uint32_t(k.resources.size()));
+    for (const Resource& r : k.resources) {
+        w.u32(uint32_t(r.kind));
+        w.u32(r.index);
+        w.u32(r.sizeBytes);
+        const uint8_t flags[8] = {r.read, r.write, r.irWrite, r.textureDim, r.textureArray, r.element, r.nullTexture, r.inlineSampler};
+        w.raw(flags, sizeof(flags));
+        w.str(r.typeName);
+        w.u32(r.argbufSet);
+        w.u32(r.argbufOffset);
+    }
+    w.u32(uint32_t(k.inlineSamplers.size()));
+    for (const auto& is : k.inlineSamplers) {
+        Sampler sampler = is.second;
+        sampler.id = 0;   // (as a stage's: see stageCacheSave)
+        w.u32(is.first);
+        w.raw(&sampler, sizeof(sampler));
+    }
+    w.u32(k.threadgroupBytes);
+    w.u32(k.hasThreadgroupArg ? 1 : 0);
+    w.u32(k.threadgroupArgBase);
+    w.str(k.name);
+    w.str(k.listing);
+    writeWhole(path, w.out.data(), w.out.size());
+}
+
+std::unique_ptr<CompiledKernel> kernelCacheLoad(const std::string& path) {
+    std::string data;
+    if (!readWhole(path, &data)) return nullptr;
+    CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
+    auto k = std::make_unique<CompiledKernel>();
+    if (r.u32() != kKernelMagic || !r.raw(&k->kernel, sizeof(k->kernel))) return nullptr;
+    k->words.resize(r.u32());
+    r.raw(k->words.data(), k->words.size() * 4);
+    k->immediates.resize(r.u32());
+    r.raw(k->immediates.data(), k->immediates.size() * 4);
+    const uint32_t nres = r.u32();
+    if (!r.ok || nres > 4096) return nullptr;
+    k->resources.resize(nres);
+    for (Resource& res : k->resources) {
+        res.kind = Resource::Kind(r.u32());
+        res.index = r.u32();
+        res.sizeBytes = r.u32();
+        uint8_t flags[8] = {};
+        r.raw(flags, sizeof(flags));
+        res.read = flags[0], res.write = flags[1], res.irWrite = flags[2], res.textureDim = flags[3];
+        res.textureArray = flags[4], res.element = flags[5], res.nullTexture = flags[6], res.inlineSampler = flags[7];
+        res.typeName = r.str();
+        res.argbufSet = r.u32();
+        res.argbufOffset = r.u32();
+    }
+    const uint32_t nis = r.u32();
+    if (!r.ok || nis > 4096) return nullptr;
+    k->inlineSamplers.resize(nis);
+    for (auto& is : k->inlineSamplers) {
+        is.first = r.u32();
+        r.raw(&is.second, sizeof(is.second));
+    }
+    k->threadgroupBytes = r.u32();
+    k->hasThreadgroupArg = r.u32() != 0;
+    k->threadgroupArgBase = r.u32();
+    k->name = r.str();
+    k->listing = r.str();
+    if (!r.ok || r.p != r.end) return nullptr;
+    k->kernel.words = k->words.data();
+    k->kernel.numWords = uint32_t(k->words.size());
+    k->kernel.immediates = k->immediates.empty() ? nullptr : k->immediates.data();
+    k->kernel.numImmediates = uint32_t(k->immediates.size());
+    k->kernel.name = k->name.c_str();
+    k->kernel.source = "";
+    return k;
+}
+
+// a kernel of that name in the writable cache or in a seed, or nullptr
+std::unique_ptr<CompiledKernel> kernelCacheFind(const std::string& name) {
+    if (name.empty()) return nullptr;
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir != nullptr && dir[0] != 0) {
+        if (std::unique_ptr<CompiledKernel> k = kernelCacheLoad(std::string(dir) + name)) return k;
+    }
+    for (const std::string& d : seedDirectories()) {
+        if (std::unique_ptr<CompiledKernel> k = kernelCacheLoad(d + name)) return k;
+    }
+    return nullptr;
+}
+
+// whether a file NAME is in the writable cache or a seed
+bool cachedAnywhere(const std::string& name) {
+    if (name.empty()) return false;
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir != nullptr && dir[0] != 0 && fileExists(std::string(dir) + name)) return true;
+    for (const std::string& d : seedDirectories()) {
+        if (fileExists(d + name)) return true;
+    }
+    return false;
+}
+
+// whether an index of DIR holds a record for KNOWN's bytes whose stage is there (knownIndexFind, without reading the stage)
+bool knownIndexHas(const std::string& dir, const std::string& index, const KnownBuffer& known) {
+    std::string data;
+    if (dir.empty() || index.empty() || !readWhole(dir + index, &data)) return false;
+    const size_t length = known.bytes.size(), record = 2 * length + kStageNameBytes;
+    for (size_t at = 0; length != 0 && at + record <= data.size(); at += record) {
+        const uint8_t* mask = reinterpret_cast<const uint8_t*>(data.data()) + at;
+        const uint8_t* values = mask + length;
+        bool same = true;
+        for (size_t i = 0; same && i < length; i++) same = ((known.bytes[i] ^ values[i]) & mask[i]) == 0;
+        if (!same) continue;
+        char name[kStageNameBytes + 1] = {};
+        memcpy(name, values + length, kStageNameBytes);
+        if (name[0] == '/' && strchr(name + 1, '/') == nullptr && fileExists(dir + name)) return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+    // (as compileStage: a kernel compiled before is read back without the compiler; the compiler is taken to compile)
+    const std::string name = kernelCacheName(bitcode, size, constants);
+    if (std::unique_ptr<CompiledKernel> k = kernelCacheFind(name)) {
+        recipeNote(kRecipeKernel, bitcode, size, constants, 0, nullptr, nullptr);
+        return k;
+    }
+    std::lock_guard<std::mutex> g(gCompilerLock);
+    if (std::unique_ptr<CompiledKernel> k = kernelCacheFind(name)) return k;
+    std::unique_ptr<CompiledKernel> k = compileAirOnce(bitcode, size, why, constants);
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (k != nullptr && !name.empty() && dir != nullptr && dir[0] != 0) {
+        kernelCacheSave(std::string(dir) + name, *k);
+        recipeNote(kRecipeKernel, bitcode, size, constants, 0, nullptr, nullptr);
+    }
+    return k;
+}
+
 CompileTimes takeCompileTimes() {
     const CompileTimes t = tCompileTimes;
     tCompileTimes = CompileTimes{};
@@ -1425,6 +1783,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     if (std::unique_ptr<CompiledStage> s = found()) {
         tCompileTimes.cached++;
         tCompileTimes.loadedUs += microsecondsSince(began);
+        recipeNote(kRecipeStage, bitcode, size, constants, iboBase, known, known != nullptr ? &s->knownReads : nullptr);
         return s;
     }
     tCompileTimes.loadedUs += microsecondsSince(began);
@@ -1461,12 +1820,108 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         chosen->knownReads = reads;
         if (!cached.empty()) knownIndexNote(index, *known, reads, name);
     }
+    if (chosen != nullptr && !cached.empty()) recipeNote(kRecipeStage, bitcode, size, constants, iboBase, known, known != nullptr ? &reads : nullptr);
     tCompileTimes.compiled++;
     tCompileTimes.compiledUs += microsecondsSince(compiling);
     return chosen;
 }
 
 
+
+WarmUpReport warmUp() {
+    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    WarmUpReport report;
+    std::vector<std::string> dirs;
+    if (const char* dir = getenv("HAKIOS_METAL_CACHE"); dir != nullptr && dir[0] != 0) dirs.push_back(dir);
+    for (const std::string& d : seedDirectories()) dirs.push_back(d);
+    // every recipe once, by its file name (a seed's and the writable cache's are the same file when they are the same)
+    std::map<std::string, std::string> recipes;   // name -> the directory it was found in first
+    for (const std::string& d : dirs) {
+        DIR* listing = opendir((d + "/recipes").c_str());
+        if (listing == nullptr) continue;
+        while (struct dirent* e = readdir(listing)) {
+            const std::string n = e->d_name;
+            if (n.size() > 7 && n.compare(n.size() - 7, 7, ".recipe") == 0) recipes.emplace(n, d);
+        }
+        closedir(listing);
+    }
+    std::map<std::string, std::string> bitcodes;   // by hash, read once
+    auto bitcodeOf = [&](const Recipe& r, std::string** out) {
+        const std::string hex = r.bitcode.hex();
+        auto it = bitcodes.find(hex);
+        if (it == bitcodes.end()) {
+            std::string bytes;
+            for (const std::string& d : dirs) {
+                if (readWhole(d + "/recipes/" + hex + ".air", &bytes)) break;
+                bytes.clear();
+            }
+            Hash128 check;
+            check.mix(bytes.data(), bytes.size());
+            if (bytes.size() != r.bitcodeSize || check.a != r.bitcode.a || check.b != r.bitcode.b) bytes.clear();
+            it = bitcodes.emplace(hex, std::move(bytes)).first;
+        }
+        *out = &it->second;
+        return !it->second.empty();
+    };
+    auto fail = [&](const std::string& name, const std::string& why) {
+        report.failed++;
+        if (report.firstFailure.empty()) report.firstFailure = name + ": " + why;
+    };
+    for (const auto& [name, dir] : recipes) {
+        report.recipes++;
+        std::string data;
+        Recipe r;
+        std::string* bitcode = nullptr;
+        if (!readWhole(dir + "/recipes/" + name, &data) || !recipeParse(data, &r)) {
+            fail(name, "the recipe does not read back");
+            continue;
+        }
+        if (!bitcodeOf(r, &bitcode)) {
+            fail(name, "its bitcode " + r.bitcode.hex() + ".air is missing or not what the recipe names");
+            continue;
+        }
+        if (r.kind == kRecipeKernel) {
+            if (cachedAnywhere(kernelCacheName(bitcode->data(), bitcode->size(), r.constants))) {
+                report.cached++;
+                continue;
+            }
+        } else {
+            KnownBuffer known;
+            known.binding = r.binding;
+            known.bytes = r.values;
+            const std::string stage = stageCacheName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, r.known ? &known : nullptr);
+            bool there = cachedAnywhere(stage);
+            if (!there && r.known) {
+                const std::string index = knownIndexName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, known);
+                for (const std::string& d : dirs) there = there || knownIndexHas(d, index, known);
+            }
+            if (there) {
+                report.cached++;
+                continue;
+            }
+        }
+        const std::chrono::steady_clock::time_point compiling = std::chrono::steady_clock::now();
+        std::string why;
+        bool made;
+        if (r.kind == kRecipeKernel) {
+            made = compileAir(bitcode->data(), bitcode->size(), &why, r.constants) != nullptr;
+        } else {
+            KnownBuffer known;
+            known.binding = r.binding;
+            known.bytes = r.values;
+            made = compileStage(bitcode->data(), bitcode->size(), &why, r.constants, r.iboBase, r.known ? &known : nullptr) != nullptr;
+        }
+        report.compileMilliseconds += microsecondsSince(compiling) / 1000.0;
+        if (made) {
+            report.compiled++;
+        } else {
+            fail(name, why);
+        }
+    }
+    (void)takeCompileTimes();   // (the warm-up's own: not a pipeline's)
+    report.milliseconds = microsecondsSince(began) / 1000.0;
+    return report;
+}
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
