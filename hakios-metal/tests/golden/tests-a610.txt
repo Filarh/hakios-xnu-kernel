@@ -163,6 +163,11 @@ link_refuses_more_varyings_than_the_table_holds submits 0 words 0 draws 0 loads 
 metallib_reads_its_functions submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 metallib_universal_takes_air64 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 metallib_refuses_what_does_not_hold_together submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_no_copy_buffer_is_the_programs_own_memory submits 2 words 222 draws 0 loads 0 stream 0868df6df4968ddc state cbf29ce484222325 names 6 1313462031b27dc7
+a_no_copy_buffer_off_a_page_is_refused_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+without_the_kernels_sharing_a_no_copy_buffer_is_refused_not_copied submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+the_deallocator_runs_after_the_last_command_buffer_that_used_it submits 1 words 10 draws 0 loads 0 stream 6ee8853323e9d305 state cbf29ce484222325 names 2 701a44c9b971dc94
+a_texture_over_a_no_copy_buffer_reads_the_programs_rows submits 1 words 640 draws 0 loads 0 stream 920264873192b65d state cbf29ce484222325 names 5 15cc1321d356ef14
 parity_is_odd submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 headers_match_mesa submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 decode_round_trips_and_catches_bad_parity submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

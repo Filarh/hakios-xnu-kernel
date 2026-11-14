@@ -47,17 +47,39 @@ struct ProgramState;
 class Buffer {
 public:
     Buffer(std::unique_ptr<Bo> bo, uint64_t length) : bo_(std::move(bo)), length_(length) {}
+    // over the program's own memory (newBufferNoCopy): RELEASED runs once the Buffer is gone and its Bo closed, which is
+    // after the last command buffer that used it has completed (each keeps it until then)
+    Buffer(std::unique_ptr<Bo> bo, uint64_t length, std::function<void()> released)
+        : bo_(std::move(bo)), length_(length), released_(std::move(released)), programMemory_(true) {}
+    ~Buffer() {
+        bo_.reset();
+        if (released_) released_();
+    }
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
     uint64_t length() const { return length_; }
     void* contents() const { return bo_->cpu(); }
     uint64_t gpuAddress() const { return bo_->gpuAddress(); }
     const Bo& bo() const { return *bo_; }
+    // the program's memory (newBufferNoCopy), cached by the processor; every other buffer is the driver's, write-combined
+    bool programMemory() const { return programMemory_; }
 
 private:
     std::unique_ptr<Bo> bo_;
     uint64_t length_;
+    std::function<void()> released_;
+    bool programMemory_ = false;
 };
 
 std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why);
+// -newBufferWithBytesNoCopy:length:options:deallocator:: a Buffer that IS the program's memory [BYTES, BYTES + LENGTH),
+// as Metal makes one -- the GPU reads what the program writes there before a command buffer that uses it is committed,
+// whenever it wrote it, and the program sees what the GPU wrote there once that command buffer has completed. BYTES and
+// LENGTH multiples of 4096, the GPU's page (Metal asks the caller for page-aligned memory). The kernel holds the pages
+// while the Buffer lives and keeps the processor's caches and the GPU's view of them agreeing (xnu patch 0380); a kernel
+// without that is refused by name, for a copy would be another buffer, not this one. RELEASED (Metal's deallocator):
+// see Buffer. nullptr with *why.
+std::shared_ptr<Buffer> newBufferNoCopy(Gpu& gpu, void* bytes, uint64_t length, std::function<void()> released, std::string* why);
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.

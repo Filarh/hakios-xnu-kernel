@@ -91,9 +91,49 @@ std::unique_ptr<Bo> Gpu::surfaceBo(uint32_t surfaceId, SurfaceInfo* out, int* er
     return std::unique_ptr<Bo>(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
 }
 
+bool Gpu::sharesMemory() {
+    int known = sharesMemory_.load(std::memory_order_relaxed);
+    if (known < 0) {
+        uint64_t v = 0;
+        known = param(kParamUserMemory, &v) == 0 && v == 1 ? 1 : 0;
+        sharesMemory_.store(known, std::memory_order_relaxed);
+    }
+    return known == 1;
+}
+
+std::unique_ptr<Bo> Gpu::userBo(void* address, uint64_t size, int* error) {
+    *error = 0;
+    const uint64_t at = uint64_t(uintptr_t(address));
+    if (address == nullptr || at % 4096 != 0 || size == 0 || size % 4096 != 0) {
+        *error = EINVAL;
+        return nullptr;
+    }
+    if (!sharesMemory()) {
+        *error = ENOSYS;
+        return nullptr;
+    }
+    UserMemory u{};
+    u.address = at;
+    u.size = size;
+    if ((*error = t_->call(kUserMemory, &u, sizeof(u))) != 0) {
+        return nullptr;
+    }
+    MsmGemInfo info{};
+    info.handle = u.handle;
+    info.info = kInfoGetIova;
+    if ((*error = t_->call(kGemInfo, &info, sizeof(info))) != 0) {
+        DrmGemClose c{u.handle, 0};
+        t_->call(kGemClose, &c, sizeof(c));
+        return nullptr;
+    }
+    std::unique_ptr<Bo> bo(new Bo(*this, u.handle, size, info.value, address));
+    bo->mapped_ = false;
+    return bo;
+}
+
 void Gpu::disown(std::unique_ptr<Bo> bo) {
     if (bo == nullptr) return;
-    if (bo->cpu_ != nullptr) {
+    if (bo->cpu_ != nullptr && bo->mapped_) {
         t_->unmap(bo->handle_, bo->cpu_);
         bo->cpu_ = nullptr;
     }
@@ -114,7 +154,7 @@ void Gpu::release(Bo& bo) {
         allocated_ -= bo.size_;
         bo.counted_ = false;
     }
-    if (bo.cpu_ != nullptr) {
+    if (bo.cpu_ != nullptr && bo.mapped_) {
         t_->unmap(bo.handle_, bo.cpu_);
     }
     DrmGemClose c{bo.handle_, 0};
