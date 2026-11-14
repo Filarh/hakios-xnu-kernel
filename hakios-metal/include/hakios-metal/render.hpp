@@ -359,6 +359,10 @@ struct Draw {
     uint64_t indirectOffset = 0;
     Viewport viewport{};
     Scissor scissor{};                           // width 0: the whole target
+    // MTLScissorRect of no area (a width or a height of 0): no fragment passes. The draw is still a draw of its pass --
+    // it opens it, with its Clear -- and is written with the scissor turnip writes for an empty one, (1, 1)-(0, 0).
+    // (SCISSOR's height 0 with a width says the same.)
+    bool scissorEmpty = false;
     float blendColor[4] = {0, 0, 0, 0};          // -setBlendColorRed:green:blue:alpha: (RB_BLEND_*_F32), read by the BlendColor/BlendAlpha factors
     DepthState depth{};                          // -setDepthStencilState: (refused with a depth test and no depth attachment)
     StencilState stencil{};                      // ...its stencil half (refused enabled with no stencil attachment)

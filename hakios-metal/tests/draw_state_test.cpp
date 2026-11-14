@@ -203,6 +203,26 @@ TEST(a_program_changed_by_the_c_interface_is_another_program_to_a_draw) {
     hakios_metal_program_free(p);
 }
 
+// Through the C interface a scissor rectangle of no width, or of no height, is a scissor nothing passes -- not the
+// core's "width 0: the whole target", which is what no rectangle at all (NULL) is. The draw is taken, among draws of
+// the same program that have their own rectangles, and the buffer completes with nothing left out.
+TEST(a_scissor_of_no_area_through_the_c_interface_is_drawn_as_one) {
+    CRig r;
+    hakios_metal_program* p = hakios_metal_program_from_stages(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, 70);
+    CHECK(p != nullptr);
+    if (p == nullptr) return;
+    hakios_metal_render_pass pass = r.pass();
+    hakios_metal_cb* cb = hakios_metal_cb_new(r.queue);
+    const hakios_metal_scissor some = {8, 8, 16, 16}, noWidth = {8, 8, 0, 16}, noHeight = {8, 8, 16, 0};
+    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &some, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
+    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &noWidth, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
+    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &noHeight, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
+    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &some, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
+    CHECK_EQ(hakios_metal_cb_skipped(cb, nullptr), 0u);
+    CHECK(done(cb) == HAKIOS_METAL_COMPLETED);
+    hakios_metal_program_free(p);
+}
+
 // A draw the kept state cannot take is judged the long way and refused by the sentence it always was: a constant buffer
 // not bound, after a draw that had it; a texture of the wrong class; a viewport outside the target. And the draw after,
 // with what it needs, is drawn.

@@ -318,6 +318,10 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
     return true;
 }
 
+// A scissor of no area as the registers say it: x and y 1, no width and no height, which the screen scissor's inclusive
+// corners (x, y)-(x + width - 1, y + height - 1) make (1, 1)-(0, 0)
+constexpr Scissor kEmptyScissor{1, 1, 0, 0};
+
 // gl_vert_attrib's VERT_ATTRIB_GENERIC0 (Mesa shader_enums.h): a VS input at this slot + n is [[attribute(n)]]
 constexpr uint32_t kVertAttribGeneric0 = 15;
 
@@ -1666,10 +1670,12 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
                                ") covers no pixel of the " + n(W) + " x " + n(H) + " target");
     }
     Scissor sc = draw.scissor;
-    if (sc.width == 0) {
+    if (draw.scissorEmpty || (sc.width != 0 && sc.height == 0)) {
+        // no area: nothing passes. The corners are inclusive, and an empty rectangle is said as turnip says it, the
+        // top left past the bottom right (tu_pipeline.cc:2669-2672: min 1, max 0)
+        sc = kEmptyScissor;
+    } else if (sc.width == 0) {
         sc = Scissor{0, 0, W, H};   // render.hpp: width 0 is the whole target
-    } else if (sc.height == 0) {
-        return refuse(why, "a scissor of " + n(sc.width) + " x 0 pixels: an empty scissor draws nothing (width 0 means the whole target)");
     } else if (uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
         return refuse(why, "scissor (" + n(sc.x) + ", " + n(sc.y) + ", " + n(sc.width) + ", " + n(sc.height) + ") lies outside the " + n(W) + " x " + n(H) + " target");
     }
@@ -2625,6 +2631,7 @@ bool drawArea(const RenderPass& pass, const Draw& draw, uint32_t area[4]) {
     uint32_t x0 = uint32_t(std::max(0.0, std::floor(vp.x))), y0 = uint32_t(std::max(0.0, std::floor(vp.y)));
     uint32_t x1 = std::min(W, uint32_t(std::ceil(vp.x + vp.width))) - 1, y1 = std::min(H, uint32_t(std::ceil(vp.y + vp.height))) - 1;
     const Scissor& sc = draw.scissor;
+    if (draw.scissorEmpty) return false;   // (it touches nothing)
     if (sc.width != 0) {
         if (sc.height == 0 || uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) return false;
         x0 = std::max(x0, sc.x);
@@ -3730,9 +3737,11 @@ bool fastFacts(const ProgramState& ps, const PassCache& pc, const RenderPass& pa
     if (!(vp.width > 0.0) || !(vp.height > 0.0)) return false;
     if (vp.x >= double(W) || vp.y >= double(H) || vp.x + vp.width <= 0.0 || vp.y + vp.height <= 0.0) return false;
     Scissor sc = draw.scissor;
-    if (sc.width == 0) {
+    if (draw.scissorEmpty || (sc.width != 0 && sc.height == 0)) {
+        sc = kEmptyScissor;
+    } else if (sc.width == 0) {
         sc = Scissor{0, 0, W, H};
-    } else if (sc.height == 0 || uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
+    } else if (uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
         return false;
     }
     f->sc = sc;

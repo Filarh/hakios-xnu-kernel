@@ -1777,6 +1777,8 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         const uint32_t* sc = which == 0 ? d.screenScissor : d.viewportScissor;
         // (in a tile the window scissor is the tile's and the draw's scissors are the target's, as on any pass: the
         // window clips them, which is how a draw visits every tile)
+        // (the screen scissor of no area, as turnip writes one: (1, 1)-(0, 0). Nothing of the draw passes it.)
+        if (which == 0 && sc[0] == 1 && sc[1] == 1 && sc[2] == 0 && sc[3] == 0) continue;
         if (sc[0] > sc[2] || sc[1] > sc[3] || (!inTile_ && (sc[2] > d.windowScissor[2] || sc[3] > d.windowScissor[3]))) {
             fault(std::string(which == 0 ? "GRAS_SC_SCREEN_SCISSOR[0]" : "GRAS_SC_VIEWPORT_SCISSOR[0]") +
                   text(" (%llu, %llu)-", sc[0], sc[1]) + text("(%llu, %llu) is not inside the window scissor", sc[2], sc[3]) +
@@ -2006,7 +2008,8 @@ int FakeGpu::drawRuns(uint32_t word0, int depth) {
         fault(text("draw %llu of a tile whose binning pass binned %llu: the streams name no such draw", n + 1, binnedDraws_.size()));
         return -1;
     }
-    auto reaches = [&](const Binned& b) { return b.x0 <= tileBin_[2] && b.x1 >= tileBin_[0] && b.y0 <= tileBin_[3] && b.y1 >= tileBin_[1]; };
+    // (a draw whose scissors leave it no pixel reaches no tile)
+    auto reaches = [&](const Binned& b) { return b.x0 <= b.x1 && b.y0 <= b.y1 && b.x0 <= tileBin_[2] && b.x1 >= tileBin_[0] && b.y0 <= tileBin_[3] && b.y1 >= tileBin_[1]; };
     if (reaches(binnedDraws_[n])) return 1;
     stats_.drawsSkipped++;
     bool more = false;
