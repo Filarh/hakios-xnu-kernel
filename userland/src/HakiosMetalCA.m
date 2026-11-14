@@ -99,6 +99,7 @@
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <os/lock.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1225,6 +1226,8 @@ HM_REFUSES_OUT_LOUD
 - (hakios_metal_sampler *)hakiosSampler;
 @end
 
+#define HM_SPEC_MOST 64   /* the contents of its deciding buffer an uber shader's pipeline is specialised for */
+
 @interface HakiosMetalComputePipelineState : _MTLComputePipelineState {
 	HakiosMetalDevice *_device;
 	hakios_metal_kernel *_kernel;
@@ -1242,13 +1245,19 @@ HM_REFUSES_OUT_LOUD
 	hakios_metal_program *_program;
 	uint64_t _hakiosUniqueIdentifier;   /* the base's uniqueIdentifier is a nil-stub; see the sampler */
 	/* an uber shader's specialisations (hakiosProgramFor:): its fragment bitcode and constants, the constant buffer
-	 * whose bytes choose its path, and the programs compiled for each content seen (NSNull while one compiles) */
+	 * whose bytes choose its path, and for each content seen (HM_SPEC_MOST at most) its bytes, their hash and the
+	 * program compiled for it (NULL while it compiles, or when it could not be) -- plain arrays under a lock, because
+	 * every draw of the pipeline asks */
 	NSData *_fsAir;
 	hakios_metal_constant _fsConstants[64];
 	unsigned _fsConstantCount;
 	int _specBinding;
 	unsigned _specLength;
-	NSMutableDictionary *_specialised;
+	os_unfair_lock _specLock;
+	unsigned _specCount;
+	uint64_t _specHashes[HM_SPEC_MOST];
+	hakios_metal_program *_specPrograms[HM_SPEC_MOST];
+	uint8_t *_specKeys;                 /* HM_SPEC_MOST x _specLength bytes */
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
 			  descriptor:(MTLRenderPipelineDescriptor *)descriptor;
@@ -1362,6 +1371,7 @@ HM_REFUSES_OUT_LOUD
 	HakiosMetalTexture *_vsTextures[HM_MAX_TEXTURES];         /* the vertex stage's, the same way */
 	HakiosMetalSamplerState *_vsSamplers[HM_MAX_SAMPLERS];
 	unsigned _vsHighestTexture, _vsHighestSampler;
+	BOOL _vsTexturesTold;                       /* the command buffer has the vertex stage's textures and samplers as they are now */
 	NSMutableArray *_scratch;                   /* the buffers -setVertexBytes:/-setFragmentBytes: made */
 	MTLWinding _frontFacingWinding;             /* -setFrontFacingWinding:'s, also in _pass.winding for the draws */
 	char _refused[160];                         /* a binding or state this encoder could not take: the next draw is failed by it */
@@ -5012,6 +5022,24 @@ HM_REFUSES_OUT_LOUD
 			hakios_metal_queue_set_deferred(_queue, 1);
 			HM_ONCE("command buffers recorded deferred, by a thread of hakios-metal's (metal_defer=1)\n");
 		}
+		/* boot-arg metal_keep=0: no draw is taken from what hakios-metal keeps of its program (hakios_metal_draw_states):
+		 * each is judged and written whole. The command stream is the same either way, so this is the switch to measure
+		 * what the kept states save and to bisect them. metal_verify=1: each draw taken from a kept state is also
+		 * written whole and the two compared; a difference fails the command buffer and is said with the refused draw
+		 * (more than a draw's cost twice over: for a check on the phone, not for use). Process-wide, read with the
+		 * first queue. */
+		{
+			static int read;
+
+			if (!read) {
+				const int keep = strstr(args, "metal_keep=0") == NULL, verify = strstr(args, "metal_verify=1") != NULL;
+
+				read = 1;
+				hakios_metal_draw_states(keep, verify);
+				if (!keep) hm_print("draws: none taken from its program's kept state (metal_keep=0)\n");
+				if (verify) hm_print("draws: each one taken from a kept state checked against itself written whole (metal_verify=1)\n");
+			}
+		}
 	}
 	_device = [device retain];
 	HM_ONCE("a command queue takes %lu command buffers at a time (maxCommandBufferCount); each one waits on the queue's "
@@ -7414,10 +7442,10 @@ HM_REFUSES_OUT_LOUD
 
 - (void)dealloc
 {
-	for (id v in [_specialised objectEnumerator]) {
-		if ([v isKindOfClass:[NSValue class]]) hakios_metal_program_free((hakios_metal_program *)[v pointerValue]);
+	for (unsigned i = 0; i < _specCount; i++) {
+		if (_specPrograms[i] != NULL) hakios_metal_program_free(_specPrograms[i]);
 	}
-	[_specialised release];
+	free(_specKeys);
 	[_fsAir release];
 	if (_program != NULL) {
 		hakios_metal_program_free(_program);   /* a draw in flight keeps its own reference */
@@ -7462,10 +7490,34 @@ hm_spec_off(void)
 		}
 	}
 	if (_specBinding < 0) return;
+	_specKeys = calloc(HM_SPEC_MOST, _specLength);
+	if (_specKeys == NULL) {
+		_specBinding = -1;
+		return;
+	}
+	_specLock = OS_UNFAIR_LOCK_INIT;
 	_fsAir = [air retain];
 	_fsConstantCount = count < 64 ? count : 64;
 	memcpy(_fsConstants, constants, _fsConstantCount * sizeof(*constants));
-	_specialised = [[NSMutableDictionary alloc] init];
+}
+
+/* LENGTH bytes at P as one number, eight at a time (a content of at most 256 bytes, asked once a draw) */
+static uint64_t
+hm_hash_bytes(const uint8_t *p, size_t length)
+{
+	uint64_t h = 0x9e3779b97f4a7c15ull ^ length;
+
+	while (length != 0) {
+		const size_t n = length < 8 ? length : 8;
+		uint64_t w = 0;
+
+		memcpy(&w, p, n);
+		h = (h ^ w) * 0xff51afd7ed558ccdull;
+		h ^= h >> 32;
+		p += n;
+		length -= n;
+	}
+	return h;
 }
 
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
@@ -7480,21 +7532,37 @@ hm_spec_off(void)
 	const uint8_t *bytes = (const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]);
 	const uint64_t length = hakios_metal_buffer_length(buffers[_specBinding]), at = offsets[_specBinding];
 	if (bytes == NULL || at > length || length - at < _specLength) return _program;
-	NSData *key = [NSData dataWithBytes:bytes + at length:_specLength];
+	/* Every draw of the pipeline comes through here, so the content is looked up with nothing made and nothing waited
+	 * for: its bytes read once (the buffer may be memory that is slow to read), hashed, and found among the contents
+	 * seen under a lock held for that search alone. An NSData for the key, an NSDictionary's lookup and @synchronized
+	 * were an allocation, an autorelease and two calls into the runtime's lock table a draw. */
+	uint8_t key[256];
+	memcpy(key, bytes + at, _specLength);   /* (_specLength is 256 at most: hakiosKeepFragment) */
+	const uint64_t hash = hm_hash_bytes(key, _specLength);
 	hakios_metal_program *found = _program;
+	int slot = -1;
 	BOOL start = NO;
 
-	@synchronized(self) {
-		id have = [_specialised objectForKey:key];
-
-		if ([have isKindOfClass:[NSValue class]]) {
-			found = (hakios_metal_program *)[have pointerValue];
-		} else if (have == nil && [_specialised count] < 64) {
-			[_specialised setObject:[NSNull null] forKey:key];
-			start = YES;
+	os_unfair_lock_lock(&_specLock);
+	for (unsigned i = 0; i < _specCount; i++) {
+		if (_specHashes[i] == hash && memcmp(_specKeys + (size_t)i * _specLength, key, _specLength) == 0) {
+			slot = (int)i;
+			break;
 		}
 	}
+	if (slot >= 0) {
+		if (_specPrograms[slot] != NULL) found = _specPrograms[slot];
+	} else if (_specCount < HM_SPEC_MOST) {
+		slot = (int)_specCount++;
+		_specHashes[slot] = hash;
+		memcpy(_specKeys + (size_t)slot * _specLength, key, _specLength);
+		_specPrograms[slot] = NULL;
+		start = YES;
+	}
+	os_unfair_lock_unlock(&_specLock);
 	if (start) {
+		NSData *content = [NSData dataWithBytes:key length:_specLength];
+
 		dispatch_once(&once, ^{
 			compiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
 		});
@@ -7504,7 +7572,7 @@ hm_spec_off(void)
 
 			clock_gettime(CLOCK_MONOTONIC, &t0);
 			hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
-										 (unsigned)_specBinding, [key bytes], [key length]);
+										 (unsigned)_specBinding, [content bytes], [content length]);
 			clock_gettime(CLOCK_MONOTONIC, &t1);
 			if (p == NULL) {
 				hm_print("specialise: %s for its buffer %d: %s; its own program goes on\n", hakios_metal_program_name(_program), _specBinding,
@@ -7514,9 +7582,9 @@ hm_spec_off(void)
 					 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
 					 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
 			}
-			@synchronized(self) {
-				if (p != NULL) [_specialised setObject:[NSValue valueWithPointer:p] forKey:key];
-			}
+			os_unfair_lock_lock(&_specLock);
+			_specPrograms[slot] = p;   /* (NULL when it could not be compiled: the pipeline's own goes on for this content) */
+			os_unfair_lock_unlock(&_specLock);
 			[self release];
 		});
 	}
@@ -7831,6 +7899,7 @@ hm_spec_off(void)
 	}
 	HakiosMetalTexture **table = vertex ? _vsTextures : _fsTextures;
 	unsigned *highest = vertex ? &_vsHighestTexture : &_fsHighestTexture;
+	if (vertex) _vsTexturesTold = NO;
 	[texture retain];
 	[table[index] release];
 	table[index] = texture;
@@ -7855,6 +7924,7 @@ hm_spec_off(void)
 	}
 	HakiosMetalSamplerState **table = vertex ? _vsSamplers : _fsSamplers;
 	unsigned *highest = vertex ? &_vsHighestSampler : &_fsHighestSampler;
+	if (vertex) _vsTexturesTold = NO;
 	[sampler retain];
 	[table[index] release];
 	table[index] = sampler;
@@ -8368,13 +8438,18 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	for (unsigned i = 0; i < _fsHighestSampler; i++) {
 		fsSamp[i] = _fsSamplers[i] != nil ? [_fsSamplers[i] hakiosSampler] : NULL;
 	}
-	for (unsigned i = 0; i < _vsHighestTexture; i++) {
-		vsTex[i] = _vsTextures[i] != nil ? [_vsTextures[i] hakiosTexture] : NULL;
+	/* the vertex stage's textures and samplers are the command buffer's state until told otherwise: told at this
+	 * encoder's first draw (another encoder's may be there) and again after one of them changes, not at every draw */
+	if (!_vsTexturesTold) {
+		for (unsigned i = 0; i < _vsHighestTexture; i++) {
+			vsTex[i] = _vsTextures[i] != nil ? [_vsTextures[i] hakiosTexture] : NULL;
+		}
+		for (unsigned i = 0; i < _vsHighestSampler; i++) {
+			vsSamp[i] = _vsSamplers[i] != nil ? [_vsSamplers[i] hakiosSampler] : NULL;
+		}
+		hakios_metal_cb_set_vertex_textures(cb, vsTex, _vsHighestTexture, vsSamp, _vsHighestSampler);
+		_vsTexturesTold = YES;
 	}
-	for (unsigned i = 0; i < _vsHighestSampler; i++) {
-		vsSamp[i] = _vsSamplers[i] != nil ? [_vsSamplers[i] hakiosSampler] : NULL;
-	}
-	hakios_metal_cb_set_vertex_textures(cb, vsTex, _vsHighestTexture, vsSamp, _vsHighestSampler);
 	hakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];
 
 	hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
