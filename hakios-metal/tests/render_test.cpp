@@ -2084,6 +2084,65 @@ TEST(a_pushed_range_off_16_bytes_is_copied_by_the_gpu) {
     }
 }
 
+// A constant buffer bound with fewer bytes behind it than the stage's pushed range, at the very end of its pages:
+// CoreAnimation binds 16 bytes of colour there for a function whose range ir3 pads to 64 ("reads 64 bytes at 0 of
+// constant buffer 2; 16 are bound and 16 mapped behind the offset", the phone's refusal, and a layer gone from the
+// frame). Metal draws it: the function reads the bytes that are bound. Here the command processor is not let read
+// past the pages: the range is loaded direct, the bound bytes and zeros after them -- and the draw is drawn, with the
+// colour it was given, whether it comes first in its pass or after draws of the same program whose state is kept.
+TEST(a_constant_range_running_past_its_buffers_pages_is_loaded_with_what_is_there) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    const Program p{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "tri_cflat"};
+    std::string why;
+    auto colour = newBuffer(*r.gpu, 16, &why);
+    auto page = newBuffer(*r.gpu, colour->bo().size(), &why);
+    auto* bytes = static_cast<uint8_t*>(page->contents());
+    const float rgba[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    memset(bytes, 0xee, page->bo().size());
+    memcpy(bytes + page->bo().size() - 16, rgba, 16);
+    Bindings tail;
+    tail.buffers = {Binding{page.get(), page->bo().size() - 16}};
+    {
+        Encoded e(r, p, pass, wholeDraw(), render::Options{}, Bindings{}, tail);
+        CHECK(e.ok);
+        if (!e.ok) std::printf("       %s\n", e.error.c_str());
+        const size_t at = e.ok ? e.findLoad(CP_LOAD_STATE6_FRAG, ST6_CONSTANTS, SB6_FS_SHADER) : size_t(-1);
+        CHECK(at != size_t(-1));
+        if (at != size_t(-1)) {
+            const auto& w = e.stream.words();
+            CHECK(((w[at + 1] & CP_LOAD_STATE6_0_STATE_SRC__MASK) >> CP_LOAD_STATE6_0_STATE_SRC__SHIFT) == SS6_DIRECT);
+        }
+    }
+    // in a command buffer, after two draws of the same program from a whole buffer (the second from the kept state)
+    float whole[16] = {9, 9, 9, 9};
+    auto wide = newBuffer(*r.gpu, 64, &why);
+    memcpy(wide->contents(), whole, sizeof whole);
+    Bindings ok;
+    ok.buffers = {Binding{wide.get(), 0}};
+    for (int kept = 0; kept < 2; kept++) {
+        auto cb = r.queue->commandBuffer();
+        for (int i = 0; i < 2 * kept; i++) CHECK(cb->draw(p, pass, wholeDraw(), Bindings{}, ok));
+        CHECK(cb->draw(p, pass, wholeDraw(), Bindings{}, tail));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        const auto s = r.fake->stats();
+        CHECK_EQ(s.faults, 0u);
+        CHECK(!s.lastDraw.fsConsts.empty() && s.lastDraw.fsConsts[0].words.size() >= 16);
+        if (!s.lastDraw.fsConsts.empty() && s.lastDraw.fsConsts[0].words.size() >= 16) {
+            float got[4];
+            memcpy(got, s.lastDraw.fsConsts[0].words.data(), 16);
+            CHECK(memcmp(got, rgba, 16) == 0);                                              // the colour that was bound
+            for (uint32_t d = 4; d < 16; d++) CHECK_EQ(s.lastDraw.fsConsts[0].words[d], 0u);   // and nothing after it
+        }
+    }
+}
+
 TEST(a_draw_refuses_a_constant_range_it_cannot_serve_by_name) {
     Rig r;
     auto t = target(r);
@@ -2104,11 +2163,7 @@ TEST(a_draw_refuses_a_constant_range_it_cannot_serve_by_name) {
     Bindings odd;
     odd.buffers = {Binding{colour.get(), 2}};
     refusedWith(p, odd, "tri_cflat_fs_air: buffer 0: offset 2 is not a multiple of 4 inside it");
-    // the padded 64-byte range running off the object's pages: a buffer as long as its pages, bound 16 bytes before the end
-    auto page = newBuffer(*r.gpu, colour->bo().size(), &why);
-    Bindings tail;
-    tail.buffers = {Binding{page.get(), page->bo().size() - 16}};
-    refusedWith(p, tail, "tri_cflat_fs_air reads 64 bytes at 0 of constant buffer 0; 16 are bound and 16 mapped behind the offset");
+    // (the padded 64-byte range running off the object's pages is no refusal: the next test)
     // a range past the stage's constlen (the twin of the constlen the fixture carries)
     Program short_ = p;
     short_.fs.k.constlen = 0;

@@ -378,15 +378,26 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
             return refuse(why, std::string(k.name) + ": a constant range of " + n(r.sizeDwords) + " dwords, not a whole number of vec4");
         }
         // The range is ir3's, in whole vec4 and padded: fill_id reads 4 bytes of its constant and the range is 64. The
-        // GPU reads the padding too, so the read must stay inside the object's pages, where nothing faults -- not
-        // inside the length the program bound. Metal binds 4 bytes by -setBytes:length:atIndex: to such a kernel as
-        // a matter of course (the plug-in's test on the phone, 28 October), and a refusal here failed that dispatch.
-        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
-            return refuse(why, std::string(k.name) + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) +
-                                   "; " + n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset");
-        }
+        // GPU reads the padding too, which inside the object's pages is harmless -- Metal binds 4 bytes by
+        // -setBytes:length:atIndex: to such a kernel as a matter of course (the plug-in's test on the phone, 28
+        // October). Past the pages it cannot be let read: the range is loaded direct, what is there and zeros after
+        // it (render.cpp: pushedRanges).
         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
             return refuse(why, std::string(k.name) + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen");
+        }
+        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
+            const Binding& x = buffers[r.block];
+            if (x.buffer->contents() == nullptr) {
+                return refuse(why, std::string(k.name) + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) +
+                                       "; " + n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset, in a buffer mapped nowhere to read them from");
+            }
+            Range g{r.offsetVec4, r.sizeDwords / 4, 0, std::vector<uint32_t>(r.sizeDwords, 0u)};
+            const uint64_t start = 4ull * r.startDword;
+            if (start < mapped) {
+                memcpy(g.words.data(), static_cast<const uint8_t*>(x.buffer->contents()) + x.offset + start, size_t(std::min<uint64_t>(mapped - start, 4ull * r.sizeDwords)));
+            }
+            ranges.push_back(std::move(g));
+            continue;
         }
         Range g{r.offsetVec4, r.sizeDwords / 4, address + 4ull * r.startDword, {}};
         if (g.from % 16 != 0) {

@@ -327,10 +327,16 @@ TEST(a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages) {
         CHECK_EQ(r.fake->stats().faults, 0u);
     }
     {
+        // ...and bound where the padded range runs off the object's pages: dispatched all the same, the range loaded
+        // direct with the bytes that are there and zeros after them
         auto page = buffer(r, 16384, 0x1234);   // exactly one page of GPU memory
         auto cb = r.queue->commandBuffer();
-        CHECK(!cb->dispatch(kernels::fill_id_air, kGroups16, local, {Binding{out.get(), 0}, Binding{page.get(), 16384 - 32}}));
-        CHECK(cb->error().find("reads 64 bytes at 0 of constant buffer 1; 32 are bound and 32 mapped") != std::string::npos);
+        CHECK(cb->dispatch(kernels::fill_id_air, kGroups16, local, {Binding{out.get(), 0}, Binding{page.get(), 16384 - 32}}));
+        CHECK(cb->error().empty());
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
     }
 }
 

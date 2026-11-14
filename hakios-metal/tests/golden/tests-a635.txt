@@ -107,7 +107,7 @@ an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 181 draws 0 l
 a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 112 draws 0 loads 2 stream efb1320aababb718 state 73d60166aefc2a51 names 3 56e6c080795c4956
 a_dispatch_of_end_only_needs_no_buffers submits 1 words 95 draws 0 loads 1 stream c24ff6d18a99ab80 state fcfa8434f89a7626 names 2 701a44c9b971dc94
 a_dispatch_of_the_air_kernel_uploads_what_ir3_asks_for submits 1 words 136 draws 0 loads 3 stream 449c19db9735da7e state 8c52fffceb2b5e22 names 4 62d909887d830c99
-a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 1 words 136 draws 0 loads 3 stream 449c19db9735da7e state 3d0dc67eca1b1a1c names 4 62d909887d830c99
+a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 2 words 288 draws 0 loads 5 stream 5b358c3b02ab681f state 8655e73ee2957dfa names 8 db389de64df694f1
 a_refused_dispatch_is_left_out_when_the_buffer_skips_refusals submits 1 words 112 draws 0 loads 2 stream ee153db4dd4e1278 state 73d60166aefc2a51 names 3 56e6c080795c4956
 a_dispatch_that_does_not_fit_is_refused_before_anything_reaches_the_gpu submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_fake_refuses_a_program_preload_of_128_units submits 1 words 4 draws 0 loads 1 stream e509d397f8d2ce75 state eaed796d1368fce3 names 0 0000000000000000
@@ -185,6 +185,7 @@ the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flushes su
 the_fake_refuses_the_packets_a_draw_stream_may_not_carry submits 10 words 5889 draws 10 loads 20 stream c559de18b66db3d5 state fc783749c5379831 names 0 0000000000000000 (unread)
 a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer submits 1 words 688 draws 1 loads 3 stream d7cc710f48bc405c state 2a4251f1a42f82b4 names 5 15ee241ca19a0b56
 a_pushed_range_off_16_bytes_is_copied_by_the_gpu submits 2 words 1384 draws 2 loads 6 stream 3cf7c60365cf8db8 state 9fa69486849bc4f7 names 10 2bdc4839433416ac
+a_constant_range_running_past_its_buffers_pages_is_loaded_with_what_is_there submits 2 words 1462 draws 4 loads 10 stream e1a5e94e01d04a3b state c1eb18db830aec81 names 11 7ac6c21a55507769
 a_draw_refuses_a_constant_range_it_cannot_serve_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_fragment_stage_that_writes_no_colour_is_drawn_with_nothing_written submits 2 words 1292 draws 2 loads 4 stream 0ed4c278dc20d085 state 355edb16f056659d names 6 40a6fd1ebafabbc4
 a_stage_that_wants_private_memory_gets_the_queues submits 1 words 676 draws 1 loads 2 stream 75d7cb3e37eed4cd state fec70d1c3dce25f1 names 4 d4c1856640f88cb3

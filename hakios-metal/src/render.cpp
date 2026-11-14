@@ -251,9 +251,12 @@ struct PushedRanges {
     PushedRange* end() { return r + count; }
 };
 
-// The stage's pushed ranges against its own [[buffer(n)]] table, by compute's rules (compute.cpp: the range is ir3's,
-// in whole vec4 and padded -- a 16-byte float4 is pushed as 64 bytes -- so the read must stay inside the bound object's
-// pages, not inside the length bound; it must land inside the stage's constlen). False with *why naming the stage.
+// The stage's pushed ranges against its own [[buffer(n)]] table. The range is ir3's, in whole vec4 and padded -- a
+// 16-byte float4 is pushed as 64 bytes -- so what the command processor reads is more than the function does, and may
+// run past the length bound: inside the bound object's pages that is harmless, the function reads none of it. Past the
+// pages the processor cannot be let read: such a range is loaded direct instead, the bytes that are there as they are
+// when the draw is encoded and zeros after them (CoreAnimation binds 16 bytes of colour at the end of a buffer for a
+// function whose range is 64). It must land inside the stage's constlen. False with *why naming the stage.
 bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::string* why) {
     const Kernel& k = s.k;
     auto name = [&s]() { return std::string(stageName(s)); };   // (built only for a refusal: a string a draw is an allocation a draw)
@@ -285,12 +288,24 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
         if (r.sizeDwords == 0 || r.sizeDwords % 4 != 0) {
             return refuse(why, name() + ": a constant range of " + n(r.sizeDwords) + " dwords, not a whole number of vec4");
         }
-        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
-            return refuse(why, name() + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) + "; " +
-                                   n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset");
-        }
         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
             return refuse(why, name() + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
+        }
+        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
+            // (past the object's pages: what is there, read here, and zeros)
+            if (x.buffer->contents() == nullptr) {
+                return refuse(why, name() + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) + "; " +
+                                       n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset, in a buffer mapped nowhere to read them from");
+            }
+            const PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, uint32_t(out->words.size()), r.sizeDwords, false, 0, nullptr, 0, nullptr};
+            out->words.resize(out->words.size() + r.sizeDwords, 0u);
+            const uint64_t start = 4ull * r.startDword;
+            if (start < mapped) {
+                memcpy(out->words.data() + p.wordsAt, static_cast<const uint8_t*>(x.buffer->contents()) + x.offset + start,
+                       size_t(std::min<uint64_t>(mapped - start, 4ull * r.sizeDwords)));
+            }
+            out->r[out->count++] = p;
+            continue;
         }
         PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0, nullptr};
         if (p.from % 16 != 0) {
