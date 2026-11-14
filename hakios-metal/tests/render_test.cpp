@@ -5689,6 +5689,91 @@ TEST(gmem_for_a_pass_of_enough_draws_decided_at_its_end) {
     CHECK(cb->counts().gmemPasses == 0 && cb->counts().passes == 1);
 }
 
+// Tiles or sysmem by what a pass holds (render::gmemWorth): turnip's criteria on what a pass knows of itself when it
+// closes. A bar of 56 draws, one 4-byte attachment.
+TEST(tiles_or_sysmem_by_what_a_pass_holds) {
+    auto worth = [](uint32_t draws, bool fetch, uint32_t loaded, uint32_t stored, uint32_t cleared, uint32_t bar = 56, std::string* why = nullptr) {
+        render::GmemChoice c;
+        c.draws = draws;
+        c.bar = bar;
+        c.fetch = fetch;
+        c.touched = 4;
+        c.loaded = loaded;
+        c.stored = stored;
+        c.cleared = cleared;
+        return render::gmemWorth(c, why);
+    };
+    // loaded and stored: the bar itself
+    CHECK(!worth(55, false, 4, 4, 0) && worth(56, false, 4, 4, 0));
+    // nothing to load (DontCare): half of it
+    CHECK(!worth(27, false, 0, 4, 0) && worth(28, false, 0, 4, 0));
+    // a Clear the tiles do themselves, which a sysmem pass would fill: 9 D <= (44 - 40) px only for next to nothing drawn
+    CHECK(!worth(4, false, 0, 4, 4) && worth(5, false, 0, 4, 4));
+    // neither loaded nor stored (a scratch target cleared and thrown away): the tiles move nothing
+    CHECK(worth(5, false, 0, 0, 4) && !worth(4, false, 0, 0, 4));
+    // a fetch: tiled from kGmemFewDraws draws on, whatever it loads
+    CHECK(!worth(4, true, 4, 4, 0) && worth(5, true, 4, 4, 0) && render::kGmemFewDraws == 5);
+    // a bar under kGmemFewDraws is its own floor (metal_gmem_draws=1: every pass that can)
+    CHECK(worth(1, false, 4, 4, 0, 1) && worth(1, true, 4, 4, 0, 1) && !worth(1, false, 4, 4, 0, 2) && worth(2, true, 4, 4, 0, 2));
+    // two attachments touched, one of them loaded and both stored: 56 * 11 * 12 / (22 * 8) = 42
+    {
+        render::GmemChoice c;
+        c.bar = 56;
+        c.touched = 8;
+        c.loaded = 4;
+        c.stored = 8;
+        c.draws = 41;
+        std::string why;
+        CHECK(!render::gmemWorth(c, &why));
+        CHECK(why.find("41 draws, fewer than the 42 at which tiles pay") != std::string::npos);
+        c.draws = 42;
+        CHECK(render::gmemWorth(c, &why));
+    }
+    std::string why;
+    CHECK(!worth(3, true, 4, 4, 0, 56, &why) && why.find("too few for tiles") != std::string::npos);
+}
+
+// ...and in a command buffer, a bar of 16: six draws that read their target are tiled, time after time (a pass tiled for
+// what it holds keeps its like recorded both ways); six that do not are not; into a target that need not be loaded,
+// eight are and seven are not; four that read their target are too few. By the draws alone (kGmemByDrawsAlone) only
+// the pass of 16 is.
+TEST(a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone) {
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    for (int alone = 0; alone < 2; alone++) {
+        // (a queue of its own for each case but the first: what a kind of pass did lately is the queue's to remember)
+        auto pass = [&](Rig& r, int draws, bool fetch, LoadAction load) {
+            auto t = target(r);
+            RenderPass p;
+            p.color0 = t.get();
+            p.load = load;
+            auto cb = r.queue->commandBuffer();
+            cb->setGmemMinDraws(16);
+            if (alone) cb->setGmemOff(CommandBuffer::kGmemByDrawsAlone);
+            for (int i = 0; i < draws; i++) CHECK(cb->draw(fetch ? fb : flatProgram(), p, wholeDraw(6), Bindings{}, Bindings{}));
+            cb->commit();
+            cb->waitUntilCompleted();
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            CHECK_EQ(cb->counts().passes, 1u);
+            CHECK_EQ(r.fake->stats().faults, 0u);
+            if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+            return cb->counts().gmemPasses;
+        };
+        {
+            Rig r;
+            for (int time = 0; time < 3; time++) CHECK_EQ(pass(r, 6, true, LoadAction::kLoad), alone ? 0u : 1u);
+        }
+        for (const auto& [draws, fetch, load, want] : {std::tuple<int, bool, LoadAction, uint32_t>{16, false, LoadAction::kLoad, 1u},
+                                                       {15, false, LoadAction::kLoad, 0u},
+                                                       {6, false, LoadAction::kLoad, 0u},
+                                                       {8, false, LoadAction::kDontCare, alone ? 0u : 1u},
+                                                       {7, false, LoadAction::kDontCare, 0u},
+                                                       {4, true, LoadAction::kLoad, 0u}}) {
+            Rig r;
+            CHECK_EQ(pass(r, draws, fetch, load), want);
+        }
+    }
+}
+
 // A pass whose like has had few draws lately (under half the bar) is recorded for sysmem only: a pass of 10 draws after
 // one of 1 stays in sysmem though 10 clears a bar of 8, saying why; the next like it, after 10, is GMEM again, and so is
 // one after a light one that followed a heavy one (the peak, not the last time, decides)

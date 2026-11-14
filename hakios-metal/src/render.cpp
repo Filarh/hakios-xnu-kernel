@@ -2299,6 +2299,27 @@ bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY) {
     return x * y <= 32;
 }
 
+bool gmemWorth(const GmemChoice& c, std::string* why) {
+    const uint32_t few = std::min(c.bar, kGmemFewDraws);
+    const std::string bar = "metal_gmem_draws=" + std::to_string(c.bar);
+    if (c.draws < few) {
+        if (why) *why = std::to_string(c.draws) + (few == c.bar ? " draws, fewer than " + bar : " draws: too few for tiles (" + std::to_string(few) + "; " + bar + ")");
+        return false;
+    }
+    if (c.fetch) return true;
+    // (nothing touched: no memory to weigh, the bar as it is)
+    const int64_t fixed = c.touched != 0 ? 11 * int64_t(c.loaded + c.stored) - 10 * int64_t(c.cleared) : 22, whole = c.touched != 0 ? 22 * int64_t(c.touched) : 22;
+    const uint32_t need = fixed <= 0 ? few : std::max<uint32_t>(few, uint32_t((int64_t(c.bar) * fixed + whole - 1) / whole));
+    if (c.draws >= need) return true;
+    if (why) {
+        *why = std::to_string(c.draws) + " draws, fewer than " +
+               (need == c.bar ? bar
+                              : "the " + std::to_string(need) + " at which tiles pay for a pass that loads " + std::to_string(c.loaded) + " and stores " +
+                                    std::to_string(c.stored) + " of its " + std::to_string(c.touched) + " bytes a pixel (" + bar + ")");
+    }
+    return false;
+}
+
 bool gmemTiles(GmemPlan* plan, const uint32_t area[4], bool atArea) {
     GmemPlan p = *plan;
     if (p.binW != 0 && p.binH != 0 && !atArea) {
@@ -3367,20 +3388,67 @@ void CommandBuffer::closePass() {
     if (open_ == nullptr) {
         return;
     }
-    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, open_->draws);
+    // What the tiles load and store of each attachment (masks), the render area's last row being Y1 of a window H high.
+    // A touched one is loaded unless its load action is DontCare and the area's granules stay above its last row (below
+    // it the store would put back what it never loaded into the rows of the next layer or level; CoreAnimation's second
+    // screen, DontCare, is 2436 rows, a multiple of 4), or the tiles clear it; stored when written or cleared, unless
+    // its store action is DontCare.
+    auto loadStore = [&](uint32_t y1, uint32_t H, uint32_t* load, uint32_t* store) {
+        // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
+        // rows past the bottom may be another layer's or level's)
+        const bool inside = render::alignUp(y1 + 1, a6xx::kGmemAlignH) <= H;
+        *load = *store = 0;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+            const bool every = (gmemOff_ & kGmemEveryAttachment) != 0;
+            const bool cleared = (open_->clears >> i) & 1;   // (cleared in the tiles: stored though no draw wrote it)
+            if (t == nullptr || (!every && !cleared && (((open_->written | open_->read) >> i) & 1) == 0)) continue;
+            const LoadAction la = i == 0 ? open_->pass.load : open_->pass.more[i - 1].load;
+            const StoreAction sa = i == 0 ? open_->pass.store : open_->pass.more[i - 1].store;
+            if (!cleared && (every || !(la == LoadAction::kDontCare && inside))) *load |= 1u << i;
+            if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) *store |= 1u << i;
+        }
+    };
+    // (the tiles over the render area alone unless the bisect or a Clear in the tiles has them over the whole window)
+    const bool overArea = open_->area[0] <= open_->area[2] && open_->area[1] <= open_->area[3] && !(gmemOff_ & kGmemWholeArea) && open_->clears == 0;
+    uint32_t noted = open_->draws;
     if (open_->dual) {
-        // recorded both ways: tiles for a pass of enough draws, else the sysmem words, head and all
-        if (open_->draws >= gmemMinDraws_) {
+        // Recorded both ways: the tiles or the sysmem words, head and all, by what the pass turned out to hold
+        // (render::gmemWorth) -- or by its draws against the bar alone, the bisect's kGmemByDrawsAlone.
+        bool tiles = open_->draws >= gmemMinDraws_;
+        std::string why = std::to_string(open_->draws) + " draws, fewer than metal_gmem_draws=" + std::to_string(gmemMinDraws_);
+        if (!(gmemOff_ & kGmemByDrawsAlone)) {
+            render::GmemChoice c;
+            c.draws = open_->draws;
+            c.bar = gmemMinDraws_;
+            c.fetch = open_->read != 0;
+            uint32_t load = 0, store = 0;
+            const uint32_t H = render::windowOf(open_->pass).second;
+            loadStore(overArea ? open_->area[3] : H - 1, H, &load, &store);
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+                if (t == nullptr) continue;
+                const uint32_t bytes = t->info().bytesPerPixel;
+                if ((gmemOff_ & kGmemEveryAttachment) || (((open_->written | open_->read | open_->clears) >> i) & 1)) c.touched += bytes;
+                if ((load >> i) & 1) c.loaded += bytes;
+                if ((store >> i) & 1) c.stored += bytes;
+                if ((i == 0 ? open_->pass.load : open_->pass.more[i - 1].load) == LoadAction::kClear) c.cleared += bytes;
+            }
+            tiles = render::gmemWorth(c, &why);
+            // (a pass tiled for what it holds counts as a heavy one of its kind: draw() records the next like it both
+            // ways again, however few its draws, instead of for sysmem alone)
+            if (tiles) noted = std::max(noted, gmemMinDraws_);
+        }
+        if (tiles) {
             appendStream(stream_, open_->headGmem);
         } else {
             appendStream(stream_, open_->sysStream);
             open_->gmem = false;
-            if ((profile_ || tuning_) && !profiled_.empty()) {
-                profiled_.back().sysmemWhy = std::to_string(open_->draws) + " draws, fewer than metal_gmem_draws=" + std::to_string(gmemMinDraws_);
-            }
+            if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().sysmemWhy = why;
         }
         open_->dual = false;
     }
+    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted);
     if (open_->gmem && open_->bodies.size() != 0) {
         Piece ib;
         std::string why;
@@ -3462,30 +3530,14 @@ void CommandBuffer::closePass() {
             std::memcpy(ib.contents(), body.data(), 4 * body.size());
         }
         // The tiles over the render area alone, and of the attachments only those the draws touch: one they neither
-        // write nor read keeps its memory as it is. A touched one is loaded unless its load action is DontCare and the
-        // area's granules stay above its last row (below it the store would put back what it never loaded into the
-        // rows of the next layer or level; CoreAnimation's second screen, DontCare, is 2436 rows, a multiple of 4).
+        // write nor read keeps its memory as it is (what is loaded and stored of the others: loadStore, above).
         // (a Clear in the tiles clears what they cover: a pass that clears so is tiled over the whole window, as the
         // fill it stands in for covers it -- over the draws' area alone the rest kept its old pixels, probe "a Clear in
         // the tiles": 1224468 of them)
-        if (open_->area[0] <= open_->area[2] && open_->area[1] <= open_->area[3] && !(gmemOff_ & kGmemWholeArea) && open_->clears == 0) {
-            render::gmemTiles(&plan, open_->area, open_->options.gmemTwin == 5);
-        }
-        // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
-        // rows past the bottom may be another layer's or level's)
+        if (overArea) render::gmemTiles(&plan, open_->area, open_->options.gmemTwin == 5);
         (void)W;
-        const bool inside = render::alignUp(plan.area[3] + 1, a6xx::kGmemAlignH) <= H;
         uint32_t load = 0, store = 0;
-        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
-            const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
-            const bool every = (gmemOff_ & kGmemEveryAttachment) != 0;
-            const bool cleared = (open_->clears >> i) & 1;   // (cleared in the tiles: stored though no draw wrote it)
-            if (t == nullptr || (!every && !cleared && (((open_->written | open_->read) >> i) & 1) == 0)) continue;
-            const LoadAction la = i == 0 ? open_->pass.load : open_->pass.more[i - 1].load;
-            const StoreAction sa = i == 0 ? open_->pass.store : open_->pass.more[i - 1].store;
-            if (!cleared && (every || !(la == LoadAction::kDontCare && inside))) load |= 1u << i;
-            if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) store |= 1u << i;
-        }
+        loadStore(plan.area[3], H, &load, &store);
         uint64_t vsc = 0;
         if (binned) {
             std::shared_ptr<Buffer> v = queue_.vscBuffer(&why);
