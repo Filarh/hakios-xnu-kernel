@@ -5473,8 +5473,14 @@ HM_REFUSES_OUT_LOUD
 	}
 	_buffer = hm_nocopy_buffer(device, bytes, length, deallocator, NULL);
 	if (_buffer == NULL) {
-		hm_print("refused: a no-copy buffer of %lu bytes at %p: %s; nil (QuartzCore then uploads the image)\n",
-			 (unsigned long)length, bytes, hakios_metal_error());
+		/* the first eight by their reason; after that one line in a hundred, with the count */
+		static _Atomic unsigned refused;
+		const unsigned n = ++refused;
+
+		if (n <= 8 || n % 100 == 0) {
+			hm_print("refused: a no-copy buffer of %lu bytes at %p (%u so far): %s; nil (QuartzCore then uploads the image)\n",
+				 (unsigned long)length, bytes, n, hakios_metal_error());
+		}
 		[self release];
 		return nil;
 	}
