@@ -3955,20 +3955,13 @@ std::atomic<uint64_t> gProgramUids{0};
 
 }  // namespace render
 
-// a pass's words onto the command buffer's stream, packet by packet, behind a NOP that marks where an encoder began
-// (for whoever reads the stream back)
+// a pass's words onto the command buffer's stream, behind a NOP that marks where an encoder began (for whoever reads
+// the stream back). The words as they are: a pm4::Stream's packets are whole and no longer than a header counts, so
+// taking each apart and making it again, as this did, came to the same words one packet at a time.
 void appendStream(pm4::Stream& to, const pm4::Stream& from) {
     const std::vector<uint32_t>& w = from.words();
     to.packet(pm4::kNop, nullptr, 0);
-    for (size_t i = 0; i < w.size();) {
-        pm4::Header h = pm4::decode(w[i]);
-        if (h.kind == pm4::Header::kRegisters) {
-            to.registers(h.reg, &w[i + 1], h.count);
-        } else {
-            to.packet(h.opcode, h.count ? &w[i + 1] : nullptr, h.count);
-        }
-        i += 1 + h.count;
-    }
+    to.append(w.data(), w.size());
 }
 
 // appendStream for the draws of one pass, leaving out every register write that puts the value the register already
