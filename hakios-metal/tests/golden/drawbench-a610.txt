@@ -1,14 +1,14 @@
 A draws 20 refused 0 submits 1 words 1417 loads 74 stream b2c12ae2aa0988ff state 711c4414f8362c2d names 22 f684cfeb98522a0b
-B draws 20 refused 0 submits 1 words 1564 loads 74 stream 8c0105df923841a1 state defbd1d5ef1dc40f names 18 2760c86e92be3da5
-C draws 143 refused 0 submits 1 words 316855 loads 29132 stream f9d212ceffc4be37 state 1faf3491473bbab9 names 38 98f56aac1ab77b3c
+B draws 20 refused 0 submits 1 words 80377 loads 1600 stream 80548e76a0cc9cfa state 0430128efbf44d05 names 19 b36f7cefbeada1b4
+C draws 143 refused 0 submits 1 words 353019 loads 11292 stream 87c452062c435394 state 9c9cb2b0dd5d9dd9 names 38 98f56aac1ab77b3c
 D draws 143 refused 0 submits 1 words 8077 loads 526 stream 126cb0e0874cf315 state 613b84fbf63951c9 names 40 835694ab056b6c74
 E draws 143 refused 0 submits 1 words 8656 loads 526 stream 15790af798f14e86 state 947ce2b970b8c58e names 41 ba9b887b4b68cbdf
-F draws 143 refused 0 submits 4 words 316861 loads 29132 stream 0000000000000000 state 1faf3491473bbab9 names 53 0000000000000000 (stream and names by timing: not summed)
-P draws 108 refused 0 submits 1 words 490138 loads 44496 stream f52a4cea1dbac2e4 state 6f09c141e0ccc412 names 35 c3093af042c23ba9
-Q draws 108 refused 0 submits 1 words 779668 loads 44496 stream c628bfb2f3f7bad2 state 23ab55fcc807cf7e names 32 515a4f924fb173c8
+F draws 143 refused 0 submits 4 words 353025 loads 11292 stream 0000000000000000 state 9c9cb2b0dd5d9dd9 names 53 0000000000000000 (stream and names by timing: not summed)
+P draws 108 refused 0 submits 1 words 294978 loads 9374 stream 945b1425df35d92e state cc8348d4426b8c39 names 35 c3093af042c23ba9
+Q draws 108 refused 0 submits 1 words 764538 loads 13846 stream 27f8e869b34d4a35 state 30866338866615f1 names 33 37f50ff140aa3202
 R draws 108 refused 0 submits 1 words 4939 loads 432 stream acf5e230f050aa3e state f90a178aa327c3f2 names 34 1745727537486b27
 G draws 1 refused 0 submits 1 words 602 loads 4 stream 70b09a33bff42227 state f7616e282bf666a6 names 6 5fa93d36f82a0959
 H draws 1 refused 0 submits 1 words 654 loads 4 stream 03f40241a9bc8e8f state f7616e282bf666a6 names 6 5fa93d36f82a0959
 J draws 20 refused 0 submits 1 words 1508 loads 76 stream 000c0e69e22f980d state 57cf1cdb921b5d8b names 29 e691fe78504f6547
-K draws 110 refused 0 submits 1 words 589118 loads 41612 stream 89d97a513b54a3b2 state 5e258e572c0a06cf names 43 16baf0bd0ce02d8d
+K draws 110 refused 0 submits 1 words 1076337 loads 20540 stream 8310683cd3b80a64 state a942c0d9e9c42add names 43 16baf0bd0ce02d8d
 L draws 110 refused 0 submits 1 words 5953 loads 404 stream 1100c23193797e7b state 32718647260908a1 names 42 edf0cac69d2bc050

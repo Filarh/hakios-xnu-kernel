@@ -19,6 +19,7 @@
 
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
+#include "hakios-metal/gmem.hpp"
 #include "hakios-metal/texture.hpp"
 
 namespace hakios::metal {
@@ -2359,7 +2360,7 @@ uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 uint32_t divUp(uint32_t v, uint32_t d) { return (v + d - 1) / d; }
 }  // namespace
 
-bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
+bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t flags) {
     if (pass.color0 == nullptr || pass.depth != nullptr || pass.stencil != nullptr) {
         return refuse(why, "a pass without colour attachment 0, or with depth or stencil: sysmem");
     }
@@ -2393,26 +2394,145 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         }
         bytes += f.bytesPerPixel;
     }
-    // GMEM below the colour cache in shares by bytes a pixel, each 16 KiB aligned (bins of whole 32 x 16 granules fit
-    // their share whatever the bins' shape)
     GmemPlan p;
-    uint32_t before = 0;
+    const uint32_t whole[4] = {0, 0, W - 1, H - 1};
+    if (flags & kGmemPlanOld) {
+        // (as it was: shares aligned to 16 KiB, one column of bins while the window is no wider than a bin may be)
+        uint32_t before = 0;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const Attachment a = attachmentOf(pass, i);
+            if (a.texture == nullptr) continue;
+            p.bpp[i] = a.texture->info().bytesPerPixel;
+            p.base[i] = uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu;
+            before += p.bpp[i];
+            p.room[i] = (uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
+        }
+        if (!gmemTiles(&p, whole, true)) return refuse(why, "a bin too wide for GMEM");
+        p.gridCols = p.cols;
+        p.gridRows = p.rows;
+        *plan = p;
+        return true;
+    }
+    // GMEM below the CCU's colour cache shared out as turnip shares it (tu_render_pass_gmem_config, tu_pass.cc:
+    // 848-877): in blocks of eight tile alignments -- 4 KiB, RB_MRT_BASE_GMEM's own unit -- each attachment taking its
+    // part of the blocks left by its bytes a pixel of the bytes left, an 8-byte one in whole pairs of them
+    // (align = MAX2(1, cpp >> 3)). A bin holds as many pixels as the smallest share does.
+    const uint32_t block = 8 * kTileAlignW * kTileAlignH;
+    uint32_t blocks = kGmemCcuColorOffset / block, bytesLeft = bytes, offset = 0;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         const Attachment a = attachmentOf(pass, i);
         if (a.texture == nullptr) continue;
         p.bpp[i] = a.texture->info().bytesPerPixel;
-        p.base[i] = uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu;
-        before += p.bpp[i];
-        p.room[i] = (uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
+        const uint32_t pairs = std::max(1u, p.bpp[i] >> 3);
+        const uint32_t take = std::max(uint32_t(uint64_t(blocks) * p.bpp[i] / bytesLeft) & ~(pairs - 1), pairs);
+        if (take > blocks) return refuse(why, "more attachments than GMEM has 4 KiB blocks for");
+        blocks -= take;
+        bytesLeft -= p.bpp[i];
+        p.base[i] = offset;
+        p.room[i] = take * block;
+        offset += take * block;
     }
-    const uint32_t whole[4] = {0, 0, W - 1, H - 1};
-    if (!gmemTiles(&p, whole)) return refuse(why, "a bin too wide for GMEM");
+    if (!gmemBins(&p, W, H, 0)) return refuse(why, "a bin too small for GMEM's shares");
+    for (uint32_t k = 0; k < 4; k++) p.area[k] = whole[k];
     *plan = p;
     return true;
 }
 
-bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
+// PLAN's bins for a W x H window out of its attachments' rooms, as turnip lays its tiles out
+// (tu_tiling_config_update_tile_layout, tu_util.cc:286-343): every bin width from the tile alignment up, each with the
+// tallest bin the smallest share holds; the one that makes the fewest bins, and of those the squarest ("the minimum
+// number of bins (lowest CP overhead and amount of cache flushing), but the most square tiles in the case of a tie
+// (likely highest cache locality)"); the height then let down to split the rows evenly. WIDTH: 0, or the one width
+// allowed (a plan whose draws were recorded with it: a framebuffer fetch's descriptor holds it as its pitch).
+bool gmemBins(GmemPlan* p, uint32_t W, uint32_t H, uint32_t width) {
+    uint32_t pixels = ~0u;
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        if (p->bpp[i] != 0 && p->room[i] != 0) pixels = std::min(pixels, p->room[i] / p->bpp[i]);
+    }
+    if (pixels == ~0u) return false;
+    const uint32_t maxW = std::min(kTileMaxW, alignUp(W, kTileAlignW)), maxH = std::min(kTileMaxH, alignUp(H, kTileAlignH));
+    uint32_t best = ~0u, bestW = 0, bestH = 0;
+    for (uint32_t w = width != 0 ? width : kTileAlignW; w <= (width != 0 ? width : maxW); w += kTileAlignW) {
+        uint32_t h = std::min(pixels / w, maxH) / kTileAlignH * kTileAlignH;
+        if (h == 0) continue;
+        const uint32_t cols = divUp(W, w), rows = divUp(H, h);
+        h = alignUp(divUp(H, rows), kTileAlignH);
+        const uint32_t apart = w > h ? w - h : h - w, bestApart = bestW > bestH ? bestW - bestH : bestH - bestW;
+        if (cols * rows < best || (cols * rows == best && apart < bestApart)) best = cols * rows, bestW = w, bestH = h;
+    }
+    if (best == ~0u) return false;
+    p->binW = bestW;
+    p->binH = bestH;
+    p->x0 = p->y0 = 0;
+    p->cols = p->gridCols = divUp(W, bestW);
+    p->rows = p->gridRows = divUp(H, bestH);
+    return true;
+}
+
+uint32_t gmemTouched(GmemPlan* plan, uint32_t touched, uint32_t W, uint32_t H) {
     GmemPlan p = *plan;
+    uint32_t moved = 0, end = kGmemCcuColorOffset;
+    for (uint32_t k = kMaxColorOutputs; k-- > 0;) {
+        if (p.bpp[k] == 0) continue;
+        if ((touched >> k) & 1) {
+            // (its place kept -- the draws name it there -- and its room now everything up to the next one touched)
+            p.room[k] = end - p.base[k];
+            end = p.base[k];
+        } else {
+            if (p.base[k] != 0) moved |= 1u << k;
+            p.base[k] = 0;
+            p.room[k] = 0;
+        }
+    }
+    if (!gmemBins(&p, W, H, p.binW)) return 0;
+    for (uint32_t k = 0; k < 4; k++) p.area[k] = plan->area[k];
+    *plan = p;
+    return moved;
+}
+
+bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY) {
+    const uint32_t cols = plan.gridCols != 0 ? plan.gridCols : plan.cols, rows = plan.gridRows != 0 ? plan.gridRows : plan.rows;
+    uint32_t x = 1, y = 1;
+    while (divUp(rows, y) > kNumVscPipes) y += 2;
+    while (divUp(rows, y) * divUp(cols, x) > kNumVscPipes) x++;
+    *perPipeX = x;
+    *perPipeY = y;
+    return x * y <= 32;
+}
+
+bool gmemWorth(const GmemChoice& c, std::string* why) {
+    const uint32_t few = std::min(c.bar, kGmemFewDraws);
+    const std::string bar = "metal_gmem_draws=" + std::to_string(c.bar);
+    if (c.draws < few) {
+        if (why) *why = std::to_string(c.draws) + (few == c.bar ? " draws, fewer than " + bar : " draws: too few for tiles (" + std::to_string(few) + "; " + bar + ")");
+        return false;
+    }
+    if (c.fetch) return true;
+    // (nothing touched: no memory to weigh, the bar as it is)
+    const int64_t fixed = c.touched != 0 ? 11 * int64_t(c.loaded + c.stored) - 10 * int64_t(c.cleared) : 22, whole = c.touched != 0 ? 22 * int64_t(c.touched) : 22;
+    const uint32_t need = fixed <= 0 ? few : std::max<uint32_t>(few, uint32_t((int64_t(c.bar) * fixed + whole - 1) / whole));
+    if (c.draws >= need) return true;
+    if (why) {
+        *why = std::to_string(c.draws) + " draws, fewer than " +
+               (need == c.bar ? bar
+                              : "the " + std::to_string(need) + " at which tiles pay for a pass that loads " + std::to_string(c.loaded) + " and stores " +
+                                    std::to_string(c.stored) + " of its " + std::to_string(c.touched) + " bytes a pixel (" + bar + ")");
+    }
+    return false;
+}
+
+bool gmemTiles(GmemPlan* plan, const uint32_t area[4], bool atArea) {
+    GmemPlan p = *plan;
+    if (p.binW != 0 && p.binH != 0 && !atArea) {
+        // the bins of the plan's grid that the area touches (render.hpp: the VSC bins from the window's origin)
+        p.x0 = area[0] / p.binW * p.binW;
+        p.y0 = area[1] / p.binH * p.binH;
+        p.cols = divUp(area[2] + 1 - p.x0, p.binW);
+        p.rows = divUp(area[3] + 1 - p.y0, p.binH);
+        for (uint32_t k = 0; k < 4; k++) p.area[k] = area[k];
+        *plan = p;
+        return true;
+    }
     p.x0 = area[0] & ~(kTileAlignW - 1);
     p.y0 = area[1] & ~(kTileAlignH - 1);
     const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
@@ -2433,6 +2553,7 @@ bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
     p.rows = divUp(h, fit);
     p.binH = alignUp(divUp(h, p.rows), kTileAlignH);
     for (uint32_t k = 0; k < 4; k++) p.area[k] = area[k];
+    if (atArea) p.gridCols = p.cols, p.gridRows = p.rows;   // (the twin: a grid of the area's own)
     *plan = p;
     return true;
 }
@@ -2527,8 +2648,14 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
 }
 
 void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, uint64_t bodies, uint32_t bodyWords, uint64_t table, const Options& o,
-                uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc) {
+                uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc, uint32_t body) {
     const auto [W, H] = windowOf(pass);
+    // every draw-state group let go: what both batch starts send, and fd6 after its binning pass and after each tile's draws
+    auto letGroupsGo = [&]() {
+        const uint32_t w[3] = {setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE_ALL_GROUPS, 0), 0, 0};
+        stream.packet(CP_SET_DRAW_STATE, w, 3);
+    };
+    const bool groups = vsc != 0 && (body & kGmemBodyGroups) != 0, leave = vsc != 0 && (body & kGmemBodyLeave) != 0;
     // the colour cache out of the tiles' way (it is not pipelined: after a WFI, as the sysmem value is written)
     stream.waitForIdle();
     reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem());
@@ -2556,10 +2683,15 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     const uint32_t bin = binControlGmem(o.binControlLrzFeedback, plan.binW, plan.binH);
     // The pipes: as fd's gmem layout groups bins (freedreno_gmem.c: tpp_y up by 2 until the rows fit the pipes, then
     // tpp_x up by 1), and each tile's place in its pipe the order the tiles are drawn in
+    // (the window's whole grid, of which the tiles drawn are the bins the render area touches: the VSC bins every draw
+    // by its place in the window)
+    const uint32_t gridCols = plan.gridCols != 0 ? plan.gridCols : plan.cols, gridRows = plan.gridRows != 0 ? plan.gridRows : plan.rows;
+    // (a plan whose corner is not a bin's -- gmemTiles' twin, the grid laid from the area -- counts its bins from its own corner, as it used to)
+    const bool onGrid = plan.binW != 0 && plan.binH != 0 && plan.x0 % plan.binW == 0 && plan.y0 % plan.binH == 0;
+    const uint32_t col0 = onGrid ? plan.x0 / plan.binW : 0, row0 = onGrid ? plan.y0 / plan.binH : 0;
     uint32_t tppX = 1, tppY = 1;
-    while (divUp(plan.rows, tppY) > kNumVscPipes) tppY += 2;
-    while (divUp(plan.rows, tppY) * divUp(plan.cols, tppX) > kNumVscPipes) tppX++;
-    const uint32_t pipesX = divUp(plan.cols, tppX);
+    gmemPipes(plan, &tppX, &tppY);
+    const uint32_t pipesX = divUp(gridCols, tppX);
     const uint64_t drawStrm = vsc, drawSizes = vsc + uint64_t(kNumVscPipes) * kVscDrawPitch, primStrm = drawSizes + kVscSizesBytes;
     auto crumb = [&](uint32_t v) {
         if (o.gmemBinningTrace && vsc != 0) stream.memWrite(drawSizes + kVscTraceAt, &v, 1);
@@ -2567,7 +2699,7 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     crumb(0xa);
     if (vsc != 0) {
         // the binning pass (emit_binning_pass): the whole window, RM6_BIN_VISIBILITY, the bins' layout, every draw once
-        regs(stream, REG_A6XX_GRAS_SC_WINDOW_SCISSOR_TL, {regXY(plan.x0, plan.y0), regXY(plan.x0 + plan.cols * plan.binW - 1, plan.y0 + plan.rows * plan.binH - 1)});
+        regs(stream, REG_A6XX_GRAS_SC_WINDOW_SCISSOR_TL, {regXY(0, 0), regXY(gridCols * plan.binW - 1, gridRows * plan.binH - 1)});
         command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_VISIBILITY));
         command1(stream, CP_SET_VISIBILITY_OVERRIDE, 1);
         command1(stream, CP_SET_MODE, 1);
@@ -2580,13 +2712,13 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         reg(stream, REG_A6XX_RB_BIN_CONTROL2, A6XX_RB_BIN_CONTROL2_BINW(plan.binW) | A6XX_RB_BIN_CONTROL2_BINH(plan.binH));
         reg(stream, REG_A6XX_VSC_BIN_SIZE, vscBinSize(plan.binW, plan.binH));
         reg64(stream, REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS, drawSizes);
-        reg(stream, REG_A6XX_VSC_BIN_COUNT, vscBinCount(plan.cols, plan.rows));
+        reg(stream, REG_A6XX_VSC_BIN_COUNT, vscBinCount(gridCols, gridRows));
         {
             uint32_t pipes[kNumVscPipes] = {};
             uint32_t p = 0;
-            for (uint32_t y = 0; y < plan.rows; y += tppY) {
-                for (uint32_t x = 0; x < plan.cols; x += tppX) {
-                    pipes[p++] = vscPipeConfig(x, y, std::min(tppX, plan.cols - x), std::min(tppY, plan.rows - y));
+            for (uint32_t y = 0; y < gridRows; y += tppY) {
+                for (uint32_t x = 0; x < gridCols; x += tppX) {
+                    pipes[p++] = vscPipeConfig(x, y, std::min(tppX, gridCols - x), std::min(tppY, gridRows - y));
                 }
             }
             stream.registers(REG_A6XX_VSC_PIPE_CONFIG_REG, pipes, kNumVscPipes);
@@ -2599,6 +2731,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         reg(stream, REG_A6XX_RB_WINDOW_OFFSET, regXY(0, 0));
         reg(stream, REG_A6XX_SP_TP_WINDOW_OFFSET, regXY(0, 0));
         if (o.gmemBinningStage != 1) stream.indirect(bodies, bodyWords);
+        // (the groups the binning pass ran are not the tiles' to find still set: fd6's emit_binning_pass, fd6_gmem.cc:1133-1135)
+        if (groups) letGroupsGo();
         event(stream, UNK_2D);
         // the VSC wrote through the UCHE and the command processor reads the streams uncached: flushed and waited for
         stream.waitForIdle();
@@ -2611,7 +2745,7 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         // binning off from then on (CommandBuffer::finish) -- this frame is what it is, the next ones draw every draw
         {
             uint32_t used = 0;
-            for (uint32_t y = 0; y < plan.rows; y += tppY) used += divUp(plan.cols, tppX);
+            for (uint32_t y = 0; y < gridRows; y += tppY) used += divUp(gridCols, tppX);
             const uint64_t flag = drawSizes + kVscOverflowAt;
             for (uint32_t p = 0; p < used; p++) {
                 for (uint32_t k = 0; k < 2; k++) {
@@ -2652,17 +2786,19 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             reg(stream, REG_A6XX_SP_TP_WINDOW_OFFSET, regXY(x1, y1));
             const bool streams = vsc != 0 && (o.gmemBinningStage == 0 || o.gmemBinningStage >= 3);
             if (streams) {
-                // this tile's streams: its pipe's, and its place in the pipe (fd6_emit_tile_prep)
-                const uint32_t pipe = (ty / tppY) * pipesX + tx / tppX;
-                const uint32_t px = (tx / tppX) * tppX, py = (ty / tppY) * tppY;
-                const uint32_t pw = std::min(tppX, plan.cols - px), ph = std::min(tppY, plan.rows - py);
-                const uint32_t n = (ty - py) * pw + (tx - px);
+                // this tile's streams: its pipe's, and its place in the pipe (fd6_emit_tile_prep), by its place in the grid
+                const uint32_t gx = col0 + tx, gy = row0 + ty;
+                const uint32_t pipe = (gy / tppY) * pipesX + gx / tppX;
+                const uint32_t px = (gx / tppX) * tppX, py = (gy / tppY) * tppY;
+                const uint32_t pw = std::min(tppX, gridCols - px), ph = std::min(tppY, gridRows - py);
+                const uint32_t n = (gy - py) * pw + (gx - px);
                 crumb(0x100 + ty * plan.cols + tx);
                 stream.waitForMe();
                 command1(stream, CP_SET_MODE, 0);
                 // (by offsets from the VSC registers the binning pass set, as turnip on A6XX; fd6's CP_SET_BIN_DATA5 with the
                 // addresses works as well, stage 7, once RM6_BIN_END_OF_DRAWS lets each tile's streams go)
                 const uint32_t w[4] = {cpSetBinData5_0(pw * ph, n), pipe * kVscDrawPitch, pipe * 4, pipe * kVscPrimPitch};
+                if (leave && o.gmemTwin == 3) command1(stream, CP_SKIP_IB2_ENABLE_LOCAL, 1);   // (the twin: before the bin data, as Mesa has it)
                 if (o.gmemBinningStage == 7) {
                     const uint64_t d = drawStrm + uint64_t(pipe) * kVscDrawPitch, z = drawSizes + pipe * 4ull, q = primStrm + uint64_t(pipe) * kVscPrimPitch;
                     const uint32_t a[7] = {w[0], uint32_t(d), uint32_t(d >> 32), uint32_t(z), uint32_t(z >> 32), uint32_t(q), uint32_t(q >> 32)};
@@ -2672,6 +2808,12 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
                 }
                 command1(stream, CP_SET_VISIBILITY_OVERRIDE, o.gmemBinningStage == 5 ? 1 : 0);
                 if (o.gmemBinningStage != 4) command1(stream, CP_SKIP_IB2_ENABLE_GLOBAL, 1);   // (fd6_emit_tile_prep's, with a binning pass)
+                // GLOBAL and LOCAL both: once the tile's streams name no more draws, the draws' buffer is left where it
+                // is read ("draws will early return from their IB", adreno_pm4.xml). LOCAL is the tile's own -- the
+                // microcode clears it at RM6_BIN_RENDER_START and at CP_SET_BIN_DATA5 -- so it is written here, after
+                // both, and not once a pass before them as turnip and fd6 write theirs (tu_cmd_buffer.cc:3687-3691,
+                // fd6_gmem.cc:1323-1325), where the first tile's marker undoes it
+                if (leave && o.gmemTwin != 3 && o.gmemBinningStage != 4) command1(stream, CP_SKIP_IB2_ENABLE_LOCAL, 1);
                 crumb(0x200 + ty * plan.cols + tx);
             } else {
                 command1(stream, CP_SET_VISIBILITY_OVERRIDE, 1);
@@ -2693,7 +2835,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             // A framebuffer fetch reads GMEM through the texture caches, which still hold what the last tile's fetches
             // read at the same GMEM addresses (probe "GMEM: framebuffer fetch": 9221 pixels of 24 tiles from the tile
             // before): dropped once a tile, the loads waited for first
-            if (fetch) {
+            // (not when the fetching draws carry their barrier as a group: the first of them a tile draws has it)
+            if (fetch && !(groups && (body & kGmemBodyBarriers))) {
                 stream.waitForIdle();
                 event(stream, CACHE_INVALIDATE);
             }
@@ -2703,7 +2846,11 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             // under hw binning): without it the third tile's CP_SET_BIN_DATA5 found the queue full and its draws hung
             // in PC, in whichever order the tiles ran (probe --bin-trace)
             if (streams && o.gmemBinningStage != 9) command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_END_OF_DRAWS) | A6XX_CP_SET_MARKER_0_USES_GMEM);
+            // (fd6_emit_tile_gmem2mem, fd6_gmem.cc:2194-2203: the groups let go and LOCAL off before the resolve; turnip's
+            // GLOBAL off, tu_cmd_buffer.cc:3827-3834)
+            if (groups && o.gmemTwin != 4) letGroupsGo();
             command1(stream, CP_SKIP_IB2_ENABLE_GLOBAL, 0);
+            if (leave) command1(stream, CP_SKIP_IB2_ENABLE_LOCAL, 0);
             command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_RESOLVE) | A6XX_CP_SET_MARKER_0_USES_GMEM);
             for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
                 if ((store >> i) & 1) blit(i, BLIT_EVENT_STORE);
@@ -4072,7 +4219,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         dual = open_->dual;
         plan = open_->plan;
     } else if (options.gmem && gmem_) {
-        gmem = render::gmemPlan(pass, &plan, &gmemWhy_) && tileable;
+        gmem = render::gmemPlan(pass, &plan, &gmemWhy_, gmemOff_ & kGmemOldTiles ? render::kGmemPlanOld : 0u) && tileable;
         if (!tileable) gmemWhy_ = whyNotTiled();
         if (gmem && gmemMinDraws_ != 0) {
             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so
@@ -4627,48 +4774,16 @@ void CommandBuffer::closePass() {
     if (open_ == nullptr) {
         return;
     }
-    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, open_->draws);
-    if (open_->dual) {
-        // recorded both ways: tiles for a pass of enough draws, else the sysmem words, head and all
-        if (open_->draws >= gmemMinDraws_) {
-            appendStream(stream_, open_->headGmem);
-        } else {
-            appendStream(stream_, open_->sysStream);
-            open_->gmem = false;
-            if ((profile_ || tuning_) && !profiled_.empty()) {
-                profiled_.back().sysmemWhy = std::to_string(open_->draws) + " draws, fewer than metal_gmem_draws=" + std::to_string(gmemMinDraws_);
-            }
-        }
-        open_->dual = false;
-    }
-    if (open_->gmem && open_->bodies.size() != 0) {
-        Piece ib;
-        std::string why;
-        const std::vector<uint32_t>& w = open_->bodies.words();
-        if (!piece(4 * w.size(), &ib, &why)) {
-            // (the draws were encoded for tiles: they cannot run in sysmem instead)
-            open_.reset();
-            fail(std::string("no memory for a GMEM pass's draws: ") + why);
-            return;
-        }
-        std::memcpy(ib.contents(), w.data(), 4 * w.size());
-        // The tiles over the render area alone, and of the attachments only those the draws touch: one they neither
-        // write nor read keeps its memory as it is. A touched one is loaded unless its load action is DontCare and the
-        // area's granules stay above its last row (below it the store would put back what it never loaded into the
-        // rows of the next layer or level; CoreAnimation's second screen, DontCare, is 2436 rows, a multiple of 4).
-        render::GmemPlan plan = open_->plan;
-        const auto [W, H] = render::windowOf(open_->pass);
-        // (a Clear in the tiles clears what they cover: a pass that clears so is tiled over the whole window, as the
-        // fill it stands in for covers it -- over the draws' area alone the rest kept its old pixels, probe "a Clear in
-        // the tiles": 1224468 of them)
-        if (open_->area[0] <= open_->area[2] && open_->area[1] <= open_->area[3] && !(gmemOff_ & kGmemWholeArea) && open_->clears == 0) {
-            render::gmemTiles(&plan, open_->area);
-        }
+    // What the tiles load and store of each attachment (masks), the render area's last row being Y1 of a window H high.
+    // A touched one is loaded unless its load action is DontCare and the area's granules stay above its last row (below
+    // it the store would put back what it never loaded into the rows of the next layer or level; CoreAnimation's second
+    // screen, DontCare, is 2436 rows, a multiple of 4), or the tiles clear it; stored when written or cleared, unless
+    // its store action is DontCare.
+    auto loadStore = [&](uint32_t y1, uint32_t H, uint32_t* load, uint32_t* store) {
         // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
         // rows past the bottom may be another layer's or level's)
-        (void)W;
-        const bool inside = render::alignUp(plan.area[3] + 1, a6xx::kGmemAlignH) <= H;
-        uint32_t load = 0, store = 0;
+        const bool inside = render::alignUp(y1 + 1, a6xx::kGmemAlignH) <= H;
+        *load = *store = 0;
         for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
             const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
             const bool every = (gmemOff_ & kGmemEveryAttachment) != 0;
@@ -4676,11 +4791,141 @@ void CommandBuffer::closePass() {
             if (t == nullptr || (!every && !cleared && (((open_->written | open_->read) >> i) & 1) == 0)) continue;
             const LoadAction la = i == 0 ? open_->pass.load : open_->pass.more[i - 1].load;
             const StoreAction sa = i == 0 ? open_->pass.store : open_->pass.more[i - 1].store;
-            if (!cleared && (every || !(la == LoadAction::kDontCare && inside))) load |= 1u << i;
-            if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) store |= 1u << i;
+            if (!cleared && (every || !(la == LoadAction::kDontCare && inside))) *load |= 1u << i;
+            if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) *store |= 1u << i;
         }
+    };
+    // (the tiles over the render area alone unless the bisect or a Clear in the tiles has them over the whole window)
+    const bool overArea = open_->area[0] <= open_->area[2] && open_->area[1] <= open_->area[3] && !(gmemOff_ & kGmemWholeArea) && open_->clears == 0;
+    uint32_t noted = open_->draws;
+    if (open_->dual) {
+        // Recorded both ways: the tiles or the sysmem words, head and all, by what the pass turned out to hold
+        // (render::gmemWorth) -- or by its draws against the bar alone, the bisect's kGmemByDrawsAlone.
+        bool tiles = open_->draws >= gmemMinDraws_;
+        std::string why = std::to_string(open_->draws) + " draws, fewer than metal_gmem_draws=" + std::to_string(gmemMinDraws_);
+        if (!(gmemOff_ & kGmemByDrawsAlone)) {
+            render::GmemChoice c;
+            c.draws = open_->draws;
+            c.bar = gmemMinDraws_;
+            c.fetch = open_->read != 0;
+            uint32_t load = 0, store = 0;
+            const uint32_t H = render::windowOf(open_->pass).second;
+            loadStore(overArea ? open_->area[3] : H - 1, H, &load, &store);
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+                if (t == nullptr) continue;
+                const uint32_t bytes = t->info().bytesPerPixel;
+                if ((gmemOff_ & kGmemEveryAttachment) || (((open_->written | open_->read | open_->clears) >> i) & 1)) c.touched += bytes;
+                if ((load >> i) & 1) c.loaded += bytes;
+                if ((store >> i) & 1) c.stored += bytes;
+                if ((i == 0 ? open_->pass.load : open_->pass.more[i - 1].load) == LoadAction::kClear) c.cleared += bytes;
+            }
+            tiles = render::gmemWorth(c, &why);
+            // (a pass tiled for what it holds counts as a heavy one of its kind: draw() records the next like it both
+            // ways again, however few its draws, instead of for sysmem alone)
+            if (tiles) noted = std::max(noted, gmemMinDraws_);
+        }
+        if (tiles) {
+            appendStream(stream_, open_->headGmem);
+        } else {
+            appendStream(stream_, open_->sysStream);
+            open_->gmem = false;
+            if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().sysmemWhy = why;
+        }
+        open_->dual = false;
+    }
+    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted);
+    if (open_->gmem && open_->bodies.size() != 0) {
+        Piece ib;
+        std::string why;
+        const std::vector<uint32_t>& w = open_->bodies.words();
+        // A binned pass's draws as draw-state groups (gmem.hpp): a tile then runs the state of the draws its visibility
+        // streams let through and of no other, and leaves the draws' buffer after the last of them. The draws were
+        // recorded as a plain stream, which is what a pass that is not binned still runs, every draw in every tile --
+        // and what a binned one falls back to when its stream holds something drawStates does not move into a group.
+        // The bins for the attachments the draws touched alone (render::gmemTouched): one the pass has attached and
+        // no draw's fragment stage has an output for, none reads and no tile clears needs no bin. Its
+        // RB_MRT_BASE_GMEM in the recorded draws then points past the taller bins, and is rewritten to where the plan
+        // now has it: 0, where turnip puts the RB_MRT of an attachment a subpass does not use (tu6_emit_mrt). "Has an
+        // output for" is read off the recorded SP_FS_OUTPUT_REG, not off the write masks: a stage that names the slot
+        // with every component masked off keeps the slot's bin to itself, whatever the RB does with a masked write.
+        render::GmemPlan plan = open_->plan;
+        const auto [W, H] = render::windowOf(open_->pass);
+        std::vector<uint32_t> moved;   // the draws' words with those registers rewritten, when any is
+        {
+            uint32_t attached = 0, touched = 0, named = 0;
+            for (size_t i = 0; i < w.size();) {
+                const pm4::Header h = pm4::decode(w[i]);
+                for (uint32_t k = 0; h.kind == pm4::Header::kRegisters && k < h.count; k++) {
+                    const uint32_t r = h.reg + k;
+                    if (r >= a6xx::REG_A6XX_SP_FS_OUTPUT_REG && r < a6xx::REG_A6XX_SP_FS_OUTPUT_REG + kMaxColorOutputs &&
+                        (w[i + 1 + k] & a6xx::A6XX_SP_FS_OUTPUT_REG_REGID__MASK) >> a6xx::A6XX_SP_FS_OUTPUT_REG_REGID__SHIFT != a6xx::kRegidNone) {
+                        named |= 1u << (r - a6xx::REG_A6XX_SP_FS_OUTPUT_REG);
+                    }
+                }
+                i += 1 + h.count;
+            }
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                if ((i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture) == nullptr) continue;
+                attached |= 1u << i;
+                if ((gmemOff_ & kGmemEveryAttachment) || (((named | open_->written | open_->read | open_->clears) >> i) & 1)) touched |= 1u << i;
+            }
+            const uint32_t movedMask =
+                touched != attached && touched != 0 && !(gmemOff_ & (kGmemOldTiles | kGmemEveryBin)) ? render::gmemTouched(&plan, touched, W, H) : 0;
+            if (movedMask != 0 && open_->options.gmemTwin != 6) {   // (the twin: those registers left as recorded)
+                moved = w;
+                for (size_t i = 0; i < moved.size();) {
+                    const pm4::Header h = pm4::decode(moved[i]);
+                    for (uint32_t k = 0; h.kind == pm4::Header::kRegisters && k < h.count; k++) {
+                        const uint32_t r = h.reg + k;
+                        if (r >= a6xx::REG_A6XX_RB_MRT_BASE_GMEM && r < a6xx::REG_A6XX_RB_MRT_BASE_GMEM + 8 * kMaxColorOutputs &&
+                            (r - a6xx::REG_A6XX_RB_MRT_BASE_GMEM) % 8 == 0 && ((movedMask >> ((r - a6xx::REG_A6XX_RB_MRT_BASE_GMEM) / 8)) & 1)) {
+                            moved[i + 1 + k] = plan.base[(r - a6xx::REG_A6XX_RB_MRT_BASE_GMEM) / 8];
+                        }
+                    }
+                    i += 1 + h.count;
+                }
+            }
+        }
+        const std::vector<uint32_t>& body = moved.empty() ? w : moved;
+        // (binned when the queue's streams have not overrun and the plan's pipes can name their bins)
+        uint32_t perPipeX = 1, perPipeY = 1;
+        const bool binned = (open_->options.gmemBinning || gmemBinning_) && queue_.binningOk() && render::gmemPipes(plan, &perPipeX, &perPipeY);
+        render::DrawStates groups;
+        const uint32_t fetchBy = gmemOff_ & kGmemAllOrdered ? render::kDsFetchOrdered : gmemOff_ & kGmemInlineBarriers ? render::kDsFetchInline : render::kDsFetchGroup;
+        const bool grouped = binned && !(gmemOff_ & kGmemPlainBody) &&
+                             render::drawStates(body.data(), body.size(), a6xx::CP_SET_DRAW_STATE__0_BINNING | a6xx::CP_SET_DRAW_STATE__0_GMEM, &groups,
+                                                open_->options.gmemTwin, fetchBy);
+        const size_t ibWords = grouped ? groups.blobs.size() + groups.list.size() : w.size();
+        if (!piece(4 * ibWords, &ib, &why)) {
+            // (the draws were encoded for tiles: they cannot run in sysmem instead)
+            open_.reset();
+            fail(std::string("no memory for a GMEM pass's draws: ") + why);
+            return;
+        }
+        uint64_t bodyAt = ib.gpuAddress();
+        uint32_t bodyWords = uint32_t(w.size());
+        if (grouped) {
+            // (the fragments first, the draws' list after them: one piece, written once)
+            groups.place(ib.gpuAddress());
+            std::memcpy(ib.contents(), groups.blobs.data(), 4 * groups.blobs.size());
+            std::memcpy(ib.contents() + 4 * groups.blobs.size(), groups.list.data(), 4 * groups.list.size());
+            bodyAt = ib.gpuAddress() + 4 * groups.blobs.size();
+            bodyWords = uint32_t(groups.list.size());
+        } else {
+            std::memcpy(ib.contents(), body.data(), 4 * body.size());
+        }
+        // The tiles over the render area alone, and of the attachments only those the draws touch: one they neither
+        // write nor read keeps its memory as it is (what is loaded and stored of the others: loadStore, above).
+        // (a Clear in the tiles clears what they cover: a pass that clears so is tiled over the whole window, as the
+        // fill it stands in for covers it -- over the draws' area alone the rest kept its old pixels, probe "a Clear in
+        // the tiles": 1224468 of them)
+        if (overArea) render::gmemTiles(&plan, open_->area, open_->options.gmemTwin == 5);
+        (void)W;
+        uint32_t load = 0, store = 0;
+        loadStore(plan.area[3], H, &load, &store);
         uint64_t vsc = 0;
-        if ((open_->options.gmemBinning || gmemBinning_) && queue_.binningOk()) {
+        if (binned) {
             std::shared_ptr<Buffer> v = queue_.vscBuffer(&why);
             if (v == nullptr) {
                 open_.reset();
@@ -4692,8 +4937,20 @@ void CommandBuffer::closePass() {
             vsc = v->gpuAddress();
         }
         pm4::Stream tiles;
-        render::encodeGmem(tiles, open_->pass, plan, ib.gpuAddress(), uint32_t(w.size()), open_->table, open_->options, load, store, open_->read != 0,
-                           open_->clears, open_->clearWords, vsc);
+        // (the copies the draws' loads read, once for every tile and for the binning pass: DrawStates::prologue)
+        if (grouped) {
+            const std::vector<uint32_t>& pro = groups.prologue;
+            for (size_t i = 0; i < pro.size();) {
+                const pm4::Header h = pm4::decode(pro[i]);
+                tiles.packet(h.opcode, h.count ? &pro[i + 1] : nullptr, h.count);
+                i += 1 + h.count;
+            }
+        }
+        render::encodeGmem(tiles, open_->pass, plan, bodyAt, bodyWords, open_->table, open_->options, load, store, open_->read != 0, open_->clears,
+                           open_->clearWords, vsc,
+                           grouped ? render::kGmemBodyGroups | (gmemOff_ & kGmemNoLeave ? 0u : render::kGmemBodyLeave) |
+                                         (groups.barriers != 0 ? render::kGmemBodyBarriers : 0u)
+                                   : 0u);
         appendStream(stream_, tiles);
         counts_.gmemPasses++;
         if (vsc != 0) counts_.binnedPasses++;

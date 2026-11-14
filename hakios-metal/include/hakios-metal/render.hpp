@@ -486,6 +486,14 @@ struct Options {
                                     // buffer's sizes page at kVscTraceAt, so that a hang still says which packet it stopped at)
     bool gmemTileWfi = true;     // a CP_WAIT_FOR_IDLE after each tile's stores (turnip's tu6_render_tile): off only to measure it
     bool gmemLoad = true;        // each tile's load from memory (off: the fake's twin, whose stores then show GMEM's own contents)
+    uint8_t gmemTwin = 0;        // (the fake's twins of a binned pass's draw-state groups, gmem.hpp: 1 each fragment only what the draw
+                                 // itself wrote, 2 the loads neither DIRTY nor sent with the program's, 3 CP_SKIP_IB2_ENABLE_LOCAL
+                                 // before the tile's CP_SET_BIN_DATA5, which clears it, 4 the groups not let go between tiles,
+                                 // 5 the bins from the render area's corner instead of the window's origin, 6 an attachment no
+                                 // draw touched left with the RB_MRT_BASE_GMEM its draws were recorded with when the bins grow
+                                 // over it (gmemTouched), 7 a fetch's barrier let go at the next draw though that one fetches
+                                 // too, 8 no group DIRTY but the loads' (each left to the command processor's memory of
+                                 // what it last ran); 0 the stream as it is meant)
     uint8_t rotate2d = 0;        // encodeBlit's RB_2D_BLIT_CNTL.ROTATE (a6xx_rotation: 0, 90, 180, 270, hflip, vflip as 0..5);
                                  // a quarter turn takes a destination rectangle of the source's sides swapped
 };
@@ -497,30 +505,83 @@ static_assert(alignof(Options) == 1, "render::Options holds bools and bytes only
 // Tiled rendering (GMEM). Sysmem rendering sends every blended pixel of every draw through the colour CCU to memory and
 // back: CoreAnimation's full-screen layers then cost a read and a write of the whole target each (8 blended layers at
 // 1125 x 2436 took the GPU 7.6 ms so, 3.1 ms in GMEM: probe "GMEM cost"). In GMEM the target is loaded tile by tile into the on-chip memory, all of the pass's draws run
-// against the tile there, and the tile is stored once. The tiles: as few columns as the bin width allows
-// (kTileMaxW), as tall as the GMEM below the CCU's colour cache holds (kGmemCcuColorOffset), balanced so the last
-// row and column are not slivers.
+// against the tile there, and the tile is stored once. The tiles are turnip's for the same pass (gmemPlan, gmemBins):
+// the fewest bins that the GMEM below the CCU's colour cache (kGmemCcuColorOffset) holds, the squarest of those.
+// What a tile costs beside its pixels -- its load and store, its wait for idle, the state of the draws that reach
+// it -- is paid once a tile: CoreAnimation's main pass on the Adreno 610 (750 x 1624, two 4-byte attachments) was 102
+// tiles of 768 x 16 as one column of bins, and is 78 of 128 x 128 so.
 struct GmemPlan {
     // Where in GMEM each colour attachment's bin lies (RB_MRT's BASE_GMEM) and how much room it has there: GMEM below
     // the CCU's colour cache shared out by bytes a pixel. Fixed when the pass opens -- the draws are encoded with it --
     // while the bins' size waits for the render area at its end (gmemTiles).
     uint32_t base[kMaxColorOutputs] = {}, room[kMaxColorOutputs] = {}, bpp[kMaxColorOutputs] = {};
-    // the render area, X0 Y0 X1 Y1 inclusive (what the draws can touch), the grid's corner (aligned to the tile
-    // alignment) and the bins over it
+    // the render area, X0 Y0 X1 Y1 inclusive (what the draws can touch), the corner of the first bin drawn (a
+    // multiple of the bin's size: the bins lie where the VSC bins, from the window's origin) and the bins over the area
     uint32_t area[4] = {}, x0 = 0, y0 = 0;
     uint32_t binW = 0, binH = 0, cols = 0, rows = 0;
+    // the window's whole grid, which the binning pass bins over whatever part of it is drawn (the pipes and each
+    // tile's place in its pipe are the grid's)
+    uint32_t gridCols = 0, gridRows = 0;
     uint32_t tiles() const { return cols * rows; }
 };
 // whether PASS can be drawn in GMEM and how: its colour attachments the window's size, linear, single-sampled, 4 or 8
 // bytes a pixel, their rows with room for the event blit's 16 x 4 granules past the edges; no depth or stencil. A bin
 // holds every attachment's pixels (CoreAnimation's main pass draws into two screens at once). False with *why
 // otherwise (the pass then runs in sysmem, as before).
-bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why);
-// PLAN's bins over the render area AREA (X0 Y0 X1 Y1 inclusive, inside the window): turnip's tiling of a render area
-// (tu_tiling_config_update_tile_layout) -- the grid's corner at the area's aligned down, the bins as wide as the plan's
-// (gmemPlan picks the width; a fetch's descriptor holds it), as tall as every attachment's room holds. A pass whose draws touch a corner of the screen is drawn in the
-// tiles over that corner, and loads and stores no more. False when no bin fits (the plan unchanged).
-bool gmemTiles(GmemPlan* plan, const uint32_t area[4]);
+// (FLAGS: kGmemPlanOld, the shares and the one column of bins this had before turnip's -- for a bisect on the phone)
+enum : uint32_t { kGmemPlanOld = 1 };
+bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t flags = 0);
+// PLAN's bins for a W x H window out of its attachments' rooms: turnip's layout (render.cpp). WIDTH 0, or the one
+// bin width allowed. False when the rooms hold no bin.
+bool gmemBins(GmemPlan* plan, uint32_t W, uint32_t H, uint32_t width);
+// PLAN for the attachments in TOUCHED alone (a mask), once a pass's draws are known: an attachment no draw writes or
+// reads and no tile clears needs no bin, and the GMEM it was given goes to the one before it -- taller bins of the
+// same width, since the draws were recorded with that width (a fetch's descriptor) and with each touched attachment's
+// place. CoreAnimation's main pass has two screens attached; drawing into one of them alone it is 42 tiles of
+// 128 x 240 where both make it 78 of 128 x 128. The attachments whose place moved (to 0, where they are never written),
+// as a mask: their RB_MRT_BASE_GMEM in the recorded draws is to be rewritten. 0 and the plan unchanged when nothing fits.
+uint32_t gmemTouched(GmemPlan* plan, uint32_t touched, uint32_t W, uint32_t H);
+// How PLAN's grid is grouped into VSC pipes, as fd's gmem layout groups bins (freedreno_gmem.c:321-326: rows of bins
+// to a pipe up by 2 until the pipes hold the rows, then columns up by 1): bins a pipe each way. False when a pipe would
+// hold more than 32 bins, which CP_SET_BIN_DATA5 cannot name (fd6 use_hw_binning, turnip is_hw_binning_possible): such
+// a pass is not binned.
+bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY);
+// GMEM or sysmem for a pass that can have either, by what it holds once its draws are known: turnip's criteria
+// (tu_autotune.cc: get_optimal_mode and the bandwidth estimate behind it) with what a pass here knows of itself.
+//   - A pass of fewer draws than kGmemFewDraws stays in sysmem: turnip's "too few draws to tune" (:1855-1870), sysmem
+//     being the mode a wrong choice costs least in (:1836-1840). (Fewer than BAR when BAR is below that: a bar of 1
+//     is the measurement's "every pass that can".)
+//   - A pass one of whose draws reads its target is tiled: turnip's rule for a pass that runs SINGLE_PRIM_MODE in
+//     sysmem (:1815-1820). Here a fetching draw in sysmem is more than that mode: two waits for idle, the colour
+//     cache flushed to memory and waited for, the texture caches dropped (encodeDraw), then the target read back
+//     from memory; in a tile it reads the bin, the barrier where a tile draws it (gmem.hpp).
+//   - Otherwise by memory moved, as turnip's estimate has it (:1043-1067, tu_pass.cc:905-932): the tiles load and
+//     store their attachments (LOADED + STORED bytes a pixel) whatever is drawn, a sysmem pass fills what its load
+//     action clears (CLEARED) and then every draw's writes and blends go through memory (D); sysmem when
+//     CLEARED * px + D <= (11 * (LOADED + STORED) * px + D) / 10, that is 9 D <= (11 (LOADED + STORED) - 10 CLEARED) px.
+//     turnip has D from the samples a pass's like passed last time; here it is taken to grow with the draws, by what
+//     BAR says: BAR draws are where tiles begin to pay for a pass that loads and stores all it touches (TOUCHED
+//     bytes: 9 D = 22 TOUCHED px there). So tiles when DRAWS * 22 TOUCHED >= BAR * (11 (LOADED + STORED) - 10 CLEARED):
+//     at BAR draws for such a pass as before, at half of it when nothing need be loaded (DontCare, or a Clear the
+//     tiles do themselves), at kGmemFewDraws when the sysmem pass would fill what the tiles store anyway.
+// WHY: when sysmem, the reason in words (for the pass's profile).
+constexpr uint32_t kGmemFewDraws = 5;
+struct GmemChoice {
+    uint32_t draws = 0, bar = 0;
+    bool fetch = false;
+    uint32_t touched = 0, loaded = 0, stored = 0, cleared = 0;   // bytes a pixel
+};
+bool gmemWorth(const GmemChoice& c, std::string* why);
+// PLAN's bins over the render area AREA (X0 Y0 X1 Y1 inclusive, inside the window): the bins of the plan's own grid
+// that the area touches. The grid is the window's, from its origin, as both of Mesa's drivers have it on this family
+// (freedreno_gmem.c: "on a6xx, the max-scissor-rect is handled in fd6_gmem, and we just rely on CP_COND_EXEC to skip
+// bins with no geometry", minx = miny = 0; turnip's tiles are tile0's multiples): the VSC bins a draw by its place in
+// the window and has no register for a grid that starts elsewhere, so a tile laid from the area's corner was given the
+// visibility of another rectangle than the one it drew. A pass whose draws touch a corner of the screen is drawn in
+// the bins over that corner -- up to four where one laid on the corner did -- and its loads and stores are still the
+// area's granules alone (encodeGmem's blit scissor). False when no bin fits (the plan unchanged).
+// (AT_AREA: Options::gmemTwin 5, the grid from the area's corner as it used to be.)
+bool gmemTiles(GmemPlan* plan, const uint32_t area[4], bool atArea = false);
 // the pixels a draw can touch, X0 Y0 X1 Y1 inclusive: its viewport clamped to the window, within its scissor (both as
 // encodeInPass writes them); false for a draw it would refuse for them
 bool drawArea(const RenderPass& pass, const Draw& draw, uint32_t area[4]);
@@ -541,8 +602,16 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
 // CLEAR: the attachments cleared in GMEM instead of loaded (gmemClearWords' packing in CLEAR_WORDS), which
 // encodeBegin was told to leave unfilled
 // VSC: with Options::gmemBinning, the visibility streams' memory (vscBytes'), the draws having been encoded USE_VISIBILITY
+// BODY: what the draws' words are, of a binned pass -- kGmemBodyGroups: draw-state groups and draws (gmem.hpp), the
+// groups let go after the binning pass and after each tile's draws as fd6 lets its own go (emit_binning_pass,
+// fd6_emit_tile_gmem2mem); kGmemBodyLeave: each tile leaves them once its visibility streams name no more draws
+// (CP_SKIP_IB2_ENABLE_LOCAL beside _GLOBAL, written after the tile's CP_SET_BIN_DATA5, which clears it);
+// kGmemBodyBarriers: the draws that fetch carry their barrier as a group (gmem.hpp: kDsFetchGroup), so a tile has none
+// before its draws
+enum : uint32_t { kGmemBodyGroups = 1, kGmemBodyLeave = 2, kGmemBodyBarriers = 4 };
 void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, uint64_t bodies, uint32_t bodyWords, uint64_t table, const Options& o,
-                uint32_t load, uint32_t store, bool fetch, uint32_t clear = 0, const uint32_t (*clearWords)[4] = nullptr, uint64_t vsc = 0);
+                uint32_t load, uint32_t store, bool fetch, uint32_t clear = 0, const uint32_t (*clearWords)[4] = nullptr, uint64_t vsc = 0,
+                uint32_t body = 0);
 // the visibility streams' memory a binned GMEM pass needs: each pipe's draw stream and its size word, each pipe's
 // primitive stream
 constexpr uint32_t kVscDrawPitch = 0x4000, kVscPrimPitch = 0x20000;

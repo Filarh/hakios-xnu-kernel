@@ -17,6 +17,7 @@
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/fake_gpu.hpp"
+#include "hakios-metal/gmem.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
 #include "fixtures/end_only.hpp"
@@ -1915,11 +1916,37 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
 TEST(the_fake_refuses_the_packets_a_draw_stream_may_not_carry) {
     using namespace a6xx;
     {
+        // a group of 4 words at an address for no mode: nothing would ever run it
         Twin w;
         size_t ds = w.e.find(CP_SET_DRAW_STATE);
-        w.words[ds + 1] = setDrawState0(4, 0, 1);   // a group of 4 dwords at an address: applied at the draw over the direct writes
+        w.words[ds + 1] = setDrawState0(4, 0, 1);
         w.words[ds + 2] = uint32_t(w.e.table->gpuAddress());
-        CHECK(has(w.fault(), "draw-state groups are not what this GPU model runs: registers are written directly (only CP_SET_DRAW_STATE's 3-word disable-all form is taken)"));
+        w.words[ds + 3] = uint32_t(w.e.table->gpuAddress() >> 32);
+        CHECK(has(w.fault(), "draw-state group 1: 4 words at"));
+    }
+    {
+        // ...for the sysmem pass: it runs at the draw, over the direct writes -- and the table's words are no packets
+        Twin w;
+        size_t ds = w.e.find(CP_SET_DRAW_STATE);
+        w.words[ds + 1] = setDrawState0(4, CP_SET_DRAW_STATE__0_SYSMEM, 1);
+        w.words[ds + 2] = uint32_t(w.e.table->gpuAddress());
+        w.words[ds + 3] = uint32_t(w.e.table->gpuAddress() >> 32);
+        CHECK(has(w.fault(), "not a packet, or its parity is wrong"));
+    }
+    {
+        // ...outside every buffer
+        Twin w;
+        size_t ds = w.e.find(CP_SET_DRAW_STATE);
+        w.words[ds + 1] = setDrawState0(4, CP_SET_DRAW_STATE__0_SYSMEM, 1);
+        w.words[ds + 2] = 0x1000;
+        CHECK(has(w.fault(), "draw-state group 1: 4 words at"));
+    }
+    {
+        // the disable-all form with a count
+        Twin w;
+        size_t ds = w.e.find(CP_SET_DRAW_STATE);
+        w.words[ds + 1] |= 4;
+        CHECK(has(w.fault(), "CP_SET_DRAW_STATE disabling every group with a count"));
     }
     {
         Twin w;
@@ -5350,20 +5377,46 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         CHECK(p.cols * p.binW >= w && (p.cols - 1) * p.binW < w && p.rows * p.binH >= h && (p.rows - 1) * p.binH < h);
         std::printf("       %ux%u %s: %u x %u tiles of %u x %u\n", w, h, t->info().name, p.cols, p.rows, p.binW, p.binH);
     }
-    // the screen at 4 bytes a pixel: two columns of 576 and twelve rows of 208, 24 tiles
-    // (the A610, 128 KiB of GMEM below the colour cache: a row of 576 pixels is 2304 bytes, 56 rows fit, 48 in whole
-    // granules of 16 -- two columns of 576 and 51 rows of 48, 102 tiles)
+    // The layouts turnip gives the same passes, worked out apart from this code from tu_render_pass_gmem_config
+    // (tu_pass.cc:848-877) and tu_tiling_config_update_tile_layout (tu_util.cc:286-343) for each chip's GMEM below the
+    // colour cache: one, two and three BGRA8 attachments at the phone's screen and at 1125 x 2436, the bins and where the
+    // second attachment's begin.
     {
-        auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
-        RenderPass a;
-        a.color0 = t.get();
-        render::GmemPlan p;
-        CHECK(render::gmemPlan(a, &p, nullptr));
+        struct Want { uint32_t w, h, attachments, binW, binH, cols, rows, base1; };
 #if defined(HAKIOS_CHIP_A610)
-        CHECK(p.cols == 2 && p.rows == 51 && p.binW == 576 && p.binH == 48);
+        // (128 KiB: CoreAnimation's main pass, 750 x 1624 with two attachments, 78 bins of 128 x 128 where it had 102 of 768 x 16)
+        static_assert(a6xx::kGmemCcuColorOffset == 0x20000, "the Adreno 610's GMEM below the colour cache");
+        const Want wants[] = {{750, 1624, 1, 256, 128, 3, 13, 0},     {750, 1624, 2, 128, 128, 6, 13, 65536},  {750, 1624, 3, 128, 80, 6, 21, 40960},
+                              {1125, 2436, 1, 288, 112, 4, 22, 0},    {1125, 2436, 2, 128, 128, 9, 20, 65536}};
 #else
-        CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
+        static_assert(a6xx::kGmemCcuColorOffset == 0x78000, "the Adreno 7c+'s GMEM below the colour cache");
+        const Want wants[] = {{750, 1624, 1, 768, 160, 1, 11, 0},     {750, 1624, 2, 256, 240, 3, 7, 245760},  {750, 1624, 3, 192, 208, 4, 8, 163840},
+                              {1125, 2436, 1, 384, 320, 3, 8, 0},     {1125, 2436, 2, 288, 208, 4, 12, 245760}};
 #endif
+        for (const Want& q : wants) {
+            std::shared_ptr<Texture> ts[3];
+            RenderPass a;
+            for (uint32_t i = 0; i < q.attachments; i++) {
+                ts[i] = target(r, q.w, q.h, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+                (i == 0 ? a.color0 : a.more[i - 1].texture) = ts[i].get();
+            }
+            render::GmemPlan p;
+            CHECK(render::gmemPlan(a, &p, nullptr));
+            CHECK(p.binW == q.binW && p.binH == q.binH && p.cols == q.cols && p.rows == q.rows && p.gridCols == q.cols && p.gridRows == q.rows);
+            CHECK(p.base[0] == 0 && (q.attachments < 2 || p.base[1] == q.base1));
+            // each attachment's bin inside its own room, the rooms apart and below the colour cache
+            for (uint32_t i = 0; i < q.attachments; i++) {
+                CHECK(uint64_t(p.binW) * p.binH * 4 <= p.room[i] && p.base[i] % 4096 == 0);
+                CHECK(p.base[i] + p.room[i] <= (i + 1 < q.attachments ? p.base[i + 1] : a6xx::kGmemCcuColorOffset));
+            }
+            // (and the layout this had before, for the bisect: one column of bins while the window is no wider than a bin,
+            // never fewer bins than turnip's -- and none at all for three attachments in the Adreno 610's GMEM, where a
+            // 768-pixel bin of 16 rows does not fit a third of it: such a pass went to sysmem)
+            render::GmemPlan old;
+            const bool had = render::gmemPlan(a, &old, nullptr, render::kGmemPlanOld);
+            CHECK(had || (a6xx::kGmemCcuColorOffset == 0x20000 && q.attachments == 3));
+            if (had) CHECK(old.cols == (q.w <= 1024 ? 1u : 2u) && old.tiles() >= p.tiles());
+        }
     }
     // what stays in sysmem: a second colour attachment of another size, an integer target
     {
@@ -5480,12 +5533,14 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-#if defined(HAKIOS_CHIP_A610)
-        // (128 KiB shared out by bytes a pixel: 64 KiB each, 28 rows of 2304 bytes, 16 in whole granules)
-        CHECK(p.binW == 576 && p.binH == 16 && p.base[0] == 0 && p.base[1] == 0x10000 && p.room[0] == 0x10000 && p.room[1] == 0x10000);
-#else
-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
-#endif
+        // (both attachments' shares the same, the second's bin after the first's)
+        CHECK(p.base[0] == 0 && p.base[1] == a6xx::kGmemCcuColorOffset / 2 && p.room[0] == a6xx::kGmemCcuColorOffset / 2 && p.room[1] == p.room[0]);
+        // drawn into the first alone, the pass's bins are the first's with all of GMEM: the same width, taller
+        if (!both) {
+            const uint32_t binH = p.binH;
+            CHECK_EQ(render::gmemTouched(&p, 1, 1125, 2436), 2u);
+            CHECK(p.room[0] == a6xx::kGmemCcuColorOffset && p.room[1] == 0 && p.base[1] == 0 && p.binH > binH && uint64_t(p.binW) * p.binH * 4 <= p.room[0]);
+        }
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
@@ -5504,14 +5559,18 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
 }
 
 // A pass whose draws touch a corner is tiled over that corner alone: tri_flat at a 100 x 50 viewport at (300, 1000)
-// and another at (350, 1010) -- one tile, its loads and stores over the area's granules, the rest of the target left as
-// it was (here the coordinates throughout: the fake draws nothing, so a store anywhere puts back what was loaded).
+// and another at (350, 1010) -- the bins of the window's grid that area touches, their loads and stores over the area's
+// granules, the rest of the target left as it was (here the coordinates throughout: the fake draws nothing, so a store
+// anywhere puts back what was loaded).
 TEST(a_gmem_pass_is_tiled_over_its_render_area) {
     Rig r;
     auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
     fillCoords(*t);
     RenderPass a;
     a.color0 = t.get();
+    render::GmemPlan p;
+    CHECK(render::gmemPlan(a, &p, nullptr));
+    const uint32_t tiles = (449 / p.binW - 300 / p.binW + 1) * (1059 / p.binH - 1000 / p.binH + 1);
     auto cb = r.queue->commandBuffer();
     Draw d1 = wholeDraw(3), d2 = wholeDraw(3);
     d1.viewport = Viewport{300, 1000, 100, 50, 0, 1};
@@ -5523,13 +5582,10 @@ TEST(a_gmem_pass_is_tiled_over_its_render_area) {
     CHECK(cb->status() == CommandBuffer::kCompleted);
     const auto s = r.fake->stats();
     CHECK_EQ(s.faults, 0u);
-#if defined(HAKIOS_CHIP_A610)
-    // (the area's 68 rows from 992 are two of this chip's bins of 48 rows at most)
-    CHECK(s.tiles == 2 && s.tileLoads == 2 && s.tileStores == 2);
-#else
-    CHECK(s.tiles == 1 && s.tileLoads == 1 && s.tileStores == 1);
-#endif
-    // the area (300, 1000)-(449, 1059) in 16 x 4 granules: x 288 to 463, y 1000 to 1059
+    CHECK(tiles >= 1 && tiles < p.tiles());
+    CHECK(s.tiles == tiles && s.tileLoads == tiles && s.tileStores == tiles);
+    // the area (300, 1000)-(449, 1059) in 16 x 4 granules: x 288 to 463, y 1000 to 1059, each granule stored once
+    // whichever bin it falls in
     CHECK_EQ(s.storedPixels, uint64_t(464 - 288) * (1060 - 1000));
     CHECK_EQ(coordsWrong(*t), 0u);
 }
@@ -5556,11 +5612,8 @@ TEST(a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has) {
     const auto s = r.fake->stats();
     CHECK_EQ(s.faults, 0u);
     if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
-#if defined(HAKIOS_CHIP_A610)
-    CHECK(cb->counts().gmemPasses == 1 && s.tiles == 2);   // (the area's 58 rows from 992: two bins of 48 rows at most)
-#else
-    CHECK(cb->counts().gmemPasses == 1 && s.tiles == 1);
-#endif
+    // (the bins of the window's grid the area (300, 1000)-(399, 1049) touches)
+    CHECK(cb->counts().gmemPasses == 1 && s.tiles == (399 / whole.binW - 300 / whole.binW + 1) * (1049 / whole.binH - 1000 / whole.binH + 1));
     const auto gd = r.fake->memory(s.lastDraw.fsTexConst, 64);
     uint32_t gw[16] = {};
     if (gd.size() == 64) memcpy(gw, gd.data(), 64);
@@ -5646,6 +5699,91 @@ TEST(gmem_for_a_pass_of_enough_draws_decided_at_its_end) {
     CHECK(cb->status() == CommandBuffer::kCompleted);
     CHECK_EQ(r.fake->stats().faults, 0u);
     CHECK(cb->counts().gmemPasses == 0 && cb->counts().passes == 1);
+}
+
+// Tiles or sysmem by what a pass holds (render::gmemWorth): turnip's criteria on what a pass knows of itself when it
+// closes. A bar of 56 draws, one 4-byte attachment.
+TEST(tiles_or_sysmem_by_what_a_pass_holds) {
+    auto worth = [](uint32_t draws, bool fetch, uint32_t loaded, uint32_t stored, uint32_t cleared, uint32_t bar = 56, std::string* why = nullptr) {
+        render::GmemChoice c;
+        c.draws = draws;
+        c.bar = bar;
+        c.fetch = fetch;
+        c.touched = 4;
+        c.loaded = loaded;
+        c.stored = stored;
+        c.cleared = cleared;
+        return render::gmemWorth(c, why);
+    };
+    // loaded and stored: the bar itself
+    CHECK(!worth(55, false, 4, 4, 0) && worth(56, false, 4, 4, 0));
+    // nothing to load (DontCare): half of it
+    CHECK(!worth(27, false, 0, 4, 0) && worth(28, false, 0, 4, 0));
+    // a Clear the tiles do themselves, which a sysmem pass would fill: 9 D <= (44 - 40) px only for next to nothing drawn
+    CHECK(!worth(4, false, 0, 4, 4) && worth(5, false, 0, 4, 4));
+    // neither loaded nor stored (a scratch target cleared and thrown away): the tiles move nothing
+    CHECK(worth(5, false, 0, 0, 4) && !worth(4, false, 0, 0, 4));
+    // a fetch: tiled from kGmemFewDraws draws on, whatever it loads
+    CHECK(!worth(4, true, 4, 4, 0) && worth(5, true, 4, 4, 0) && render::kGmemFewDraws == 5);
+    // a bar under kGmemFewDraws is its own floor (metal_gmem_draws=1: every pass that can)
+    CHECK(worth(1, false, 4, 4, 0, 1) && worth(1, true, 4, 4, 0, 1) && !worth(1, false, 4, 4, 0, 2) && worth(2, true, 4, 4, 0, 2));
+    // two attachments touched, one of them loaded and both stored: 56 * 11 * 12 / (22 * 8) = 42
+    {
+        render::GmemChoice c;
+        c.bar = 56;
+        c.touched = 8;
+        c.loaded = 4;
+        c.stored = 8;
+        c.draws = 41;
+        std::string why;
+        CHECK(!render::gmemWorth(c, &why));
+        CHECK(why.find("41 draws, fewer than the 42 at which tiles pay") != std::string::npos);
+        c.draws = 42;
+        CHECK(render::gmemWorth(c, &why));
+    }
+    std::string why;
+    CHECK(!worth(3, true, 4, 4, 0, 56, &why) && why.find("too few for tiles") != std::string::npos);
+}
+
+// ...and in a command buffer, a bar of 16: six draws that read their target are tiled, time after time (a pass tiled for
+// what it holds keeps its like recorded both ways); six that do not are not; into a target that need not be loaded,
+// eight are and seven are not; four that read their target are too few. By the draws alone (kGmemByDrawsAlone) only
+// the pass of 16 is.
+TEST(a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone) {
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    for (int alone = 0; alone < 2; alone++) {
+        // (a queue of its own for each case but the first: what a kind of pass did lately is the queue's to remember)
+        auto pass = [&](Rig& r, int draws, bool fetch, LoadAction load) {
+            auto t = target(r);
+            RenderPass p;
+            p.color0 = t.get();
+            p.load = load;
+            auto cb = r.queue->commandBuffer();
+            cb->setGmemMinDraws(16);
+            if (alone) cb->setGmemOff(CommandBuffer::kGmemByDrawsAlone);
+            for (int i = 0; i < draws; i++) CHECK(cb->draw(fetch ? fb : flatProgram(), p, wholeDraw(6), Bindings{}, Bindings{}));
+            cb->commit();
+            cb->waitUntilCompleted();
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            CHECK_EQ(cb->counts().passes, 1u);
+            CHECK_EQ(r.fake->stats().faults, 0u);
+            if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+            return cb->counts().gmemPasses;
+        };
+        {
+            Rig r;
+            for (int time = 0; time < 3; time++) CHECK_EQ(pass(r, 6, true, LoadAction::kLoad), alone ? 0u : 1u);
+        }
+        for (const auto& [draws, fetch, load, want] : {std::tuple<int, bool, LoadAction, uint32_t>{16, false, LoadAction::kLoad, 1u},
+                                                       {15, false, LoadAction::kLoad, 0u},
+                                                       {6, false, LoadAction::kLoad, 0u},
+                                                       {8, false, LoadAction::kDontCare, alone ? 0u : 1u},
+                                                       {7, false, LoadAction::kDontCare, 0u},
+                                                       {4, true, LoadAction::kLoad, 0u}}) {
+            Rig r;
+            CHECK_EQ(pass(r, draws, fetch, load), want);
+        }
+    }
 }
 
 // A pass whose like has had few draws lately (under half the bar) is recorded for sysmem only: a pass of 10 draws after
@@ -5851,4 +5989,613 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
         CHECK(std::string(cb->passSysmemWhy(0)).find("GMEM off") != std::string::npos);
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// --- A binned pass's draws as draw-state groups (gmem.hpp), and the command processor's part in it -----------------------
+//
+// The fake keeps the command processor's state as the phone's microcode does (fake_gpu.hpp): a tile's streams name the
+// draws of the binning pass whose scissors' rectangle reaches the tile's bin, a draw they do not name is skipped, a
+// group runs when a draw that runs finds it pending. It logs every draw that ran with a digest of everything the GPU
+// holds then, so two recordings of one scene can be held to each other draw by draw and tile by tile.
+namespace {
+struct Scene {
+    FakeGpu::Stats stats;
+    CommandBuffer::Counts counts;
+    bool completed = false;
+    render::GmemPlan plan;
+};
+// Nine draws over a 1125 x 600 target, each in a rectangle of its own so that every tile sees another subset of them,
+// with the kinds of state a compositor's draws differ in: three programs' worth of textures, constants bound at a
+// 16-byte boundary and off one (the copy), a framebuffer fetch, blending on and off. GMEM_OFF: CommandBuffer's bits;
+// TWIN: Options::gmemTwin; SHARED: the two draws whose programs differ and whose loads do not (twin 2's).
+Scene groupScene(uint32_t gmemOff, uint8_t twin = 0, bool shared = false) {
+    Rig r;
+    r.fake->logDraws(true, true);
+    auto t = target(r, 1125, 600, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto tex1 = target(r, 32, 32, kTextureUsageRead), tex2 = target(r, 16, 16, kTextureUsageRead);
+    fillCoords(*t);
+    std::string why;
+    Sampler smp;
+    CHECK(makeSampler(SamplerDesc{}, &smp, &why));
+    auto uniforms = newBuffer(*r.gpu, 4096, &why);
+    CHECK(uniforms != nullptr);
+    for (uint32_t i = 0; i < 1024; i++) static_cast<uint32_t*>(uniforms->contents())[i] = 0x3f000000u + i;
+    const Program flat = flatProgram(), color = colorProgram();
+    const Program tex{kernels::tri_color_vs_air, kernels::tri_tex_fs_air, Linkage{}, "tri_tex"};
+    Program cflat{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "tri_cflat"};
+    Program blended = cflat;
+    blended.blend.enabled = true;
+    blended.blend.srcRgb = 1, blended.blend.dstRgb = 5, blended.blend.srcAlpha = 1, blended.blend.dstAlpha = 5;
+    const Program fetch{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    // (one vertex stage whose words lie in two places: two programs to the driver, uploaded apart, with not a load between them that differs)
+    const std::vector<uint32_t> again(cflat.vs.k.words, cflat.vs.k.words + cflat.vs.k.numWords);
+    Program cflat2 = cflat;
+    cflat2.vs.k.words = again.data();
+    Scene out;
+    RenderPass a;
+    a.color0 = t.get();
+    CHECK(render::gmemPlan(a, &out.plan, nullptr));
+    render::Options o;
+    o.gmemBinning = true;
+    o.gmemTwin = twin;
+    auto cb = r.queue->commandBuffer();
+    cb->setGmemOff(gmemOff);
+    auto draw = [&](const Program& p, double x, double y, double w, double h, const Bindings& fsb = Bindings{}, const Bindings& vsb = Bindings{}) {
+        Draw d = wholeDraw(3);
+        d.viewport = Viewport{x, y, w, h, 0, 1};
+        const bool ok = cb->draw(p, a, d, vsb, fsb, o);
+        CHECK(ok);
+        if (!ok) std::printf("       %s: %s\n", p.name, cb->error().c_str());
+    };
+    Bindings t1, t2, u8, u32;
+    t1.textures = {tex1.get()};
+    t1.samplers = {&smp};
+    t2.textures = {tex2.get()};
+    t2.samplers = {&smp};
+    u8.buffers = {Binding{uniforms.get(), 8}};     // off a 16-byte boundary: copied by the command processor first
+    u32.buffers = {Binding{uniforms.get(), 32}};   // on one: loaded from where it lies
+    if (shared) {
+        // two programs with one fragment stage and the same constants bound: the program's fragment differs, the loads'
+        // does not -- what the loads must still be run again for
+        draw(cflat, 0, 0, 1125, 600, u32);
+        draw(cflat2, 0, 0, 1125, 600, u32);
+    } else {
+        draw(flat, 0, 0, 1125, 600);
+        draw(tex, 0, 0, 200, 100, t1);
+        draw(cflat, 700, 300, 300, 200, u8);
+        draw(tex, 600, 0, 500, 60, t2);
+        draw(cflat, 0, 400, 100, 100, u32);
+        draw(fetch, 100, 100, 400, 300);
+        draw(flat, 900, 500, 200, 100);
+        draw(blended, 50, 50, 20, 20, u32);
+        draw(color, 0, 0, 300, 300);
+    }
+    cb->commit();
+    cb->waitUntilCompleted();
+    out.completed = cb->status() == CommandBuffer::kCompleted;
+    out.stats = r.fake->stats();
+    out.counts = cb->counts();
+    if (out.completed) CHECK_EQ(coordsWrong(*t), 0u);
+    return out;
+}
+// whether two scenes ran the same draws in the same tiles with the GPU in the same state at each (SAY: where they part)
+bool sameDraws(const Scene& a, const Scene& b, bool say = false) {
+    if (a.stats.drawLog.size() != b.stats.drawLog.size()) {
+        if (say) std::printf("       %zu draws ran against %zu\n", a.stats.drawLog.size(), b.stats.drawLog.size());
+        return false;
+    }
+    for (size_t i = 0; i < a.stats.drawLog.size(); i++) {
+        const auto &x = a.stats.drawLog[i], &y = b.stats.drawLog[i];
+        if (x.tile != y.tile || x.ordinal != y.ordinal || x.binning != y.binning || x.digest != y.digest) {
+            if (say) {
+                std::printf("       entry %zu: tile %d draw %u%s against tile %d draw %u%s\n", i, int(x.tile), x.ordinal, x.binning ? " (binning)" : "", int(y.tile),
+                            y.ordinal, y.binning ? " (binning)" : "");
+                for (size_t k = 0, shown = 0; k < x.state.size() && k < y.state.size() && shown < 12; k++) {
+                    if (x.state[k] != y.state[k]) {
+                        std::printf("         word %zu: %#llx against %#llx\n", k, (unsigned long long)x.state[k], (unsigned long long)y.state[k]);
+                        shown++;
+                    }
+                }
+                if (x.state.size() != y.state.size()) std::printf("         %zu words of state against %zu\n", x.state.size(), y.state.size());
+            }
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+// The fake's visibility streams: in a binned pass's tile a draw runs where its rectangle reaches the tile's bin and is
+// skipped elsewhere, its packet read and nothing more. Without the binning (metal_gmem_off=16's) every draw runs in
+// every tile.
+TEST(a_binned_tile_runs_the_draws_its_streams_name_and_skips_the_rest) {
+    const Scene s = groupScene(CommandBuffer::kGmemPlainBody);
+    CHECK(s.completed);
+    CHECK_EQ(s.stats.faults, 0u);
+    const render::GmemPlan& p = s.plan;
+    CHECK(p.tiles() >= 6);
+    // each draw's rectangle counted over the plan's bins: the tiles it runs in
+    const uint32_t rects[9][4] = {{0, 0, 1124, 599}, {0, 0, 199, 99}, {700, 300, 999, 499}, {600, 0, 1099, 59}, {0, 400, 99, 499},
+                                  {100, 100, 499, 399}, {900, 500, 1099, 599}, {50, 50, 69, 69}, {0, 0, 299, 299}};
+    uint32_t runs = 0;
+    for (const auto& q : rects) runs += (q[2] / p.binW - q[0] / p.binW + 1) * (q[3] / p.binH - q[1] / p.binH + 1);
+    CHECK_EQ(s.stats.binnedDraws, 9u);
+    CHECK_EQ(s.stats.draws, runs);                                // (a draw of the binning pass is counted apart)
+    CHECK_EQ(s.stats.drawsSkipped, 9 * p.tiles() - runs);
+    CHECK(s.stats.drawsSkipped != 0);
+    CHECK(s.stats.groupsRun == 0 && s.stats.ibEarlyReturns == 0);   // (the plain stream: no group, and LOCAL never written)
+}
+
+// The same scene as draw-state groups: every draw that runs finds the GPU as the plain stream leaves it for that draw
+// in that tile -- every register and every load, by the fake's digest -- though the tile ran the state of none of the
+// draws it skipped; the command processor reads a fraction of the words; and a tile whose streams are done leaves the
+// draws' buffer there.
+TEST(draw_state_groups_give_each_draw_that_runs_the_state_the_plain_stream_gives_it) {
+    const Scene plain = groupScene(CommandBuffer::kGmemPlainBody), groups = groupScene(0);
+    CHECK(plain.completed && groups.completed);
+    CHECK_EQ(plain.stats.faults, 0u);
+    CHECK_EQ(groups.stats.faults, 0u);
+    if (groups.stats.faults) std::printf("       %s\n", groups.stats.lastFault.c_str());
+    CHECK(!plain.stats.drawLog.empty());
+    CHECK(sameDraws(plain, groups, true));
+    CHECK(groups.stats.draws == plain.stats.draws && groups.stats.tiles == plain.stats.tiles && groups.stats.binnedDraws == plain.stats.binnedDraws);
+    CHECK(groups.stats.groupsRun != 0 && groups.stats.sdsWords != 0);
+    CHECK(groups.stats.ibEarlyReturns != 0);
+    CHECK(groups.stats.cpLoads < plain.stats.cpLoads);
+    CHECK(groups.stats.cpWaits <= plain.stats.cpWaits);
+    std::printf("       %u tiles: plain %llu words, %llu registers, %u loads; groups %llu words (%llu in groups), %llu registers, %u loads, %u buffers left early\n",
+                groups.stats.tiles, (unsigned long long)plain.stats.cpWords, (unsigned long long)plain.stats.cpRegisters, plain.stats.cpLoads,
+                (unsigned long long)groups.stats.cpWords, (unsigned long long)groups.stats.sdsWords, (unsigned long long)groups.stats.cpRegisters,
+                groups.stats.cpLoads, groups.stats.ibEarlyReturns);
+    // the copy of the constants bound off a 16-byte boundary: once in the pass, not once a tile that walks past its draw
+    CHECK(groups.stats.wordsCopied != 0 && groups.stats.wordsCopied < plain.stats.wordsCopied);
+    // (and with the buffers read to their end, kGmemNoLeave: the same draws in the same state, none left early)
+    const Scene whole = groupScene(CommandBuffer::kGmemNoLeave);
+    CHECK(whole.completed && sameDraws(plain, whole) && whole.stats.ibEarlyReturns == 0 && whole.stats.cpWords > groups.stats.cpWords);
+}
+
+// The twins. 1: fragments that hold only what the draw itself wrote -- the plain stream's words cut into groups -- leave
+// a draw without the registers a skipped draw wrote for it. 2: the loads neither DIRTY nor sent again with the
+// program's fragment are not run after its HLSQ_INVALIDATE_CMD when they are the fragment that ran last. 3:
+// CP_SKIP_IB2_ENABLE_LOCAL written before the tile's CP_SET_BIN_DATA5, where both of Mesa's drivers have theirs, is
+// cleared by it: nothing is left early. 4: groups left set from one tile to the next. 5: the bins laid from the render
+// area's corner are not the bins the VSC wrote the streams for.
+TEST(the_twins_of_the_draw_state_groups_show) {
+    const Scene plain = groupScene(CommandBuffer::kGmemPlainBody);
+    {
+        const Scene twin = groupScene(0, 1);
+        CHECK(!twin.completed || !sameDraws(plain, twin));
+    }
+    {
+        const Scene plainShared = groupScene(CommandBuffer::kGmemPlainBody, 0, true), shared = groupScene(0, 0, true), twin = groupScene(0, 2, true);
+        CHECK(plainShared.completed && shared.completed);
+        CHECK(sameDraws(plainShared, shared));
+        CHECK(!twin.completed || !sameDraws(plainShared, twin));
+    }
+    {
+        const Scene twin = groupScene(0, 3);
+        CHECK(twin.completed && sameDraws(plain, twin));
+        CHECK_EQ(twin.stats.ibEarlyReturns, 0u);
+    }
+    {
+        const Scene twin = groupScene(0, 4);
+        CHECK(!twin.completed);
+        CHECK(twin.stats.lastFault.find("a tile begun with a draw-state group still set") != std::string::npos);
+    }
+    {
+        // no group DIRTY but the loads': the first tile sets the pass's group to the words the binning pass ran last
+        const Scene twin = groupScene(0, 8);
+        CHECK(!twin.completed);
+        CHECK(twin.stats.lastFault.find("set again, without DIRTY, to the address and length it last ran with") != std::string::npos);
+    }
+}
+
+TEST(bins_laid_from_the_render_areas_corner_are_not_the_vscs) {
+    for (int twin = 0; twin < 2; twin++) {
+        Rig r;
+        auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        fillCoords(*t);
+        RenderPass a;
+        a.color0 = t.get();
+        render::Options o;
+        o.gmemBinning = true;
+        o.gmemTwin = twin ? 5 : 0;
+        auto cb = r.queue->commandBuffer();
+        Draw d1 = wholeDraw(3), d2 = wholeDraw(3);
+        d1.viewport = Viewport{300, 1000, 100, 50, 0, 1};
+        d2.viewport = Viewport{350, 1010, 100, 50, 0, 1};
+        CHECK(cb->draw(flatProgram(), a, d1, Bindings{}, Bindings{}, o));
+        CHECK(cb->draw(flatProgram(), a, d2, Bindings{}, Bindings{}, o));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto s = r.fake->stats();
+        if (twin == 0) {
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            CHECK_EQ(s.faults, 0u);
+            if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+            CHECK_EQ(coordsWrong(*t), 0u);
+        } else {
+            CHECK(cb->status() == CommandBuffer::kError);
+            CHECK(s.lastFault.find("the VSC bins from the window's origin") != std::string::npos);
+        }
+    }
+}
+
+// GMEM for the attachments a pass's draws touch. CoreAnimation's main pass has two screens attached; a pass whose
+// draws write the first alone needs no bin for the second, and its bins are the first's with all of GMEM: the same
+// width (the draws were recorded with it), taller, fewer. Here a stage with two colour slots whose second has no
+// output register: its draws still give the RB an RB_MRT[1], recorded with BASE_GMEM where the second's bin would
+// have been, which is rewritten to 0 -- left as recorded (the twin) it names a bin that runs into the CCU's colour
+// cache. A stage that does name the second slot, with every component masked off, keeps the second's bin.
+TEST(a_pass_gives_gmem_to_the_attachments_its_draws_touch) {
+    Stage gapFs = kernels::tri_mrt_fs_air;
+    gapFs.colorRegid[1] = a6xx::kRegidNone;
+    const Program mrt{kernels::tri_flat_vs_air, gapFs, Linkage{}, "tri_mrt without its second output"};
+    for (int twin = 0; twin < 2; twin++) {
+        for (int binning = 0; binning < 2; binning++) {
+            Rig r;
+            auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+            auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+            fillCoords(*t);
+            fillCoords(*u, 0x80000000u);
+            RenderPass a;
+            a.color0 = t.get();
+            a.more[0].texture = u.get();
+            a.more[0].load = LoadAction::kDontCare;
+            a.more[0].store = StoreAction::kDontCare;
+            render::GmemPlan both, one;
+            CHECK(render::gmemPlan(a, &both, nullptr));
+            one = both;
+            CHECK_EQ(render::gmemTouched(&one, 1, 750, 1624), 2u);
+            CHECK(one.binW == both.binW && one.binH > both.binH && one.tiles() < both.tiles());
+#if defined(HAKIOS_CHIP_A610)
+            // (the phone's: 78 bins of 128 x 128 for both screens, 42 of 128 x 240 for one)
+            CHECK(both.tiles() == 78 && one.binW == 128 && one.binH == 240 && one.tiles() == 42);
+#endif
+            render::Options o;
+            o.gmemBinning = binning != 0;
+            o.gmemTwin = twin ? 6 : 0;
+            auto cb = r.queue->commandBuffer();
+            CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, o));
+            CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, o));
+            cb->commit();
+            cb->waitUntilCompleted();
+            const auto s = r.fake->stats();
+            if (twin == 0) {
+                CHECK(cb->status() == CommandBuffer::kCompleted);
+                CHECK_EQ(s.faults, 0u);
+                if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+                CHECK(s.tiles == one.tiles() && s.tileLoads == one.tiles() && s.tileStores == one.tiles());
+                CHECK_EQ(cb->counts().tiles, one.tiles());
+                CHECK_EQ(coordsWrong(*t), 0u);
+                CHECK_EQ(coordsWrong(*u, 0x80000000u), 0u);
+            } else {
+                CHECK(cb->status() == CommandBuffer::kError);
+                CHECK(s.lastFault.find("RB_MRT_BASE_GMEM[1]: a bin to") != std::string::npos && s.lastFault.find("into the CCU's colour cache") != std::string::npos);
+            }
+        }
+    }
+    // the second slot named and masked: both bins, the first's draws stored, the second's not
+    {
+        Program masked{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"};
+        masked.moreBlend[0].writeMask = 0;
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->draw(masked, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        CHECK(r.fake->stats().tiles == both.tiles() && r.fake->stats().tileStores == both.tiles());
+    }
+    // a bin for every attachment all the same (kGmemEveryBin): the plan's own bins, the first attachment's loads and stores
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(CommandBuffer::kGmemEveryBin);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted && r.fake->stats().faults == 0);
+        CHECK(r.fake->stats().tiles == both.tiles() && r.fake->stats().tileStores == both.tiles());
+    }
+    // every attachment loaded and stored (kGmemEveryAttachment): every one has its bin, as planned
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(CommandBuffer::kGmemEveryAttachment);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted && r.fake->stats().tiles == both.tiles() && r.fake->stats().tileStores == 2 * both.tiles());
+    }
+    // ...and the bins as before turnip's layout (kGmemOldTiles): one column, a bin for both
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan old;
+        CHECK(render::gmemPlan(a, &old, nullptr, render::kGmemPlanOld));
+        CHECK_EQ(old.cols, 1u);
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(CommandBuffer::kGmemOldTiles);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        CHECK_EQ(r.fake->stats().tiles, old.tiles());
+    }
+}
+
+// The VSC's pipes: the bins of a grid grouped as fd's gmem layout groups them, and no binning at all when a pipe would
+// hold more than the 32 bins CP_SET_BIN_DATA5 can name.
+TEST(a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned) {
+    render::GmemPlan p;
+    uint32_t x = 0, y = 0;
+    p.gridCols = 6, p.gridRows = 13;   // the phone's main pass: 13 rows of bins, a pipe a row
+    CHECK(render::gmemPipes(p, &x, &y));
+    CHECK(y == 1 && x * y <= 32 && (p.gridRows + y - 1) / y * ((p.gridCols + x - 1) / x) <= a6xx::kNumVscPipes);
+    p.gridCols = 1, p.gridRows = 102;   // ...and as one column of 102
+    CHECK(render::gmemPipes(p, &x, &y));
+    CHECK(x == 1 && y % 2 == 1 && (p.gridRows + y - 1) / y <= a6xx::kNumVscPipes);
+    p.gridCols = 40, p.gridRows = 40;
+    CHECK(!render::gmemPipes(p, &x, &y));
+    CHECK(x * y > 32);
+}
+
+// A framebuffer fetch's barrier as a draw-state group. The pass: a draw that does not fetch over the left half; a
+// fetching draw over the right half, recorded with the barrier (the first to fetch after one that does not); a second
+// fetching draw over the left half, recorded without one (the rasterizer orders it after the first); a draw that does
+// not fetch. A tile of the left half draws the first and the third and not the second: the barrier, pending since the
+// second set it, runs there before the third, which the fake holds it to (the texture caches are stale after a draw
+// the rasterizer was not ordering). Let go at the very next draw (the twin), the third reads stale caches. And a tile
+// draws no barrier it has no fetch for: fewer waits than with the barrier in the stream, which every tile runs.
+TEST(a_fetchs_barrier_runs_where_a_tile_draws_the_fetch) {
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    struct Result { bool completed; FakeGpu::Stats stats; };
+    auto run = [&](uint32_t gmemOff, uint8_t twin) {
+        Rig r;
+        auto t = target(r, 1125, 600, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        fillCoords(*t);
+        RenderPass a;
+        a.color0 = t.get();
+        render::Options o;
+        o.gmemBinning = true;
+        o.gmemTwin = twin;
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(gmemOff);
+        auto draw = [&](const Program& p, double x, double w) {
+            Draw d = wholeDraw(3);
+            d.viewport = Viewport{x, 0, w, 600, 0, 1};
+            CHECK(cb->draw(p, a, d, Bindings{}, Bindings{}, o));
+        };
+        draw(flatProgram(), 0, 500);
+        draw(fb, 600, 500);
+        draw(fb, 0, 500);
+        draw(flatProgram(), 0, 1125);
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (cb->status() == CommandBuffer::kCompleted) CHECK_EQ(coordsWrong(*t), 0u);
+        return Result{cb->status() == CommandBuffer::kCompleted, r.fake->stats()};
+    };
+    const Result group = run(0, 0), inlined = run(CommandBuffer::kGmemInlineBarriers, 0), ordered = run(CommandBuffer::kGmemAllOrdered, 0),
+                 plain = run(CommandBuffer::kGmemPlainBody, 0), twin = run(0, 7);
+    CHECK(group.completed && inlined.completed && ordered.completed && plain.completed);
+    CHECK(group.stats.faults == 0 && inlined.stats.faults == 0 && ordered.stats.faults == 0 && plain.stats.faults == 0);
+    if (group.stats.faults) std::printf("       %s\n", group.stats.lastFault.c_str());
+    if (ordered.stats.faults) std::printf("       %s\n", ordered.stats.lastFault.c_str());
+    CHECK(group.stats.tiles == inlined.stats.tiles && group.stats.draws == inlined.stats.draws);
+    // the group's barrier ran once in each tile that drew a fetch (two waits), and each tile has its closing wait
+    CHECK(group.stats.groupRuns[render::kDsBarrier] != 0 && group.stats.groupRuns[render::kDsBarrier] <= group.stats.tiles);
+    CHECK_EQ(group.stats.cpWaits - 2 * group.stats.groupRuns[render::kDsBarrier], ordered.stats.cpWaits - ordered.stats.tiles);
+    CHECK(group.stats.cpWaits < inlined.stats.cpWaits && inlined.stats.cpWaits <= plain.stats.cpWaits);
+    CHECK_EQ(inlined.stats.groupRuns[render::kDsBarrier], 0u);
+    CHECK_EQ(ordered.stats.groupRuns[render::kDsBarrier], 0u);
+    std::printf("       %u tiles: waits for idle with the barrier a group %u, in the stream %u, the plain stream %u, every draw ordered %u\n", group.stats.tiles,
+                group.stats.cpWaits, inlined.stats.cpWaits, plain.stats.cpWaits, ordered.stats.cpWaits);
+    CHECK(!twin.completed);
+    CHECK(twin.stats.lastFault.find("reads its target's bin through texture caches that are stale") != std::string::npos);
+}
+
+// drawStates on streams written by hand: a fragment holds every register of its group as it stands at the draw, not
+// the draw's own writes alone; a group no draw changes is not set again; a copy goes to the prologue with one wait for
+// all; a packet that is none of a draw's sends the pass back to its plain stream.
+TEST(draw_states_keep_each_groups_registers_whole) {
+    using namespace a6xx;
+    pm4::Stream body;
+    auto reg1 = [&](uint32_t r, uint32_t v) { body.registers(r, &v, 1); };
+    const uint32_t draw[3] = {drawIndxOffset0(DI_PT_TRILIST, DI_SRC_SEL_AUTO_INDEX, USE_VISIBILITY), 1, 3};
+    // draw 1: two viewport registers, the blend, a copy and its waits; draw 2: one viewport register; draw 3: nothing
+    reg1(REG_A6XX_GRAS_CL_VPORT_XOFFSET, 11);
+    reg1(REG_A6XX_GRAS_CL_VPORT_XOFFSET + 1, 12);
+    reg1(REG_A6XX_RB_BLEND_CNTL, 7);
+    body.memcpy(0x1000, 0x2000, 4);
+    body.waitMemWrites();
+    body.waitForMe();
+    body.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    reg1(REG_A6XX_GRAS_CL_VPORT_XOFFSET + 1, 99);
+    body.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    body.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    render::DrawStates s;
+    const uint32_t modes = CP_SET_DRAW_STATE__0_BINNING | CP_SET_DRAW_STATE__0_GMEM;
+    CHECK(render::drawStates(body.words().data(), body.words().size(), modes, &s));
+    CHECK(s.draws == 3 && s.fragments == 3 && s.entries == 3);
+    // the prologue: the copy, CP_WAIT_MEM_WRITES, CP_WAIT_FOR_ME
+    CHECK_EQ(s.prologue.size(), size_t(6 + 1 + 1));
+    CHECK(s.prologue.size() == 8 && pm4::decode(s.prologue[0]).opcode == pm4::kMemcpy && pm4::decode(s.prologue[6]).opcode == pm4::kWaitMemWrites &&
+          pm4::decode(s.prologue[7]).opcode == pm4::kWaitForMe);
+    // the list: [set viewport, blend][draw][set viewport][draw][draw]
+    const std::vector<uint32_t>& l = s.list;
+    CHECK_EQ(l.size(), size_t(7 + 4 + 4 + 4 + 4));
+    if (l.size() == 23) {
+        CHECK(pm4::decode(l[0]).opcode == CP_SET_DRAW_STATE && pm4::decode(l[0]).count == 6);
+        // (every group DIRTY: gmem.hpp)
+        CHECK_EQ(l[1], setDrawState0(3, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsViewport));   // one type-4 of two registers
+        CHECK_EQ(l[4], setDrawState0(2, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsBlend));
+        CHECK(pm4::decode(l[7]).opcode == CP_DRAW_INDX_OFFSET);
+        CHECK(pm4::decode(l[11]).opcode == CP_SET_DRAW_STATE && pm4::decode(l[11]).count == 3);
+        // draw 2's viewport fragment: BOTH registers, the one draw 1 wrote and the one draw 2 changed
+        CHECK_EQ(l[12], setDrawState0(3, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsViewport));
+        const uint32_t at = l[13] / 4;
+        CHECK(at + 3 <= s.blobs.size());
+        if (at + 3 <= s.blobs.size()) {
+            CHECK_EQ(s.blobs[at], pm4::type4(REG_A6XX_GRAS_CL_VPORT_XOFFSET, 2));
+            CHECK(s.blobs[at + 1] == 11 && s.blobs[at + 2] == 99);
+        }
+        CHECK(pm4::decode(l[15]).opcode == CP_DRAW_INDX_OFFSET && pm4::decode(l[19]).opcode == CP_DRAW_INDX_OFFSET);
+    }
+    // placed: the entries' addresses are the fragments'
+    s.place(0x100002000ull);
+    CHECK(l.size() == 23 && l[2] == 0x00002000u && l[3] == 1u);
+    // a barrier before a draw in raster order, another such draw, one that is not: [set barrier, raster][draw][draw][let the
+    // barrier go, raster][draw] -- or the barrier's three packets in the list itself, or none and every draw in order
+    {
+        pm4::Stream f;
+        const uint32_t inOrder = A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP), plainOrder = grasScCntlSysmem();
+        const uint32_t invalidate = eventWrite0(CACHE_INVALIDATE, false);
+        f.waitForIdle();
+        f.packet(CP_EVENT_WRITE, &invalidate, 1);
+        f.waitForIdle();
+        f.registers(REG_A6XX_GRAS_SC_CNTL, &inOrder, 1);
+        f.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+        f.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+        f.registers(REG_A6XX_GRAS_SC_CNTL, &plainOrder, 1);
+        f.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+        render::DrawStates g;
+        CHECK(render::drawStates(f.words().data(), f.words().size(), modes, &g));
+        CHECK(g.draws == 3 && g.barriers == 1 && g.entries == 4);
+        const std::vector<uint32_t>& fl = g.list;
+        CHECK_EQ(fl.size(), size_t(7 + 4 + 4 + 7 + 4));
+        if (fl.size() == 26) {
+            CHECK_EQ(fl[1], setDrawState0(4, CP_SET_DRAW_STATE__0_GMEM | CP_SET_DRAW_STATE__0_DIRTY, render::kDsBarrier));
+            CHECK(fl[2] / 4 + 4 <= g.blobs.size() && pm4::decode(g.blobs[fl[2] / 4]).opcode == pm4::kWaitForIdle);
+            CHECK_EQ(fl[4], setDrawState0(2, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsRaster));
+            CHECK(pm4::decode(fl[7]).opcode == CP_DRAW_INDX_OFFSET && pm4::decode(fl[11]).opcode == CP_DRAW_INDX_OFFSET);
+            CHECK_EQ(fl[16], setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE, render::kDsBarrier));
+            CHECK(fl[17] == 0 && fl[18] == 0);
+        }
+        render::DrawStates in, ord;
+        CHECK(render::drawStates(f.words().data(), f.words().size(), modes, &in, 0, render::kDsFetchInline));
+        CHECK(in.barriers == 0 && in.list.size() == size_t(4 + 4 + 4 + 4 + 4 + 4) && pm4::decode(in.list[0]).opcode == pm4::kWaitForIdle);
+        CHECK(render::drawStates(f.words().data(), f.words().size(), modes, &ord, 0, render::kDsFetchOrdered));
+        // (one raster fragment for all three draws: GRAS_SC_CNTL in order throughout, no barrier anywhere)
+        CHECK(ord.barriers == 0 && ord.fragments == 1 && ord.list.size() == size_t(4 + 4 + 4 + 4) && ord.blobs.size() == 2 && ord.blobs[1] == inOrder);
+    }
+    // a packet no draw is made of: not moved, the pass keeps its plain stream
+    pm4::Stream odd;
+    const uint32_t marker = 0;
+    odd.packet(CP_SET_MARKER, &marker, 1);
+    odd.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    render::DrawStates none;
+    CHECK(!render::drawStates(odd.words().data(), odd.words().size(), modes, &none));
+    // state with no draw after it
+    pm4::Stream tail;
+    tail.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    const uint32_t v = 1;
+    tail.registers(REG_A6XX_RB_BLEND_CNTL, &v, 1);
+    CHECK(!render::drawStates(tail.words().data(), tail.words().size(), modes, &none));
+}
+
+// The command processor's part, on a stream mutated by hand (the flat draw in sysmem): a group for the sysmem pass
+// runs at the draw, over what the stream wrote directly; one for the tiles alone stays pending; set again to what it
+// last ran, the microcode would not run it again -- a fault here, since what the processor keeps of a run is nothing a
+// stream may lean on -- and DIRTY runs it again; a group holds register writes and loads and nothing else.
+TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
+    using namespace a6xx;
+    auto run = [](uint32_t modes, uint32_t flags, bool twice, bool wait, FakeGpu::Stats* out) {
+        Twin w;
+        std::string why;
+        auto blob = newBuffer(*w.r.gpu, 4096, &why);
+        CHECK(blob != nullptr);
+        // the group: the screen scissor at (1, 2)-(30, 31), and under WAIT a CP_WAIT_FOR_ME, which no group holds
+        pm4::Stream g;
+        const uint32_t sc[2] = {scissorXY(1, 2), scissorXY(30, 31)};
+        g.registers(regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0), sc, 2);
+        if (wait) g.waitForMe();
+        memcpy(blob->contents(), g.words().data(), 4 * g.words().size());
+        const uint32_t set[4] = {pm4::type7(CP_SET_DRAW_STATE, 3), setDrawState0(uint32_t(g.words().size()), modes | flags, 5), uint32_t(blob->gpuAddress()),
+                                 uint32_t(blob->gpuAddress() >> 32)};
+        const size_t d = w.e.find(CP_DRAW_INDX_OFFSET);
+        CHECK(d != size_t(-1));
+        std::vector<uint32_t> drawWords(w.words.begin() + d, w.words.begin() + d + 4);
+        std::vector<uint32_t> add(set, set + 4);
+        if (twice) {
+            // the draw, the group set again, the draw again
+            add.insert(add.end(), drawWords.begin(), drawWords.end());
+            add.insert(add.end(), set, set + 4);
+        }
+        w.words.insert(w.words.begin() + d, add.begin(), add.end());
+        const uint32_t before = w.r.fake->stats().faults;
+        Raw raw(w.r);
+        raw.submit(w.words);
+        *out = w.r.fake->stats();
+        return out->faults != before ? out->lastFault : std::string();
+    };
+    FakeGpu::Stats s;
+    CHECK(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, false, false, &s).empty());
+    CHECK(s.groupsRun == 1 && s.sdsWords == 3 && s.lastDraw.screenScissor[0] == 1 && s.lastDraw.screenScissor[3] == 31);
+    // for the tiles alone: pending through a sysmem draw, which keeps the scissor the stream wrote
+    CHECK(run(CP_SET_DRAW_STATE__0_GMEM, 0, false, false, &s).empty());
+    CHECK(s.groupsRun == 0 && s.lastDraw.screenScissor[0] == 0 && s.lastDraw.screenScissor[3] == 63);
+    // set twice to the same words: the second time is the fault; DIRTY: run twice
+    CHECK(has(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, true, false, &s), "set again, without DIRTY, to the address and length it last ran with"));
+    CHECK(s.groupsRun == 1);
+    CHECK(run(CP_SET_DRAW_STATE__0_SYSMEM, CP_SET_DRAW_STATE__0_DIRTY, true, false, &s).empty());
+    CHECK(s.groupsRun == 2 && s.draws == 2);
+    // a packet no group holds
+    CHECK(has(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, false, true, &s), "in a draw-state group: register writes, CP_LOAD_STATE6 and a fetch's barrier are what a group holds"));
+    // A group set by an indirect buffer -- a tiled pass's draws -- and still set at a draw of the stream itself: it would
+    // run there, the tiled pass's state over that draw's. (Every pass's head lets all groups go, encodeBegin, and a
+    // tiled pass does after its binning pass and after each tile: no stream of the driver's gets here.)
+    {
+        Twin w;
+        std::string why;
+        auto blob = newBuffer(*w.r.gpu, 4096, &why);
+        CHECK(blob != nullptr);
+        pm4::Stream g;
+        const uint32_t sc[2] = {scissorXY(1, 2), scissorXY(30, 31)};
+        g.registers(regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0), sc, 2);
+        const size_t groupWords = g.words().size();
+        const uint32_t set[4] = {pm4::type7(CP_SET_DRAW_STATE, 3),
+                                 setDrawState0(uint32_t(groupWords), CP_SET_DRAW_STATE__0_SYSMEM | CP_SET_DRAW_STATE__0_DIRTY, 5),
+                                 uint32_t(blob->gpuAddress()), uint32_t(blob->gpuAddress() >> 32)};
+        memcpy(blob->contents(), g.words().data(), 4 * groupWords);
+        memcpy(static_cast<uint8_t*>(blob->contents()) + 4 * groupWords, set, sizeof set);   // (the buffer that sets it, after its words)
+        pm4::Stream call;
+        call.indirect(blob->gpuAddress() + 4 * groupWords, 4);
+        const size_t d = w.e.find(CP_DRAW_INDX_OFFSET);
+        CHECK(d != size_t(-1));
+        w.words.insert(w.words.begin() + d, call.words().begin(), call.words().end());
+        const uint32_t before = w.r.fake->stats().faults;
+        Raw raw(w.r);
+        raw.submit(w.words);
+        const FakeGpu::Stats st = w.r.fake->stats();
+        CHECK(st.faults != before);
+        CHECK(has(st.lastFault, "a draw of the stream itself with draw-state group 5 still set by a tiled pass's draws"));
+    }
 }
