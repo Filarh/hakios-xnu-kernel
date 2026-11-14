@@ -135,6 +135,7 @@ the_fake_refuses_a_load_of_ibos_into_the_texture_block submits 1 words 142 draws
 the_fake_refuses_a_zero_ibo_descriptor submits 2 words 268 draws 0 loads 6 stream f656501605a3ede5 state 81494f49fbe365ae names 0 0000000000000000
 a_dispatch_loads_the_ubo_descriptors_an_ldc_reads_through submits 2 words 228 draws 0 loads 4 stream e5232c3cb200baa8 state 01bfc3782cab1405 names 0 0000000000000000
 a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits 1 words 1127 draws 0 loads 3 stream abcfbe21613cc005 state 32f038a0aab14085 names 4 bb062d7fae986371
+a_surface_textures_cpu_accesses_are_told_to_the_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submits 3 words 2895 draws 11 loads 22 stream 4ff66e4800bfa836 state 09bde857f6d3d994 names 13 38f44a1414b10600
 a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 3124737029797cdf state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
 a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 7ad80caa8188a98b state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6

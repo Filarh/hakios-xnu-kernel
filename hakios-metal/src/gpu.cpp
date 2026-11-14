@@ -88,7 +88,23 @@ std::unique_ptr<Bo> Gpu::surfaceBo(uint32_t surfaceId, SurfaceInfo* out, int* er
         return nullptr;
     }
     *out = SurfaceInfo{s.size, s.offset, s.rowBytes, s.width, s.height, s.pixelFormat, s.planes};
-    return std::unique_ptr<Bo>(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
+    std::unique_ptr<Bo> bo(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
+    bo->surface_ = true;
+    return bo;
+}
+
+namespace {
+// msm_drm.h's MSM_PREP_*
+constexpr uint32_t kPrepRead = 0x1, kPrepWrite = 0x2;
+constexpr int64_t kPrepPatienceNs = 2000000000;
+}  // namespace
+
+void Bo::cpuBegin(bool write) const {
+    if (surface_) (void)gpu_.cpuPrep(*this, write ? kPrepRead | kPrepWrite : kPrepRead, kPrepPatienceNs);
+}
+
+void Bo::cpuEnd() const {
+    if (surface_) gpu_.cpuFini(*this);
 }
 
 bool Gpu::sharesMemory() {
