@@ -4399,14 +4399,23 @@ TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_bef
     RenderPass pass;
     pass.color0 = t.get();
     {
-        // In sysmem a fetch is never left to the rasterizer's ordering (FLUSH_PER_OVERLAP_AND_OVERWRITE flushes at every
-        // overlap): the barrier, NO_FLUSH. In a tile it is: FLUSH_PER_OVERLAP, and the texture caches dropped before the
-        // first fetching draw of a run alone (a CACHE_INVALIDATE before the draw; none for the one after it).
+        // In sysmem the barrier stands before a fetching draw, and the rasterizer orders the draw's own primitives among
+        // themselves: FLUSH_PER_OVERLAP_AND_OVERWRITE, as both witnesses have a sysmem draw that reads its target (a
+        // fragment over one the same draw wrote reads what that one left); NO_FLUSH with the option off, and for a draw
+        // that reads nothing. In a tile: FLUSH_PER_OVERLAP, and the texture caches dropped before the first fetching
+        // draw of a run alone (a CACHE_INVALIDATE before the draw; none for the one after it).
         render::Options ord;
         ord.fbReadOrdered = true;
         Encoded o(r, fb, pass, wholeDraw(6), ord);
         CHECK(o.ok);
-        CHECK_EQ(o.reg(REG_A6XX_GRAS_SC_CNTL) & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK, 0u);
+        CHECK_EQ((o.reg(REG_A6XX_GRAS_SC_CNTL) & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK) >> A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT,
+                 uint32_t(FLUSH_PER_OVERLAP_AND_OVERWRITE));
+        CHECK_EQ(o.reg(REG_A6XX_GRAS_SC_CNTL) & 7u, 2u);   // (CCUSINGLECACHELINESIZE as ever)
+        render::Options unordered = ord;
+        unordered.fbReadOverlap = false;
+        Encoded u(r, fb, pass, wholeDraw(6), unordered);
+        CHECK(u.ok);
+        CHECK_EQ(u.reg(REG_A6XX_GRAS_SC_CNTL), grasScCntlSysmem());
         auto invalidates = [&](const pm4::Stream& st) {
             uint32_t n = 0;
             for (size_t i = 0; i + 1 < st.words().size();) {

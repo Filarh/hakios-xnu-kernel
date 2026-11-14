@@ -464,6 +464,8 @@ struct Options {
     bool fbReadOrdered = true;   // ...in GMEM the rasterizer's own ordering (GRAS_SC_CNTL.SINGLE_PRIM_MODE) instead, the barrier
                                  // kept for the first fetching draw after one that is not (fd6_draw.cc's rule); off: the
                                  // barrier before every fetching draw there too
+    bool fbReadOverlap = true;   // ...and in sysmem the rasterizer's ordering between the primitives of the fetching draw itself
+                                 // (SINGLE_PRIM_MODE FLUSH_PER_OVERLAP_AND_OVERWRITE), the barrier before it kept; off: NO_FLUSH
     bool tailDepthFlush = true;  // with a depth attachment: PC_CCU_FLUSH_DEPTH_TS writing a value + the wait for it
     bool tailLrzFlush = true;    // LRZ_FLUSH, 1 word
     bool tailCacheFlush = true;  // CACHE_FLUSH_TS + CP_WAIT_MEM_GTE, as compute's tail

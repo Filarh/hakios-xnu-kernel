@@ -1774,7 +1774,13 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
     // ordering alone showed a widget's text cut by a band and the App Library's blur in blocks.
     // (in GMEM only: in sysmem the ordering bought nothing measurable over the barrier -- SpringBoard's heaviest passes
     // took some 50 ms either way -- and the barrier is what SpringBoard was looked at with)
+    // In sysmem the barrier stands before every fetching draw, and orders it after the draws before it. Between the
+    // primitives of the draw itself it orders nothing: a fragment over one the same draw wrote (the overlapping
+    // triangles of a path) has to read what that one left, as Metal's programmable blending does, and that is the
+    // rasterizer's to keep -- SINGLE_PRIM_MODE FLUSH_PER_OVERLAP_AND_OVERWRITE, what both witnesses give a sysmem draw
+    // that reads its target (fd6_emit.cc:564-570, tu_pipeline.cc:3373-3376).
     const bool ordered = fs.fbRead && o.fbReadOrdered && gmem != nullptr;
+    const bool overlaps = fs.fbRead && o.fbReadOverlap && gmem == nullptr;
     const bool barrier = (g & kGBarrier) && fs.fbRead && o.fbReadBarrier && (!ordered || !afterFetch);
     if (barrier && gmem != nullptr) {
         stream.waitForIdle();
@@ -2170,7 +2176,9 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
         // fragment over one not yet written and flushes between them (turnip's rasterization_order_attachment_access,
         // tu_pipeline.cc:3351-3380 and 3955-3983: FLUSH_PER_OVERLAP_AND_OVERWRITE in sysmem, FLUSH_PER_OVERLAP in GMEM)
         reg(stream, REG_A6XX_GRAS_SC_CNTL,
-            ordered ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP) : grasScCntlSysmem());
+            ordered    ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP)
+            : overlaps ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP_AND_OVERWRITE)
+                       : grasScCntlSysmem());
         // primitive restart on for an indexed draw (Metal restarts at the all-ones index; tu6_draw_common's primitive_restart,
         // :5851-5862, which is off for a draw without indices, where the index register would be stale)
         reg(stream, REG_A6XX_PC_PRIMITIVE_CNTL_0, draw.indexBuffer != nullptr ? A6XX_PC_PRIMITIVE_CNTL_0_PRIMITIVE_RESTART : 0u);
@@ -4071,7 +4079,8 @@ void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, cons
     keptOf(Cursor::kLink, ps.link);
     {
         const bool ordered = ps.fbRead && o.fbReadOrdered && gmem != nullptr;
-        const uint32_t in = draw.cullMode | draw.winding << 2 | (ordered ? 8u : 0u) | (draw.indexBuffer != nullptr ? 16u : 0u);
+        const bool overlaps = ps.fbRead && o.fbReadOverlap && gmem == nullptr;
+        const uint32_t in = draw.cullMode | draw.winding << 2 | (ordered ? 8u : 0u) | (draw.indexBuffer != nullptr ? 16u : 0u) | (overlaps ? 32u : 0u);
         if (!cur.rastSet || cur.rast != in) {
             pending |= kGRast;
             cur.rast = in;
@@ -4566,6 +4575,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     const bool afterFetch = joins && open_->lastFetched;
     render::Options encodeOptions = options;
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
+    if (gmemOff_ & kSysmemFetchUnordered) encodeOptions.fbReadOverlap = false;
     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
     if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
     render::Options sysOptions = encodeOptions;   // (recorded both ways: the sysmem side's)
