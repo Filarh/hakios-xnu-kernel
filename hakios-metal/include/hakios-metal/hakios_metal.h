@@ -501,6 +501,9 @@ int hakios_metal_cb_draw_place(hakios_metal_cb *cb, unsigned i, unsigned *pass, 
 void hakios_metal_cb_gmem_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *tiles);
 /* pass I's colour attachments as a mask, and those its draws wrote or read (a GMEM pass's; 0 for a sysmem one): -1 past the passes */
 int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *attached, unsigned *touched);
+/* ...and of a tiled pass, apart: the attachments its draws' fragment stages have an output for (WROTE) and those a draw
+ * reads through framebuffer fetch (READ), as masks; -1 past the profiled passes */
+int hakios_metal_cb_pass_access(hakios_metal_cb *cb, unsigned i, unsigned *wrote, unsigned *read);
 int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);
 /* why CB's last pass refused for GMEM was refused ("" when none was); valid while CB lives */
 const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);

@@ -978,6 +978,15 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned* 
     return 0;
 }
 
+int hakios_metal_cb_pass_access(hakios_metal_cb* cb, unsigned i, unsigned* wrote, unsigned* read) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    if (i >= t.size()) return -1;
+    *wrote = t[i].wrote;
+    *read = t[i].read;
+    return 0;
+}
+
 int hakios_metal_cb_pass_tiles(hakios_metal_cb* cb, unsigned i) {
     syncOne(cb);
     const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
