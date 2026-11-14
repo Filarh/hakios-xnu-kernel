@@ -347,6 +347,9 @@ private:
         // one the pass's draws call for, now that they are known
         bool dual = false;
         pm4::Stream sysStream, headGmem;
+        // (recorded both ways until its draws left no doubt that it is tiled -- render::gmemWorth's answer could no
+        // longer come out sysmem whatever the draws still to come -- and for tiles alone from then on: draw())
+        bool tiledEarly = false;
         uint32_t clears = 0;        // the attachments a GMEM pass clears in its tiles (render::gmemClearWords), and their words
         uint32_t clearWords[kMaxColorOutputs][4] = {};
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind

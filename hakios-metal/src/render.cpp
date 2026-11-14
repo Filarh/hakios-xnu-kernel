@@ -4835,6 +4835,40 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         open_->cache->cur[1].forget();
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
+    // A pass recorded both ways is recorded for tiles alone from the draw at which closePass's choice can no longer
+    // come out sysmem: the choice is render::gmemWorth's over what the pass holds, and what it holds only grows --
+    // its draws, the attachments they touch, whether one reads its target -- while what a pass loads and stores is
+    // never more than every attachment it has. CoreAnimation's main pass is a hundred draws and more, tiled every
+    // frame, and each of them was written a second time for a sysmem pass that never ran. (What is on the stream is
+    // what closePass would have put there: the tiles' head now, the tiles when it closes.)
+    if (open_->dual) {
+        bool certain = false;
+        if (gmemOff_ & kGmemByDrawsAlone) {
+            certain = open_->draws >= gmemMinDraws_;
+        } else if (open_->draws >= std::min(gmemMinDraws_, render::kGmemFewDraws)) {
+            if (open_->read != 0) {
+                certain = true;   // (a draw reads its target: tiles)
+            } else {
+                uint64_t touched = 0, all = 0;
+                for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                    const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+                    if (t == nullptr) continue;
+                    const uint32_t bytes = t->info().bytesPerPixel;
+                    all += bytes;
+                    if ((gmemOff_ & kGmemEveryAttachment) || (((open_->written | open_->read | open_->clears) >> i) & 1)) touched += bytes;
+                }
+                // (gmemWorth: tiles when draws * 22 touched >= bar * (11 (loaded + stored) - 10 cleared), and that is at
+                // most bar * 22 * every attachment's bytes)
+                certain = touched != 0 && uint64_t(open_->draws) * touched >= uint64_t(gmemMinDraws_) * all;
+            }
+        }
+        if (certain) {
+            appendStream(stream_, open_->headGmem);
+            open_->sysStream.clear();
+            open_->dual = false;
+            open_->tiledEarly = true;
+        }
+    }
     counts_.draws++;
     if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing
@@ -5111,6 +5145,10 @@ void CommandBuffer::closePass() {
             if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().sysmemWhy = why;
         }
         open_->dual = false;
+    } else if (open_->tiledEarly && !(gmemOff_ & kGmemByDrawsAlone)) {
+        // (tiled for what it holds, decided while it was being recorded: noted as above)
+        noted = std::max(noted, gmemMinDraws_);
+        belowBar = open_->draws < gmemMinDraws_;
     }
     if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted);
     if (open_->gmem && open_->bodies.size() != 0) {
