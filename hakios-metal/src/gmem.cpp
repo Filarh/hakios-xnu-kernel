@@ -130,11 +130,14 @@ void DrawStates::place(uint64_t blobsAddress) {
     relocs.clear();
 }
 
-bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* out, uint8_t twin) {
+bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* out, uint8_t twin, uint32_t fetch) {
     DrawStates s;
     Group groups[kDsGroups];
-    std::vector<uint32_t> fragment;
+    std::vector<uint32_t> fragment, barrier;   // (BARRIER: the draw's barrier packets, as recorded)
     bool copies = false, pending = false;   // a copy went to the prologue; state or a barrier waits for its draw
+    bool armed = false;                     // the barrier's group is set and not yet let go
+    uint32_t barrierAt = 0, barrierWords = 0;   // the barrier's fragment (one for the pass: they are all alike)
+    const uint32_t ordered = A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP);
     for (size_t i = 0; i < words;) {
         const pm4::Header h = pm4::decode(body[i]);
         if (h.kind == pm4::Header::kBad || h.count > words - i - 1) return false;
@@ -146,6 +149,8 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* 
                     // a command, not a value: it leads the program's fragment and is never one of the registers kept
                     groups[kDsProgram].invalidates = true;
                     groups[kDsProgram].invalidate = p[k];
+                } else if (h.reg + k == REG_A6XX_GRAS_SC_CNTL && fetch == kDsFetchOrdered) {
+                    groups[kDsRaster].write(h.reg + k, ordered);   // (every draw in raster order, fetching or not)
                 } else {
                     groups[groupOf(h.reg + k)].write(h.reg + k, p[k]);
                 }
@@ -168,13 +173,41 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* 
             // (the waits for a copy, which the prologue ends with once; appendDeduped's marker)
             if (h.count != 0 && h.opcode != pm4::kNop) return false;
         } else if (h.opcode == pm4::kWaitForIdle || (h.opcode == CP_EVENT_WRITE && h.count == 1)) {
-            // a draw's barrier (a framebuffer fetch's): in the stream itself, before the draw's groups are set
-            s.list.insert(s.list.end(), body + i, body + next);
+            // a draw's barrier (a framebuffer fetch's): a group of its own, in the stream itself, or left out (gmem.hpp)
+            if (h.opcode == CP_EVENT_WRITE && (p[0] & CP_EVENT_WRITE_0_EVENT__MASK) != CACHE_INVALIDATE) return false;
+            if (fetch == kDsFetchInline) s.list.insert(s.list.end(), body + i, body + next);
+            if (fetch == kDsFetchGroup) barrier.insert(barrier.end(), body + i, body + next);
             pending = true;
         } else if (h.opcode == CP_DRAW_INDX_OFFSET || h.opcode == CP_DRAW_INDIRECT_MULTI) {
             // the draw: a fragment for each group that is no longer what its last fragment holds, then the groups set
             uint32_t sent[kDsGroups], count = 0;
-            for (uint32_t g = 0; g < kDsGroups; g++) {
+            // The barrier's group: set by a draw recorded with a barrier, let go by the first draw after it that the
+            // rasterizer is not ordering (GRAS_SC_CNTL without a primitive mode: a draw that does not fetch, which
+            // ends the run of fetching draws the barrier was for). 1: set, 2: let go.
+            uint32_t barrierDoes = 0;
+            {
+                uint32_t scCntl = 0;
+                for (const auto& [r, v] : groups[kDsRaster].regs) {
+                    if (r == REG_A6XX_GRAS_SC_CNTL) scCntl = v;
+                }
+                const bool inOrder = (scCntl & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK) != 0;
+                if (!barrier.empty()) {
+                    if (barrierWords != barrier.size() || memcmp(&s.blobs[barrierAt], barrier.data(), 4 * barrier.size()) != 0) {
+                        barrierAt = uint32_t(s.blobs.size());
+                        barrierWords = uint32_t(barrier.size());
+                        s.blobs.insert(s.blobs.end(), barrier.begin(), barrier.end());
+                        s.fragments++;
+                    }
+                    barrierDoes = 1;
+                    armed = true;
+                    s.barriers++;
+                    barrier.clear();
+                } else if (armed && (!inOrder || twin == 7)) {   // (twin 7: let go at the very next draw, a fetching one too)
+                    barrierDoes = 2;
+                    armed = false;
+                }
+            }
+            for (uint32_t g = kDsPass; g < kDsGroups; g++) {
                 Group& G = groups[g];
                 const bool differs = !G.set || G.changed || G.loads != G.loadsBefore || G.invalidates != G.invalidatesBefore ||
                                      (G.invalidates && G.invalidate != G.invalidateBefore);
@@ -210,8 +243,22 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* 
                 sent[count++] = kDsLoads;
                 std::sort(sent, sent + count);
             }
-            if (count != 0) {
-                s.list.push_back(pm4::type7(CP_SET_DRAW_STATE, 3 * count));
+            if (count != 0 || barrierDoes != 0) {
+                s.list.push_back(pm4::type7(CP_SET_DRAW_STATE, 3 * (count + (barrierDoes != 0 ? 1 : 0))));
+                if (barrierDoes == 1) {
+                    // (DIRTY: every barrier is the same words at the same place, which would not run twice otherwise; for
+                    // the tiles alone: a binning pass runs no fragment stage)
+                    s.list.push_back(setDrawState0(barrierWords, CP_SET_DRAW_STATE__0_GMEM | CP_SET_DRAW_STATE__0_DIRTY, kDsBarrier));
+                    s.relocs.push_back(uint32_t(s.list.size()));
+                    s.list.push_back(4 * barrierAt);
+                    s.list.push_back(0);
+                    s.entries++;
+                } else if (barrierDoes == 2) {
+                    s.list.push_back(setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE, kDsBarrier));
+                    s.list.push_back(0);
+                    s.list.push_back(0);
+                    s.entries++;
+                }
                 for (uint32_t k = 0; k < count; k++) {
                     const Group& G = groups[sent[k]];
                     const uint32_t dirty = sent[k] == kDsLoads && twin != 2 ? CP_SET_DRAW_STATE__0_DIRTY : 0u;

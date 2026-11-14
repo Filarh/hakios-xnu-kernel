@@ -367,6 +367,13 @@ private:
     };
     Group groups_[32];
     bool inGroup_ = false;          // a group's words are being run
+    // A framebuffer fetch in a tile reads the bin through the texture caches. What they hold of it is stale once a
+    // tile begins (the tile before's, at the same GMEM addresses) and once a draw has run that the rasterizer was not
+    // ordering (GRAS_SC_CNTL.SINGLE_PRIM_MODE NO_FLUSH: its writes are nothing a later ordered draw is held back
+    // for); a CACHE_INVALIDATE right after a CP_WAIT_FOR_IDLE makes them good. A draw that reads a bin while they are
+    // stale reads what was there before -- on the phone a widget's text cut by a band, a blur in blocks (render.cpp:
+    // encodeDraw's note) -- and is a fault here.
+    bool gmemCachesStale_ = false, drawReadsGmem_ = false;
     bool logDraws_ = false, logState_ = false;
     // (the registers the binning pass's draws wrote, in the order each was first written, and how many of them had
     // been by each of its draws: what the digest of a tile's draw leaves out, above)

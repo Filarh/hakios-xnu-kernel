@@ -6246,6 +6246,60 @@ TEST(a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned) {
     CHECK(x * y > 32);
 }
 
+// A framebuffer fetch's barrier as a draw-state group. The pass: a draw that does not fetch over the left half; a
+// fetching draw over the right half, recorded with the barrier (the first to fetch after one that does not); a second
+// fetching draw over the left half, recorded without one (the rasterizer orders it after the first); a draw that does
+// not fetch. A tile of the left half draws the first and the third and not the second: the barrier, pending since the
+// second set it, runs there before the third, which the fake holds it to (the texture caches are stale after a draw
+// the rasterizer was not ordering). Let go at the very next draw (the twin), the third reads stale caches. And a tile
+// draws no barrier it has no fetch for: fewer waits than with the barrier in the stream, which every tile runs.
+TEST(a_fetchs_barrier_runs_where_a_tile_draws_the_fetch) {
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    struct Result { bool completed; FakeGpu::Stats stats; };
+    auto run = [&](uint32_t gmemOff, uint8_t twin) {
+        Rig r;
+        auto t = target(r, 1125, 600, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        fillCoords(*t);
+        RenderPass a;
+        a.color0 = t.get();
+        render::Options o;
+        o.gmemBinning = true;
+        o.gmemTwin = twin;
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(gmemOff);
+        auto draw = [&](const Program& p, double x, double w) {
+            Draw d = wholeDraw(3);
+            d.viewport = Viewport{x, 0, w, 600, 0, 1};
+            CHECK(cb->draw(p, a, d, Bindings{}, Bindings{}, o));
+        };
+        draw(flatProgram(), 0, 500);
+        draw(fb, 600, 500);
+        draw(fb, 0, 500);
+        draw(flatProgram(), 0, 1125);
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (cb->status() == CommandBuffer::kCompleted) CHECK_EQ(coordsWrong(*t), 0u);
+        return Result{cb->status() == CommandBuffer::kCompleted, r.fake->stats()};
+    };
+    const Result group = run(0, 0), inlined = run(CommandBuffer::kGmemInlineBarriers, 0), ordered = run(CommandBuffer::kGmemAllOrdered, 0),
+                 plain = run(CommandBuffer::kGmemPlainBody, 0), twin = run(0, 7);
+    CHECK(group.completed && inlined.completed && ordered.completed && plain.completed);
+    CHECK(group.stats.faults == 0 && inlined.stats.faults == 0 && ordered.stats.faults == 0 && plain.stats.faults == 0);
+    if (group.stats.faults) std::printf("       %s\n", group.stats.lastFault.c_str());
+    if (ordered.stats.faults) std::printf("       %s\n", ordered.stats.lastFault.c_str());
+    CHECK(group.stats.tiles == inlined.stats.tiles && group.stats.draws == inlined.stats.draws);
+    // the group's barrier ran once in each tile that drew a fetch (two waits), and each tile has its closing wait
+    CHECK(group.stats.groupRuns[render::kDsBarrier] != 0 && group.stats.groupRuns[render::kDsBarrier] <= group.stats.tiles);
+    CHECK_EQ(group.stats.cpWaits - 2 * group.stats.groupRuns[render::kDsBarrier], ordered.stats.cpWaits - ordered.stats.tiles);
+    CHECK(group.stats.cpWaits < inlined.stats.cpWaits && inlined.stats.cpWaits <= plain.stats.cpWaits);
+    CHECK_EQ(inlined.stats.groupRuns[render::kDsBarrier], 0u);
+    CHECK_EQ(ordered.stats.groupRuns[render::kDsBarrier], 0u);
+    std::printf("       %u tiles: waits for idle with the barrier a group %u, in the stream %u, the plain stream %u, every draw ordered %u\n", group.stats.tiles,
+                group.stats.cpWaits, inlined.stats.cpWaits, plain.stats.cpWaits, ordered.stats.cpWaits);
+    CHECK(!twin.completed);
+    CHECK(twin.stats.lastFault.find("reads its target's bin through texture caches that are stale") != std::string::npos);
+}
+
 // drawStates on streams written by hand: a fragment holds every register of its group as it stands at the draw, not
 // the draw's own writes alone; a group no draw changes is not set again; a copy goes to the prologue with one wait for
 // all; a packet that is none of a draw's sends the pass back to its plain stream.
@@ -6295,6 +6349,40 @@ TEST(draw_states_keep_each_groups_registers_whole) {
     // placed: the entries' addresses are the fragments'
     s.place(0x100002000ull);
     CHECK(l.size() == 23 && l[2] == 0x00002000u && l[3] == 1u);
+    // a barrier before a draw in raster order, another such draw, one that is not: [set barrier, raster][draw][draw][let the
+    // barrier go, raster][draw] -- or the barrier's three packets in the list itself, or none and every draw in order
+    {
+        pm4::Stream f;
+        const uint32_t inOrder = A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP), plainOrder = grasScCntlSysmem();
+        const uint32_t invalidate = eventWrite0(CACHE_INVALIDATE, false);
+        f.waitForIdle();
+        f.packet(CP_EVENT_WRITE, &invalidate, 1);
+        f.waitForIdle();
+        f.registers(REG_A6XX_GRAS_SC_CNTL, &inOrder, 1);
+        f.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+        f.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+        f.registers(REG_A6XX_GRAS_SC_CNTL, &plainOrder, 1);
+        f.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+        render::DrawStates g;
+        CHECK(render::drawStates(f.words().data(), f.words().size(), modes, &g));
+        CHECK(g.draws == 3 && g.barriers == 1 && g.entries == 4);
+        const std::vector<uint32_t>& fl = g.list;
+        CHECK_EQ(fl.size(), size_t(7 + 4 + 4 + 7 + 4));
+        if (fl.size() == 26) {
+            CHECK_EQ(fl[1], setDrawState0(4, CP_SET_DRAW_STATE__0_GMEM | CP_SET_DRAW_STATE__0_DIRTY, render::kDsBarrier));
+            CHECK(fl[2] / 4 + 4 <= g.blobs.size() && pm4::decode(g.blobs[fl[2] / 4]).opcode == pm4::kWaitForIdle);
+            CHECK_EQ(fl[4], setDrawState0(2, modes, render::kDsRaster));
+            CHECK(pm4::decode(fl[7]).opcode == CP_DRAW_INDX_OFFSET && pm4::decode(fl[11]).opcode == CP_DRAW_INDX_OFFSET);
+            CHECK_EQ(fl[16], setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE, render::kDsBarrier));
+            CHECK(fl[17] == 0 && fl[18] == 0);
+        }
+        render::DrawStates in, ord;
+        CHECK(render::drawStates(f.words().data(), f.words().size(), modes, &in, 0, render::kDsFetchInline));
+        CHECK(in.barriers == 0 && in.list.size() == size_t(4 + 4 + 4 + 4 + 4 + 4) && pm4::decode(in.list[0]).opcode == pm4::kWaitForIdle);
+        CHECK(render::drawStates(f.words().data(), f.words().size(), modes, &ord, 0, render::kDsFetchOrdered));
+        // (one raster fragment for all three draws: GRAS_SC_CNTL in order throughout, no barrier anywhere)
+        CHECK(ord.barriers == 0 && ord.fragments == 1 && ord.list.size() == size_t(4 + 4 + 4 + 4) && ord.blobs.size() == 2 && ord.blobs[1] == inOrder);
+    }
     // a packet no draw is made of: not moved, the pass keeps its plain stream
     pm4::Stream odd;
     const uint32_t marker = 0;
@@ -6320,11 +6408,11 @@ TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
         std::string why;
         auto blob = newBuffer(*w.r.gpu, 4096, &why);
         CHECK(blob != nullptr);
-        // the group: the screen scissor at (1, 2)-(30, 31), and under WAIT a CP_WAIT_FOR_IDLE no group holds
+        // the group: the screen scissor at (1, 2)-(30, 31), and under WAIT a CP_WAIT_FOR_ME, which no group holds
         pm4::Stream g;
         const uint32_t sc[2] = {scissorXY(1, 2), scissorXY(30, 31)};
         g.registers(regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0), sc, 2);
-        if (wait) g.waitForIdle();
+        if (wait) g.waitForMe();
         memcpy(blob->contents(), g.words().data(), 4 * g.words().size());
         const uint32_t set[4] = {pm4::type7(CP_SET_DRAW_STATE, 3), setDrawState0(uint32_t(g.words().size()), modes | flags, 5), uint32_t(blob->gpuAddress()),
                                  uint32_t(blob->gpuAddress() >> 32)};
@@ -6355,6 +6443,6 @@ TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
     CHECK(s.groupsRun == 1 && s.draws == 2);
     CHECK(run(CP_SET_DRAW_STATE__0_SYSMEM, CP_SET_DRAW_STATE__0_DIRTY, true, false, &s).empty());
     CHECK(s.groupsRun == 2 && s.draws == 2);
-    // a wait in a group
-    CHECK(has(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, false, true, &s), "in a draw-state group: register writes and CP_LOAD_STATE6 are what a group holds"));
+    // a packet no group holds
+    CHECK(has(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, false, true, &s), "in a draw-state group: register writes, CP_LOAD_STATE6 and a fetch's barrier are what a group holds"));
 }
