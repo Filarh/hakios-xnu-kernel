@@ -78,6 +78,8 @@ public:
     uint32_t* open(uint32_t opcode, uint32_t count);
     // room for WORDS more, taken at once (a command buffer's stream grows to what the last one's was)
     void reserve(size_t words) { words_.reserve(words_.size() + words); }
+    // whole packets already encoded (a program's loads, kept from the last draw with it), as they are
+    void append(const uint32_t* words, size_t count) { words_.insert(words_.end(), words, words + count); }
 
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }

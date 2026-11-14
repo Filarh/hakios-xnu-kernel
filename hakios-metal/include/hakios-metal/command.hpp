@@ -34,6 +34,14 @@ namespace hakios::metal {
 
 class CommandQueue;
 class Texture;
+namespace render {
+// (render.cpp, the draw path: what a queue keeps of the programs drawn with it, what a command buffer has at hand of
+// that, and what an open pass's stream last held)
+struct StateCache;
+struct DrawCache;
+struct PassCache;
+struct ProgramState;
+}  // namespace render
 
 // a buffer a program sees: a GEM object with its length (MTLBuffer's -length may be less than the object's size)
 class Buffer {
@@ -111,9 +119,20 @@ public:
     // a blit the caller could not record (a buffer not in the GPU's memory, say): the buffer ends in the error state
     void refuse(const std::string& why) { fail(why); }
     // a buffer it uses, kept alive until it completes (the owner may let go of it before that)
-    void keep(std::shared_ptr<const Buffer> b) { kept_.push_back(std::move(b)); }
+    // (by reference, and once: a draw names the same few buffers and textures as the draw before it, and a copy of the
+    // pointer for each -- two atomic counts and a slot of a growing vector -- was most of what keeping them cost. One
+    // kept a moment ago is found in RECENT and left alone; one pushed out of it is kept twice, which costs a slot.)
+    void keep(const std::shared_ptr<const Buffer>& b) {
+        if (b != nullptr && !recently(b.get())) kept_.push_back(b);
+    }
+    void keep(const std::shared_ptr<Buffer>& b) {
+        if (b != nullptr && !recently(b.get())) kept_.push_back(b);
+    }
     // anything else it uses (a compiled kernel's words), the same way
-    void keepAlive(std::shared_ptr<const void> p) { keptAny_.push_back(std::move(p)); }
+    template <class T>
+    void keepAlive(const std::shared_ptr<T>& p) {
+        if (p != nullptr && !recently(p.get())) keptAny_.push_back(p);
+    }
     // OTHER's recorded work after this one's, as if it had been recorded here: its packets, what it names and what it
     // keeps alive -- a parallel render encoder's sub-encoders each record into a command buffer of their own, from any
     // thread in any order, and are appended in the order they were made. OTHER is left empty and is not committed; an
@@ -133,7 +152,12 @@ public:
     // What the buffer holds, counted as it is recorded: passes opened (each a pass start, its flushes and the wait for
     // idle at its tail, which is a fixed cost whatever is drawn), the draws in them, and dispatches, copies and clears
     // (each a pass of its own). What a frame's GPU time goes to is read off these beside the time (metal_fps).
-    struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0; };   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+    struct Counts {
+        uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0;   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+        // ...of the draws, those encoded from what the queue keeps of their program (render.cpp: ProgramState) rather than
+        // judged and written whole: all but the first with each program in each kind of pass, when all is well
+        uint32_t keptDraws = 0;
+    };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
     // of each pass and after its tail -- whose wait for idle makes the end the end -- for the first kMaxProfiled passes:
@@ -173,6 +197,13 @@ public:
     const std::string& gmemRefusal() const { return gmemWhy_; }
     // the words recorded so far (what the command processor will read)
     size_t streamWords() const { return stream_.words().size(); }
+    // (for the tests) every draw taken from a program's kept state checked against the same draw encoded in full: a
+    // difference in a word of the stream or a byte of the draw's table ends the buffer in error, saying which
+    static void verifyDraws(bool on);
+    // a program's kept state not used: every draw judged and written whole, as the first with its program is. The
+    // stream is the same either way (the tests record it both ways); a bisect's switch. On by default; what it was is
+    // returned.
+    static bool keepStates(bool on);
     std::vector<PassTime> passTimes() const;
     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
     const char* passSysmemWhy(size_t i) const { return i < profiled_.size() ? profiled_[i].sysmemWhy.c_str() : ""; }
@@ -213,7 +244,23 @@ private:
                      const uint32_t* immediates, const compute::Options& options);
     // the end of it, however it ends: the status, the handlers (which see that status), and only then the waiters
     void finish(Status s);
-    void use(const Buffer& b, bool write) { uses_.push_back(BoUse{&b.bo(), write}); }
+    // (once for reading and once for writing: the submission names each buffer once whatever the draws, and the list was
+    // as long as the frame's draws times their bindings, gone through again for every one of them at the commit)
+    void use(const Buffer& b, bool write) {
+        const Bo* bo = &b.bo();
+        const void* key = reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(bo) | (write ? 1u : 0u));
+        if (!recently(key)) uses_.push_back(BoUse{bo, write});
+    }
+    // whether P was asked about a moment ago (and it is, from now on): a small table by address, one entry a slot
+    bool recently(const void* p) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+        const void*& slot = recent_[((a >> 4) ^ (a >> 12)) & (kRecent - 1)];
+        if (slot == p) return true;
+        slot = p;
+        return false;
+    }
+    static constexpr size_t kRecent = 256;
+    const void* recent_[kRecent] = {};
 public:
     // What each register written in a pass holds, for appendDeduped: a draw writes some 500 of them and almost all
     // hold their value already, so each is looked up once, in an open-addressed table of its own (std::unordered_map's
@@ -286,6 +333,8 @@ private:
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
+        // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
+        std::shared_ptr<render::PassCache> cache;
     };
     void closePass();
     void useAttachments(const RenderPass& pass);
@@ -315,6 +364,9 @@ private:
     // the GPU address of K's words in this buffer, uploading them when they are not there; 0 with *WHY when out of memory
     uint64_t programAddress(const Kernel& k, std::string* why);
     std::unordered_multimap<const uint32_t*, Uploaded> uploaded_;
+    // the programs this buffer has drawn with and its scratch for a draw (render.cpp: DrawCache), made at the first draw
+    std::shared_ptr<render::DrawCache> drawCache_;
+    std::shared_ptr<Texture> null_;   // the queue's null texture, asked for once a buffer rather than once a draw
 
     CommandQueue& queue_;
     std::atomic<Status> status_{kNotEnqueued};
@@ -391,6 +443,9 @@ public:
     // only now and then (CoreAnimation's: light frames between the heavy ones of an animation) counts as heavy
     uint32_t peakDraws(uint64_t kind, uint32_t ordinal);
     void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws);
+    // what the queue keeps of the programs drawn with it, from one command buffer to the next (render.cpp: StateCache;
+    // under its own lock)
+    render::StateCache& states();
 
 
 private:
@@ -421,6 +476,7 @@ private:
     std::unordered_map<uint64_t, uint32_t> lastDraws_;   // (under lock_) noteDraws', by kind and ordinal
     struct Peak { uint32_t draws = 0, below = 0; };
     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
+    std::shared_ptr<render::StateCache> states_;   // (made by states() at the first ask, under lock_)
     std::condition_variable changed_;
     std::deque<std::shared_ptr<CommandBuffer>> inFlight_;
     std::vector<std::unique_ptr<Bo>> idle_;
