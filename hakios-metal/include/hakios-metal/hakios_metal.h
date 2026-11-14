@@ -74,6 +74,15 @@ void hakios_metal_close(hakios_metal_device *device);
 uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);
+/* Nothing compiled in use (compiler.hpp: warmUp): every recipe of the cache directory (HAKIOS_METAL_CACHE) and its
+ * seeds whose stage or kernel this build has not filed yet, compiled now, in the calling thread. A recipe is kept for
+ * every stage and kernel the driver compiles or finds; what it filed under another build's key is compiled again. */
+typedef struct hakios_metal_warmup_report {
+	unsigned recipes, cached, compiled, failed;
+	double milliseconds, compile_milliseconds;
+	char first_failure[256];
+} hakios_metal_warmup_report;
+void hakios_metal_warmup(hakios_metal_warmup_report *report);
 
 hakios_metal_buffer *hakios_metal_buffer_new(hakios_metal_device *device, uint64_t length);
 void hakios_metal_buffer_free(hakios_metal_buffer *buffer);
