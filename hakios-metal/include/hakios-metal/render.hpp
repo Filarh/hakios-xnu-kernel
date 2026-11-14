@@ -484,7 +484,8 @@ struct Options {
                                  // 5 the bins from the render area's corner instead of the window's origin, 6 an attachment no
                                  // draw touched left with the RB_MRT_BASE_GMEM its draws were recorded with when the bins grow
                                  // over it (gmemTouched), 7 a fetch's barrier let go at the next draw though that one fetches
-                                 // too; 0 the stream as it is meant)
+                                 // too, 8 no group DIRTY but the loads' (each left to the command processor's memory of
+                                 // what it last ran); 0 the stream as it is meant)
     uint8_t rotate2d = 0;        // encodeBlit's RB_2D_BLIT_CNTL.ROTATE (a6xx_rotation: 0, 90, 180, 270, hflip, vflip as 0..5);
                                  // a quarter turn takes a destination rectangle of the source's sides swapped
 };

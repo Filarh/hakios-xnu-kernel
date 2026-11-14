@@ -19,6 +19,15 @@
 // draw touches writes a fragment with ALL of the group's registers as they stand at that draw (not only the ones the
 // draw changed) followed by the draw's loads of that group. Which register goes into which group decides only how much
 // is run again when something changes: any split is correct, because every fragment is whole.
+//
+// Every group is set DIRTY. The command processor does not run again a group set to the address and length it last
+// ran with -- the microcode's compare, against what its hardware kept of that run -- and whether a disable, a reset
+// or another context's work clears what it kept is the hardware's part, which no source here shows. A pass's
+// fragments lie in memory the command buffers take turns with, so the next frame's fragment for a group is often at
+// the address the last frame's was, with other words in it or with the registers written over since by the passes
+// drawn from the stream itself. DIRTY makes the group run whatever the processor remembers: the draws here set a
+// group only when its fragment changed, so nothing runs twice for it (turnip sets it on the states a PROGRAM_CONFIG
+// invalidates, tu_cmd_buffer.cc:1275-1313: the same bit, there for the same kind of reason).
 #pragma once
 
 #include <cstdint>

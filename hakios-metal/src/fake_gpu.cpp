@@ -1973,6 +1973,15 @@ void FakeGpu::invalidate(uint32_t bits) {
 int FakeGpu::drawRuns(uint32_t word0, int depth) {
     using namespace a6xx;
     drawOrdinal_++;
+    // A draw of the stream itself (no indirect buffer: a sysmem pass's, a fill's) with a group still set that a draws'
+    // buffer set would run that group's words first -- a tiled pass's state over its own. Such groups are their
+    // pass's, let go after the binning pass and after each tile.
+    for (uint32_t id = 0; depth == 0 && id < 32; id++) {
+        if (groups_[id].enabled && groups_[id].fromBuffer) {
+            fault(text("a draw of the stream itself with draw-state group %llu still set by a tiled pass's draws: it would run before the draw", id));
+            return -1;
+        }
+    }
     const bool useVisibility = fieldOf(word0, CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK, CP_DRAW_INDX_OFFSET_0_VIS_CULL__SHIFT) == USE_VISIBILITY;
     if (visOverride_ || !useVisibility || !inTile_ || !binned_) return 1;
     if (!tileStreams_) {
@@ -2000,7 +2009,7 @@ int FakeGpu::drawRuns(uint32_t word0, int depth) {
 // CP_SET_DRAW_STATE: three words a group. The disable-all form both batch starts send (fd6_emit_restore;
 // tu_disable_draw_states) and fd6 sends after the binning pass and after each tile's draws; a group disabled; or a group
 // set to WORDS words at an address, for the modes its three bits name, DIRTY making it run even where it last ran.
-bool FakeGpu::setDrawState(const uint32_t* p, uint32_t count) {
+bool FakeGpu::setDrawState(const uint32_t* p, uint32_t count, int depth) {
     using namespace a6xx;
     if (count == 0 || count % 3 != 0) {
         fault(text("CP_SET_DRAW_STATE of %llu words: three a group", count));
@@ -2034,6 +2043,7 @@ bool FakeGpu::setDrawState(const uint32_t* p, uint32_t count) {
             return false;
         }
         g.enabled = g.pending = true;
+        g.fromBuffer = depth > 0;
         g.forced = (w0 & CP_SET_DRAW_STATE__0_DIRTY) != 0;
         g.address = address;
         g.words = words;
@@ -2044,9 +2054,10 @@ bool FakeGpu::setDrawState(const uint32_t* p, uint32_t count) {
 }
 
 // The pending groups of the mode in force, from the lowest id up, each as a stream of its own a level down. One of
-// another mode stays pending. One set to the address and length it last ran with does not run again unless DIRTY said
-// so: the microcode's compare is with what the group last RAN, not with what it was last set to. (The same address
-// with another length runs the words added, or all of them when fewer: no driver here means either, so it is a fault.)
+// another mode stays pending. One set to the address and length it last ran with would not run again unless DIRTY
+// said so: the microcode's compare is with what the group last RAN, not with what it was last set to -- and is a
+// fault here, below. (The same address with another length runs the words added, or all of them when fewer: no
+// driver here means either, so it is a fault too.)
 bool FakeGpu::runGroups() {
     // (once groups have been looked at, "at once" is what CP_SET_MODE last said, whatever the override did to it)
     sdsImmediate_ = sdsMode_;
@@ -2054,7 +2065,15 @@ bool FakeGpu::runGroups() {
         Group& g = groups_[id];
         if (!g.enabled || !g.pending || (g.modes & cpMode_) == 0) continue;
         g.pending = false;
-        if (!g.forced && g.address == g.ranAddress && g.words == g.ranWords) continue;
+        if (!g.forced && g.address == g.ranAddress && g.words == g.ranWords) {
+            // The microcode would not run it. What it compares with is what the hardware kept of the group's last run,
+            // and whether a disable, a reset or another context in between cleared that is not the microcode's to show;
+            // the words there may be another frame's by now (a command buffer's memory is taken again), the registers
+            // whatever the stream wrote since. No stream here may lean on it: its groups are DIRTY (gmem.hpp).
+            fault(text("draw-state group %llu set again, without DIRTY, to the address and length it last ran with: ", id) +
+                  "whether it runs is what the command processor remembers of that run");
+            return false;
+        }
         if (!g.forced && g.address == g.ranAddress) {
             fault(text("draw-state group %llu set to the address it last ran from with another length: ", id) + "the microcode would run the difference");
             return false;
@@ -2384,7 +2403,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 }
                 break;
             case CP_SET_DRAW_STATE:
-                if (!setDrawState(p, h.count)) {
+                if (!setDrawState(p, h.count, depth)) {
                     return false;
                 }
                 break;

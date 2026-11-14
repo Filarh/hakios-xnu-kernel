@@ -6067,7 +6067,14 @@ TEST(the_twins_of_the_draw_state_groups_show) {
         CHECK(!twin.completed);
         CHECK(twin.stats.lastFault.find("a tile begun with a draw-state group still set") != std::string::npos);
     }
+    {
+        // no group DIRTY but the loads': the first tile sets the pass's group to the words the binning pass ran last
+        const Scene twin = groupScene(0, 8);
+        CHECK(!twin.completed);
+        CHECK(twin.stats.lastFault.find("set again, without DIRTY, to the address and length it last ran with") != std::string::npos);
+    }
 }
+
 TEST(bins_laid_from_the_render_areas_corner_are_not_the_vscs) {
     for (int twin = 0; twin < 2; twin++) {
         Rig r;
@@ -6332,12 +6339,13 @@ TEST(draw_states_keep_each_groups_registers_whole) {
     CHECK_EQ(l.size(), size_t(7 + 4 + 4 + 4 + 4));
     if (l.size() == 23) {
         CHECK(pm4::decode(l[0]).opcode == CP_SET_DRAW_STATE && pm4::decode(l[0]).count == 6);
-        CHECK_EQ(l[1], setDrawState0(3, modes, render::kDsViewport));   // one type-4 of two registers
-        CHECK_EQ(l[4], setDrawState0(2, modes, render::kDsBlend));
+        // (every group DIRTY: gmem.hpp)
+        CHECK_EQ(l[1], setDrawState0(3, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsViewport));   // one type-4 of two registers
+        CHECK_EQ(l[4], setDrawState0(2, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsBlend));
         CHECK(pm4::decode(l[7]).opcode == CP_DRAW_INDX_OFFSET);
         CHECK(pm4::decode(l[11]).opcode == CP_SET_DRAW_STATE && pm4::decode(l[11]).count == 3);
         // draw 2's viewport fragment: BOTH registers, the one draw 1 wrote and the one draw 2 changed
-        CHECK_EQ(l[12], setDrawState0(3, modes, render::kDsViewport));
+        CHECK_EQ(l[12], setDrawState0(3, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsViewport));
         const uint32_t at = l[13] / 4;
         CHECK(at + 3 <= s.blobs.size());
         if (at + 3 <= s.blobs.size()) {
@@ -6371,7 +6379,7 @@ TEST(draw_states_keep_each_groups_registers_whole) {
         if (fl.size() == 26) {
             CHECK_EQ(fl[1], setDrawState0(4, CP_SET_DRAW_STATE__0_GMEM | CP_SET_DRAW_STATE__0_DIRTY, render::kDsBarrier));
             CHECK(fl[2] / 4 + 4 <= g.blobs.size() && pm4::decode(g.blobs[fl[2] / 4]).opcode == pm4::kWaitForIdle);
-            CHECK_EQ(fl[4], setDrawState0(2, modes, render::kDsRaster));
+            CHECK_EQ(fl[4], setDrawState0(2, modes | CP_SET_DRAW_STATE__0_DIRTY, render::kDsRaster));
             CHECK(pm4::decode(fl[7]).opcode == CP_DRAW_INDX_OFFSET && pm4::decode(fl[11]).opcode == CP_DRAW_INDX_OFFSET);
             CHECK_EQ(fl[16], setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE, render::kDsBarrier));
             CHECK(fl[17] == 0 && fl[18] == 0);
@@ -6400,7 +6408,8 @@ TEST(draw_states_keep_each_groups_registers_whole) {
 
 // The command processor's part, on a stream mutated by hand (the flat draw in sysmem): a group for the sysmem pass
 // runs at the draw, over what the stream wrote directly; one for the tiles alone stays pending; set again to what it
-// last ran it does not run again, unless DIRTY; a group holds register writes and loads and nothing else.
+// last ran, the microcode would not run it again -- a fault here, since what the processor keeps of a run is nothing a
+// stream may lean on -- and DIRTY runs it again; a group holds register writes and loads and nothing else.
 TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
     using namespace a6xx;
     auto run = [](uint32_t modes, uint32_t flags, bool twice, bool wait, FakeGpu::Stats* out) {
@@ -6438,11 +6447,40 @@ TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
     // for the tiles alone: pending through a sysmem draw, which keeps the scissor the stream wrote
     CHECK(run(CP_SET_DRAW_STATE__0_GMEM, 0, false, false, &s).empty());
     CHECK(s.groupsRun == 0 && s.lastDraw.screenScissor[0] == 0 && s.lastDraw.screenScissor[3] == 63);
-    // set twice to the same words: run once; DIRTY: twice
-    CHECK(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, true, false, &s).empty());
-    CHECK(s.groupsRun == 1 && s.draws == 2);
+    // set twice to the same words: the second time is the fault; DIRTY: run twice
+    CHECK(has(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, true, false, &s), "set again, without DIRTY, to the address and length it last ran with"));
+    CHECK(s.groupsRun == 1);
     CHECK(run(CP_SET_DRAW_STATE__0_SYSMEM, CP_SET_DRAW_STATE__0_DIRTY, true, false, &s).empty());
     CHECK(s.groupsRun == 2 && s.draws == 2);
     // a packet no group holds
     CHECK(has(run(CP_SET_DRAW_STATE__0_SYSMEM, 0, false, true, &s), "in a draw-state group: register writes, CP_LOAD_STATE6 and a fetch's barrier are what a group holds"));
+    // A group set by an indirect buffer -- a tiled pass's draws -- and still set at a draw of the stream itself: it would
+    // run there, the tiled pass's state over that draw's. (Every pass's head lets all groups go, encodeBegin, and a
+    // tiled pass does after its binning pass and after each tile: no stream of the driver's gets here.)
+    {
+        Twin w;
+        std::string why;
+        auto blob = newBuffer(*w.r.gpu, 4096, &why);
+        CHECK(blob != nullptr);
+        pm4::Stream g;
+        const uint32_t sc[2] = {scissorXY(1, 2), scissorXY(30, 31)};
+        g.registers(regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0), sc, 2);
+        const size_t groupWords = g.words().size();
+        const uint32_t set[4] = {pm4::type7(CP_SET_DRAW_STATE, 3),
+                                 setDrawState0(uint32_t(groupWords), CP_SET_DRAW_STATE__0_SYSMEM | CP_SET_DRAW_STATE__0_DIRTY, 5),
+                                 uint32_t(blob->gpuAddress()), uint32_t(blob->gpuAddress() >> 32)};
+        memcpy(blob->contents(), g.words().data(), 4 * groupWords);
+        memcpy(static_cast<uint8_t*>(blob->contents()) + 4 * groupWords, set, sizeof set);   // (the buffer that sets it, after its words)
+        pm4::Stream call;
+        call.indirect(blob->gpuAddress() + 4 * groupWords, 4);
+        const size_t d = w.e.find(CP_DRAW_INDX_OFFSET);
+        CHECK(d != size_t(-1));
+        w.words.insert(w.words.begin() + d, call.words().begin(), call.words().end());
+        const uint32_t before = w.r.fake->stats().faults;
+        Raw raw(w.r);
+        raw.submit(w.words);
+        const FakeGpu::Stats st = w.r.fake->stats();
+        CHECK(st.faults != before);
+        CHECK(has(st.lastFault, "a draw of the stream itself with draw-state group 5 still set by a tiled pass's draws"));
+    }
 }

@@ -261,7 +261,8 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* 
                 }
                 for (uint32_t k = 0; k < count; k++) {
                     const Group& G = groups[sent[k]];
-                    const uint32_t dirty = sent[k] == kDsLoads && twin != 2 ? CP_SET_DRAW_STATE__0_DIRTY : 0u;
+                    // (every group DIRTY, gmem.hpp; twin 8: the loads' alone, twin 2: not even theirs)
+                    const uint32_t dirty = (sent[k] == kDsLoads ? twin != 2 : twin != 8) ? CP_SET_DRAW_STATE__0_DIRTY : 0u;
                     s.list.push_back(setDrawState0(G.words, modes | dirty, sent[k]));
                     s.relocs.push_back(uint32_t(s.list.size()));
                     s.list.push_back(4 * G.at);
