@@ -24,6 +24,8 @@ int main(int argc, char** argv) {
     if (sums) golden::sumInto(&s);
     // every draw the tests make from a program's kept state is checked against the same draw encoded in full
     hakios::metal::CommandBuffer::verifyDraws(checked);
+    // ...and memory a command buffer takes over from another is not the other's tables (CommandQueue::poisonReused)
+    hakios::metal::CommandQueue::poisonReused(true);
     // tests whose submissions depend on which thread got there first (a command buffer let go while the GPU has it:
     // whether its memory is back in the queue's pools when the next one asks is the race the test is about), so that
     // the addresses in their streams differ from run to run: counted, not summed
