@@ -10,6 +10,12 @@
 
 #include "hakios-metal/gpu.hpp"
 
+// The kernel's GPU service by name. HackiOS's kernel publishes "HakiosGPU"; another port's kernel names its own with
+// -DHAKIOS_GPU_SERVICE='"..."' (make ios GPU_SERVICE=...). The requests are msm_drm.h's numbers in both.
+#ifndef HAKIOS_GPU_SERVICE
+#define HAKIOS_GPU_SERVICE "HakiosGPU"
+#endif
+
 namespace hakios::metal {
 
 namespace {
@@ -65,16 +71,16 @@ private:
 }  // namespace
 
 std::unique_ptr<Transport> openKernelGpu(std::string* why) {
-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("HakiosGPU"));
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(HAKIOS_GPU_SERVICE));
     if (s == 0) {
-        *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
+        *why = "no " HAKIOS_GPU_SERVICE " service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
         return nullptr;
     }
     io_connect_t c = 0;
     kern_return_t r = IOServiceOpen(s, mach_task_self(), 0, &c);
     IOObjectRelease(s);
     if (r != KERN_SUCCESS) {
-        *why = "HakiosGPU would not open: error " + std::to_string(r);
+        *why = HAKIOS_GPU_SERVICE " would not open: error " + std::to_string(r);
         return nullptr;
     }
     return std::unique_ptr<Transport>(new KernelGpu(c));
