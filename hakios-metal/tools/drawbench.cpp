@@ -228,6 +228,7 @@ FakeGpu::Stats gpuSince(const FakeGpu::Stats& a) {
     d.cpWords = b.cpWords - a.cpWords, d.sdsWords = b.sdsWords - a.sdsWords, d.cpRegisters = b.cpRegisters - a.cpRegisters;
     d.drawsSkipped = b.drawsSkipped - a.drawsSkipped, d.ibSkipped = b.ibSkipped - a.ibSkipped, d.groupsRun = b.groupsRun - a.groupsRun;
     d.cpLoads = b.cpLoads - a.cpLoads, d.cpWaits = b.cpWaits - a.cpWaits;
+    for (int i = 0; i < 8; i++) d.groupRuns[i] = b.groupRuns[i] - a.groupRuns[i], d.groupWords[i] = b.groupWords[i] - a.groupWords[i];
     return d;
 }
 void onSubmit(FakeGpu& gpu, uint64_t address, uint32_t words, void*) {
@@ -1115,6 +1116,14 @@ int main(int argc, char** argv) {
                         (unsigned long long)g.cpWords, (unsigned long long)g.sdsWords, (unsigned long long)g.cpRegisters, g.cpLoads, g.cpWaits, g.draws, g.drawsSkipped,
                         g.groupsRun, g.passes, g.tiles, g.binnedDraws, double(g.loadedPixels) * 4 / 1e6, double(g.storedPixels) * 4 / 1e6, g.tileLoads, g.tileStores,
                         g.tileClears);
+            // (the draw-state groups by id, gmem.hpp: barrier, pass, program, vertex, loads, raster, viewport, blend -- how
+            // often the tiles ran each and the words they ran of it)
+            if (g.groupsRun != 0) {
+                static const char* const names[8] = {"barrier", "pass", "program", "vertex", "loads", "raster", "viewport", "blend"};
+                std::printf("   groups:");
+                for (int i = 0; i < 8; i++) std::printf(" %s %u x %.0f", names[i], g.groupRuns[i], g.groupRuns[i] ? double(g.groupWords[i]) / g.groupRuns[i] : 0.0);
+                std::printf(" words; outside groups %llu words\n", (unsigned long long)(g.cpWords - g.sdsWords));
+            }
         }
         return 0;
     }

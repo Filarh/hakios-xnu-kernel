@@ -291,6 +291,11 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
  * descriptor and sample count come with it. NULL with the reason. */
 hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
+/* What making programs cost the calling thread since it last asked (the counts start again): the stages asked for,
+ * those read from the stage cache and those compiled, and the microseconds spent waiting for the compiler while
+ * another thread compiled, reading cached stages, and compiling. Any pointer may be NULL. */
+void hakios_metal_compile_times(unsigned *stages, unsigned *cached, unsigned *compiled, double *waited_us, double *loaded_us,
+    double *compiled_us);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* what PROGRAM's fragment stage does that a frame trace reports (the plug-in's metal_trace=frame looks for it by name):

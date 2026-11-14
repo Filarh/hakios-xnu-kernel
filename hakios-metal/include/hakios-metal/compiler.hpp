@@ -136,6 +136,15 @@ struct KnownBuffer {
 };
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
                                            uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
+// What compileStage did for the calling thread since it last asked (the counts start again): the stages asked for,
+// those that came out of the cache or a seed and those compiled, and the time each part took -- waiting for the one
+// compiler while another thread compiled, reading cached stages, compiling. A stage found in the cache waits for
+// nobody: only a compilation takes the compiler.
+struct CompileTimes {
+    uint32_t stages = 0, cached = 0, compiled = 0;
+    double waitedUs = 0, loadedUs = 0, compiledUs = 0;
+};
+CompileTimes takeCompileTimes();
 // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
 // the one that spills less, then the one with fewer registers; WITH on a tie. (CoreAnimation's fixed_frag_lph_cpf: 48
 // registers and 512 bytes of spills with the preamble, 21 and none without; its draws 6.6 ms each so, 2.6 without.)

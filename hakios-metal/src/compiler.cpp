@@ -1,6 +1,7 @@
 #include "hakios-metal/compiler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,8 @@ std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* wh
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
 }
+
+CompileTimes takeCompileTimes() { return {}; }
 
 std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage>, std::shared_ptr<CompiledStage>, PixelFormat, std::string* why) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
@@ -1275,15 +1278,13 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
 }
 }  // namespace
 
-std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                           const KnownBuffer* known) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
-    if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
-        return nullptr;
-    }
-    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
-    const std::string cached = stageCacheWritable(name);
+namespace {
+thread_local CompileTimes tCompileTimes;
+double microsecondsSince(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
+}
+// a stage of that name in the writable cache or in a seed, or nullptr
+std::unique_ptr<CompiledStage> stageCacheFind(const std::string& name, const std::string& cached) {
     if (!cached.empty()) {
         if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) return s;
     }
@@ -1297,6 +1298,48 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
             if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) return s;
         }
     }
+    return nullptr;
+}
+}  // namespace
+
+CompileTimes takeCompileTimes() {
+    const CompileTimes t = tCompileTimes;
+    tCompileTimes = CompileTimes{};
+    return t;
+}
+
+std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+                                           const KnownBuffer* known) {
+    // A stage compiled before is read from its file with the compiler left alone: the one compiler is taken for a
+    // compilation only. Taken first, a pipeline whose two stages were both in the cache -- half a millisecond of
+    // reading -- stood behind whatever another thread was compiling: 173 to 434 ms each on the phone, three of them
+    // one after another in one frame (1.3 s), behind the uber shader being compiled for a configuration in the
+    // background.
+    tCompileTimes.stages++;
+    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
+    const std::string cached = stageCacheWritable(name);
+    if (std::unique_ptr<CompiledStage> s = stageCacheFind(name, cached)) {
+        tCompileTimes.cached++;
+        tCompileTimes.loadedUs += microsecondsSince(began);
+        return s;
+    }
+    tCompileTimes.loadedUs += microsecondsSince(began);
+    const std::chrono::steady_clock::time_point asked = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> g(gCompilerLock);
+    tCompileTimes.waitedUs += microsecondsSince(asked);
+    // (while this thread waited another may have compiled the very stage: its file is there now)
+    if (!cached.empty()) {
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
+            tCompileTimes.cached++;
+            return s;
+        }
+    }
+    const std::chrono::steady_clock::time_point compiling = std::chrono::steady_clock::now();
+    if (theCompiler() == nullptr) {
+        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        return nullptr;
+    }
     std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
@@ -1309,6 +1352,8 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
     }
     if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
+    tCompileTimes.compiled++;
+    tCompileTimes.compiledUs += microsecondsSince(compiling);
     return chosen;
 }
 
