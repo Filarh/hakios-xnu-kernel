@@ -361,7 +361,11 @@ private:
     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
     // again from nothing, a doubling at a time.
     struct PassReturn {
-        CommandQueue* queue = nullptr;
+        // (constructors of its own: a member initializer here is no use to unique_ptr while CommandBuffer itself is still
+        // being defined, and the iOS SDK's libc++ then finds no default constructor for the deleter)
+        PassReturn() : queue(nullptr) {}
+        explicit PassReturn(CommandQueue* q) : queue(q) {}
+        CommandQueue* queue;
         void operator()(OpenPass* p) const;
     };
     using OpenPassPtr = std::unique_ptr<OpenPass, PassReturn>;
