@@ -17,6 +17,7 @@
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/fake_gpu.hpp"
+#include "hakios-metal/gmem.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
 #include "fixtures/end_only.hpp"
@@ -5836,9 +5837,198 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
-// The bins are the window's grid, from its origin, whatever part of the window a pass draws: that is where the VSC bins
-// a draw. A binned pass over a corner is drawn in the grid's bins there, each given the streams of the bin it is; laid
-// from the corner itself (the twin) a tile is given the streams of another rectangle than the one it draws.
+// --- A binned pass's draws as draw-state groups (gmem.hpp), and the command processor's part in it -----------------------
+//
+// The fake keeps the command processor's state as the phone's microcode does (fake_gpu.hpp): a tile's streams name the
+// draws of the binning pass whose scissors' rectangle reaches the tile's bin, a draw they do not name is skipped, a
+// group runs when a draw that runs finds it pending. It logs every draw that ran with a digest of everything the GPU
+// holds then, so two recordings of one scene can be held to each other draw by draw and tile by tile.
+namespace {
+struct Scene {
+    FakeGpu::Stats stats;
+    CommandBuffer::Counts counts;
+    bool completed = false;
+    render::GmemPlan plan;
+};
+// Nine draws over a 1125 x 600 target, each in a rectangle of its own so that every tile sees another subset of them,
+// with the kinds of state a compositor's draws differ in: three programs' worth of textures, constants bound at a
+// 16-byte boundary and off one (the copy), a framebuffer fetch, blending on and off. GMEM_OFF: CommandBuffer's bits;
+// TWIN: Options::gmemTwin; SHARED: the two draws whose programs differ and whose loads do not (twin 2's).
+Scene groupScene(uint32_t gmemOff, uint8_t twin = 0, bool shared = false) {
+    Rig r;
+    r.fake->logDraws(true, true);
+    auto t = target(r, 1125, 600, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto tex1 = target(r, 32, 32, kTextureUsageRead), tex2 = target(r, 16, 16, kTextureUsageRead);
+    fillCoords(*t);
+    std::string why;
+    Sampler smp;
+    CHECK(makeSampler(SamplerDesc{}, &smp, &why));
+    auto uniforms = newBuffer(*r.gpu, 4096, &why);
+    CHECK(uniforms != nullptr);
+    for (uint32_t i = 0; i < 1024; i++) static_cast<uint32_t*>(uniforms->contents())[i] = 0x3f000000u + i;
+    const Program flat = flatProgram(), color = colorProgram();
+    const Program tex{kernels::tri_color_vs_air, kernels::tri_tex_fs_air, Linkage{}, "tri_tex"};
+    Program cflat{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "tri_cflat"};
+    Program blended = cflat;
+    blended.blend.enabled = true;
+    blended.blend.srcRgb = 1, blended.blend.dstRgb = 5, blended.blend.srcAlpha = 1, blended.blend.dstAlpha = 5;
+    const Program fetch{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    // (one vertex stage whose words lie in two places: two programs to the driver, uploaded apart, with not a load between them that differs)
+    const std::vector<uint32_t> again(cflat.vs.k.words, cflat.vs.k.words + cflat.vs.k.numWords);
+    Program cflat2 = cflat;
+    cflat2.vs.k.words = again.data();
+    Scene out;
+    RenderPass a;
+    a.color0 = t.get();
+    CHECK(render::gmemPlan(a, &out.plan, nullptr));
+    render::Options o;
+    o.gmemBinning = true;
+    o.gmemTwin = twin;
+    auto cb = r.queue->commandBuffer();
+    cb->setGmemOff(gmemOff);
+    auto draw = [&](const Program& p, double x, double y, double w, double h, const Bindings& fsb = Bindings{}, const Bindings& vsb = Bindings{}) {
+        Draw d = wholeDraw(3);
+        d.viewport = Viewport{x, y, w, h, 0, 1};
+        const bool ok = cb->draw(p, a, d, vsb, fsb, o);
+        CHECK(ok);
+        if (!ok) std::printf("       %s: %s\n", p.name, cb->error().c_str());
+    };
+    Bindings t1, t2, u8, u32;
+    t1.textures = {tex1.get()};
+    t1.samplers = {&smp};
+    t2.textures = {tex2.get()};
+    t2.samplers = {&smp};
+    u8.buffers = {Binding{uniforms.get(), 8}};     // off a 16-byte boundary: copied by the command processor first
+    u32.buffers = {Binding{uniforms.get(), 32}};   // on one: loaded from where it lies
+    if (shared) {
+        // two programs with one fragment stage and the same constants bound: the program's fragment differs, the loads'
+        // does not -- what the loads must still be run again for
+        draw(cflat, 0, 0, 1125, 600, u32);
+        draw(cflat2, 0, 0, 1125, 600, u32);
+    } else {
+        draw(flat, 0, 0, 1125, 600);
+        draw(tex, 0, 0, 200, 100, t1);
+        draw(cflat, 700, 300, 300, 200, u8);
+        draw(tex, 600, 0, 500, 60, t2);
+        draw(cflat, 0, 400, 100, 100, u32);
+        draw(fetch, 100, 100, 400, 300);
+        draw(flat, 900, 500, 200, 100);
+        draw(blended, 50, 50, 20, 20, u32);
+        draw(color, 0, 0, 300, 300);
+    }
+    cb->commit();
+    cb->waitUntilCompleted();
+    out.completed = cb->status() == CommandBuffer::kCompleted;
+    out.stats = r.fake->stats();
+    out.counts = cb->counts();
+    if (out.completed) CHECK_EQ(coordsWrong(*t), 0u);
+    return out;
+}
+// whether two scenes ran the same draws in the same tiles with the GPU in the same state at each (SAY: where they part)
+bool sameDraws(const Scene& a, const Scene& b, bool say = false) {
+    if (a.stats.drawLog.size() != b.stats.drawLog.size()) {
+        if (say) std::printf("       %zu draws ran against %zu\n", a.stats.drawLog.size(), b.stats.drawLog.size());
+        return false;
+    }
+    for (size_t i = 0; i < a.stats.drawLog.size(); i++) {
+        const auto &x = a.stats.drawLog[i], &y = b.stats.drawLog[i];
+        if (x.tile != y.tile || x.ordinal != y.ordinal || x.binning != y.binning || x.digest != y.digest) {
+            if (say) {
+                std::printf("       entry %zu: tile %d draw %u%s against tile %d draw %u%s\n", i, int(x.tile), x.ordinal, x.binning ? " (binning)" : "", int(y.tile),
+                            y.ordinal, y.binning ? " (binning)" : "");
+                for (size_t k = 0, shown = 0; k < x.state.size() && k < y.state.size() && shown < 12; k++) {
+                    if (x.state[k] != y.state[k]) {
+                        std::printf("         word %zu: %#llx against %#llx\n", k, (unsigned long long)x.state[k], (unsigned long long)y.state[k]);
+                        shown++;
+                    }
+                }
+                if (x.state.size() != y.state.size()) std::printf("         %zu words of state against %zu\n", x.state.size(), y.state.size());
+            }
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+// The fake's visibility streams: in a binned pass's tile a draw runs where its rectangle reaches the tile's bin and is
+// skipped elsewhere, its packet read and nothing more. Without the binning (metal_gmem_off=16's) every draw runs in
+// every tile.
+TEST(a_binned_tile_runs_the_draws_its_streams_name_and_skips_the_rest) {
+    const Scene s = groupScene(CommandBuffer::kGmemPlainBody);
+    CHECK(s.completed);
+    CHECK_EQ(s.stats.faults, 0u);
+    const render::GmemPlan& p = s.plan;
+    CHECK(p.tiles() >= 6);
+    // each draw's rectangle counted over the plan's bins: the tiles it runs in
+    const uint32_t rects[9][4] = {{0, 0, 1124, 599}, {0, 0, 199, 99}, {700, 300, 999, 499}, {600, 0, 1099, 59}, {0, 400, 99, 499},
+                                  {100, 100, 499, 399}, {900, 500, 1099, 599}, {50, 50, 69, 69}, {0, 0, 299, 299}};
+    uint32_t runs = 0;
+    for (const auto& q : rects) runs += (q[2] / p.binW - q[0] / p.binW + 1) * (q[3] / p.binH - q[1] / p.binH + 1);
+    CHECK_EQ(s.stats.binnedDraws, 9u);
+    CHECK_EQ(s.stats.draws, runs);                                // (a draw of the binning pass is counted apart)
+    CHECK_EQ(s.stats.drawsSkipped, 9 * p.tiles() - runs);
+    CHECK(s.stats.drawsSkipped != 0);
+    CHECK(s.stats.groupsRun == 0 && s.stats.ibEarlyReturns == 0);   // (the plain stream: no group, and LOCAL never written)
+}
+
+// The same scene as draw-state groups: every draw that runs finds the GPU as the plain stream leaves it for that draw
+// in that tile -- every register and every load, by the fake's digest -- though the tile ran the state of none of the
+// draws it skipped; the command processor reads a fraction of the words; and a tile whose streams are done leaves the
+// draws' buffer there.
+TEST(draw_state_groups_give_each_draw_that_runs_the_state_the_plain_stream_gives_it) {
+    const Scene plain = groupScene(CommandBuffer::kGmemPlainBody), groups = groupScene(0);
+    CHECK(plain.completed && groups.completed);
+    CHECK_EQ(plain.stats.faults, 0u);
+    CHECK_EQ(groups.stats.faults, 0u);
+    if (groups.stats.faults) std::printf("       %s\n", groups.stats.lastFault.c_str());
+    CHECK(!plain.stats.drawLog.empty());
+    CHECK(sameDraws(plain, groups, true));
+    CHECK(groups.stats.draws == plain.stats.draws && groups.stats.tiles == plain.stats.tiles && groups.stats.binnedDraws == plain.stats.binnedDraws);
+    CHECK(groups.stats.groupsRun != 0 && groups.stats.sdsWords != 0);
+    CHECK(groups.stats.ibEarlyReturns != 0);
+    CHECK(groups.stats.cpLoads < plain.stats.cpLoads);
+    CHECK(groups.stats.cpWaits <= plain.stats.cpWaits);
+    std::printf("       %u tiles: plain %llu words, %llu registers, %u loads; groups %llu words (%llu in groups), %llu registers, %u loads, %u buffers left early\n",
+                groups.stats.tiles, (unsigned long long)plain.stats.cpWords, (unsigned long long)plain.stats.cpRegisters, plain.stats.cpLoads,
+                (unsigned long long)groups.stats.cpWords, (unsigned long long)groups.stats.sdsWords, (unsigned long long)groups.stats.cpRegisters,
+                groups.stats.cpLoads, groups.stats.ibEarlyReturns);
+    // the copy of the constants bound off a 16-byte boundary: once in the pass, not once a tile that walks past its draw
+    CHECK(groups.stats.wordsCopied != 0 && groups.stats.wordsCopied < plain.stats.wordsCopied);
+    // (and with the buffers read to their end, kGmemNoLeave: the same draws in the same state, none left early)
+    const Scene whole = groupScene(CommandBuffer::kGmemNoLeave);
+    CHECK(whole.completed && sameDraws(plain, whole) && whole.stats.ibEarlyReturns == 0 && whole.stats.cpWords > groups.stats.cpWords);
+}
+
+// The twins. 1: fragments that hold only what the draw itself wrote -- the plain stream's words cut into groups -- leave
+// a draw without the registers a skipped draw wrote for it. 2: the loads neither DIRTY nor sent again with the
+// program's fragment are not run after its HLSQ_INVALIDATE_CMD when they are the fragment that ran last. 3:
+// CP_SKIP_IB2_ENABLE_LOCAL written before the tile's CP_SET_BIN_DATA5, where both of Mesa's drivers have theirs, is
+// cleared by it: nothing is left early. 4: groups left set from one tile to the next. 5: the bins laid from the render
+// area's corner are not the bins the VSC wrote the streams for.
+TEST(the_twins_of_the_draw_state_groups_show) {
+    const Scene plain = groupScene(CommandBuffer::kGmemPlainBody);
+    {
+        const Scene twin = groupScene(0, 1);
+        CHECK(!twin.completed || !sameDraws(plain, twin));
+    }
+    {
+        const Scene plainShared = groupScene(CommandBuffer::kGmemPlainBody, 0, true), shared = groupScene(0, 0, true), twin = groupScene(0, 2, true);
+        CHECK(plainShared.completed && shared.completed);
+        CHECK(sameDraws(plainShared, shared));
+        CHECK(!twin.completed || !sameDraws(plainShared, twin));
+    }
+    {
+        const Scene twin = groupScene(0, 3);
+        CHECK(twin.completed && sameDraws(plain, twin));
+        CHECK_EQ(twin.stats.ibEarlyReturns, 0u);
+    }
+    {
+        const Scene twin = groupScene(0, 4);
+        CHECK(!twin.completed);
+        CHECK(twin.stats.lastFault.find("a tile begun with a draw-state group still set") != std::string::npos);
+    }
+}
 TEST(bins_laid_from_the_render_areas_corner_are_not_the_vscs) {
     for (int twin = 0; twin < 2; twin++) {
         Rig r;
@@ -5868,6 +6058,70 @@ TEST(bins_laid_from_the_render_areas_corner_are_not_the_vscs) {
             CHECK(s.lastFault.find("the VSC bins from the window's origin") != std::string::npos);
         }
     }
+}
+
+// drawStates on streams written by hand: a fragment holds every register of its group as it stands at the draw, not
+// the draw's own writes alone; a group no draw changes is not set again; a copy goes to the prologue with one wait for
+// all; a packet that is none of a draw's sends the pass back to its plain stream.
+TEST(draw_states_keep_each_groups_registers_whole) {
+    using namespace a6xx;
+    pm4::Stream body;
+    auto reg1 = [&](uint32_t r, uint32_t v) { body.registers(r, &v, 1); };
+    const uint32_t draw[3] = {drawIndxOffset0(DI_PT_TRILIST, DI_SRC_SEL_AUTO_INDEX, USE_VISIBILITY), 1, 3};
+    // draw 1: two viewport registers, the blend, a copy and its waits; draw 2: one viewport register; draw 3: nothing
+    reg1(REG_A6XX_GRAS_CL_VPORT_XOFFSET, 11);
+    reg1(REG_A6XX_GRAS_CL_VPORT_XOFFSET + 1, 12);
+    reg1(REG_A6XX_RB_BLEND_CNTL, 7);
+    body.memcpy(0x1000, 0x2000, 4);
+    body.waitMemWrites();
+    body.waitForMe();
+    body.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    reg1(REG_A6XX_GRAS_CL_VPORT_XOFFSET + 1, 99);
+    body.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    body.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    render::DrawStates s;
+    const uint32_t modes = CP_SET_DRAW_STATE__0_BINNING | CP_SET_DRAW_STATE__0_GMEM;
+    CHECK(render::drawStates(body.words().data(), body.words().size(), modes, &s));
+    CHECK(s.draws == 3 && s.fragments == 3 && s.entries == 3);
+    // the prologue: the copy, CP_WAIT_MEM_WRITES, CP_WAIT_FOR_ME
+    CHECK_EQ(s.prologue.size(), size_t(6 + 1 + 1));
+    CHECK(s.prologue.size() == 8 && pm4::decode(s.prologue[0]).opcode == pm4::kMemcpy && pm4::decode(s.prologue[6]).opcode == pm4::kWaitMemWrites &&
+          pm4::decode(s.prologue[7]).opcode == pm4::kWaitForMe);
+    // the list: [set viewport, blend][draw][set viewport][draw][draw]
+    const std::vector<uint32_t>& l = s.list;
+    CHECK_EQ(l.size(), size_t(7 + 4 + 4 + 4 + 4));
+    if (l.size() == 23) {
+        CHECK(pm4::decode(l[0]).opcode == CP_SET_DRAW_STATE && pm4::decode(l[0]).count == 6);
+        CHECK_EQ(l[1], setDrawState0(3, modes, render::kDsViewport));   // one type-4 of two registers
+        CHECK_EQ(l[4], setDrawState0(2, modes, render::kDsBlend));
+        CHECK(pm4::decode(l[7]).opcode == CP_DRAW_INDX_OFFSET);
+        CHECK(pm4::decode(l[11]).opcode == CP_SET_DRAW_STATE && pm4::decode(l[11]).count == 3);
+        // draw 2's viewport fragment: BOTH registers, the one draw 1 wrote and the one draw 2 changed
+        CHECK_EQ(l[12], setDrawState0(3, modes, render::kDsViewport));
+        const uint32_t at = l[13] / 4;
+        CHECK(at + 3 <= s.blobs.size());
+        if (at + 3 <= s.blobs.size()) {
+            CHECK_EQ(s.blobs[at], pm4::type4(REG_A6XX_GRAS_CL_VPORT_XOFFSET, 2));
+            CHECK(s.blobs[at + 1] == 11 && s.blobs[at + 2] == 99);
+        }
+        CHECK(pm4::decode(l[15]).opcode == CP_DRAW_INDX_OFFSET && pm4::decode(l[19]).opcode == CP_DRAW_INDX_OFFSET);
+    }
+    // placed: the entries' addresses are the fragments'
+    s.place(0x100002000ull);
+    CHECK(l.size() == 23 && l[2] == 0x00002000u && l[3] == 1u);
+    // a packet no draw is made of: not moved, the pass keeps its plain stream
+    pm4::Stream odd;
+    const uint32_t marker = 0;
+    odd.packet(CP_SET_MARKER, &marker, 1);
+    odd.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    render::DrawStates none;
+    CHECK(!render::drawStates(odd.words().data(), odd.words().size(), modes, &none));
+    // state with no draw after it
+    pm4::Stream tail;
+    tail.packet(CP_DRAW_INDX_OFFSET, draw, 3);
+    const uint32_t v = 1;
+    tail.registers(REG_A6XX_RB_BLEND_CNTL, &v, 1);
+    CHECK(!render::drawStates(tail.words().data(), tail.words().size(), modes, &none));
 }
 
 // The command processor's part, on a stream mutated by hand (the flat draw in sysmem): a group for the sysmem pass
