@@ -3583,6 +3583,25 @@ hm_print_callers(const char *what)
 /* true of this SoC: the GPU reads the same DRAM the processor does, and every buffer here is mapped on both sides */
 - (BOOL)hasUnifiedMemory { return YES; }
 
+/* Where a texture's rows lie in memory this device did not lay out -- an IOSurface, a buffer -- they must start at a
+ * multiple of 64 bytes and be a multiple of 64 bytes apart: the a6xx reads a texture's pitch and writes a render
+ * target's in 64-byte units (hakios-metal's texture.cpp: wrapSurface, overBuffer). These are the device's answers to
+ * whoever lays such memory out. CoreAnimation asks iosurfaceReadOnlyTextureAlignmentBytes as it makes its Metal context
+ * and creates its IOSurfaces by the answer (CADeviceSetMinimumAlignment); a client of linear textures asks
+ * minimumLinearTextureAlignmentForPixelFormat:. Left to the base class they were Apple's own for this profile, and a
+ * surface made by them (rows of 2848 bytes for 712 pixels) is one the GPU cannot take where it lies: read through a
+ * copy (-hakiosShadow:). A surface another process lays out without asking this device is still what it is. */
+- (NSUInteger)iosurfaceTextureAlignmentBytes { return 64; }
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return 64; }
+- (NSUInteger)linearTextureAlignmentBytes { return 64; }
+- (NSUInteger)deviceLinearTextureAlignmentBytes { return 64; }
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return 64; }
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	(void)format;
+	return 64;
+}
+
 /* the GPU memory this device has allocated and not given back (hakios-metal counts every buffer it asks the kernel
  * for); Resident Evil 4 sizes what it keeps resident by it */
 - (NSUInteger)currentAllocatedSize
@@ -3617,6 +3636,23 @@ hm_print_callers(const char *what)
 		}
 		HM_ONCE("feature profile %lu: supportsFamily answers YES for%s; maxColorAttachments-limited features follow it\n",
 			(unsigned long)[self featureProfile], yes[0] ? yes : " none");
+		{
+			/* the alignment this device declares, beside what the base class had for it: the one answer of the
+			 * base's that is known to be there to ask (CoreAnimation asked it of the base at every start) */
+			static dispatch_once_t once;
+
+			dispatch_once(&once, ^{
+				struct objc_super up = { self, class_getSuperclass([HakiosMetalDevice class]) };
+				const SEL name = sel_getUid("iosurfaceReadOnlyTextureAlignmentBytes");
+				unsigned long base = 0;
+
+				if ([up.super_class instancesRespondToSelector:name]) {
+					base = (unsigned long)((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&up, name);
+				}
+				hm_print("alignment declared for a texture's rows over an IOSurface or a buffer: 64 bytes (the base class's for a "
+					 "read-only IOSurface: %lu)\n", base);
+			});
+		}
 	}
 	id use = descriptor;
 
