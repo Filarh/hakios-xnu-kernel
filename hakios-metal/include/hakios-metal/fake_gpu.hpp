@@ -232,6 +232,7 @@ private:
         uint64_t programFrom = 0;
         uint32_t programUnits = 0;
         std::vector<ConstLoad> consts;
+        uint64_t constsFor = 0;            // the program (its preload's source) CONSTS were loaded after
         bool sampLoaded = false, texLoaded = false;
         uint64_t sampFrom = 0, texFrom = 0;
         uint32_t sampUnits = 0, texUnits = 0;

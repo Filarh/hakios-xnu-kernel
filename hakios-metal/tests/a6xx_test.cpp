@@ -110,8 +110,14 @@ TEST(a6xx_load_state6_word_0) {
     // one IBO descriptor: ST6_IBO (3) << 14 = 0xc000 | 0x20000 | 0x340000 | 1 << 22 = 0x400000
     CHECK_EQ(loadState6_0(0, ST6_IBO, SS6_INDIRECT, SB6_CS_SHADER, 1), 0x0076c000u);
     // the shader preload is capped at the instruction cache, and that fits the 10-bit NUM_UNIT
+#if defined(HAKIOS_CHIP_A610)
+    // (the A610: Mesa 25.0.7 freedreno_devices.py a6xx_gen1_low, instr_cache_size = 64)
+    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 64u << 22);
+    CHECK_EQ(kInstrCacheSize, 64u);
+#else
     CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
     CHECK_EQ(kInstrCacheSize, 127u);
+#endif
     // the source address: the low word keeps bits 31:2, the high word is whole
     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1000), 0x1000u);
     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1003), 0x1000u);
@@ -282,10 +288,18 @@ TEST(a6xx_private_memory_fields_are_scaled) {
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x3ffff000), 0x3ffffu);
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x800), 1u);
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
+#if defined(HAKIOS_CHIP_A610)
+    // the A610 (freedreno_devices.py GPUId(610): fibers_per_sp = 128 * 16, num_ccu = 1): 2048 fibers per SP, 1 SP; a
+    // 512-byte private memory per fiber is 1 MiB, 256 pages of 4 KiB
+    CHECK_EQ(kFibersPerSp, 2048u);
+    CHECK_EQ(kNumSpCores, 1u);
+    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 256u);
+#else
     // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
     CHECK_EQ(kFibersPerSp, 4096u);
     CHECK_EQ(kNumSpCores, 2u);
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
+#endif
 }
 
 TEST(a6xx_dispatch_words) {
@@ -333,7 +347,15 @@ TEST(a6xx_batch_start_words) {
     // RB_CCU_CNTL for rendering to memory on this chip: depth cache at 0, color cache after it at
     // num_ccu (2) * 64 KiB = 0x20000 bytes, in 4 KiB units: 0x20 << 23 = 0x10000000; both cache sizes FULL (0);
     // the chip has fast clear (bit 0 clear) and no concurrent resolve (bit 2 clear)
+#if defined(HAKIOS_CHIP_A610)
+    // (the A610: one CCU whose caches are 8 KiB each -- num_ccu = 1, sysmem_per_ccu_*_cache_size = 8 * 1024 in
+    // a6xx_gen1_low -- so the colour cache sits at 0x2000 after the depth cache's 8 KiB, 2 << 23 = 0x01000000; and no
+    // fast clear, has_gmem_fast_clear = False: GMEM_FAST_CLEAR_DISABLE, bit 0. tu_device.cc:1426-1437 for the offset,
+    // tu6_emit_ccu_cntl for the word)
+    CHECK_EQ(rbCcuCntlSysmem(), 0x01000001u);
+#else
     CHECK_EQ(rbCcuCntlSysmem(), 0x10000000u);
+#endif
     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET(0x20000), 0x10000000u);
     CHECK_EQ(A6XX_RB_CCU_CNTL_DEPTH_OFFSET(0x1000), 0x1000u);
     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(1), 0x200u);
@@ -365,11 +387,19 @@ TEST(a6xx_batch_start_words) {
     CHECK_EQ(kStaticState[1].reg, REG_A6XX_SP_FLOAT_CNTL);
     CHECK_EQ(kStaticState[1].value, 0x8u);
     CHECK_EQ(kStaticState[5].reg, REG_A6XX_TPL1_DBG_ECO_CNTL);
+#if defined(HAKIOS_CHIP_A610)
+    CHECK_EQ(kStaticState[5].value, 0u);            // (the A610's magic_regs: TPL1_DBG_ECO_CNTL = 0, freedreno_devices.py:459-477)
+#else
     CHECK_EQ(kStaticState[5].value, 0x05008000u);
+#endif
     CHECK_EQ(kStaticState[19].reg, REG_A6XX_SP_MODE_CONTROL);
     CHECK_EQ(kStaticState[19].value, 0x5u);
     CHECK_EQ(kStaticState[23].reg, REG_A6XX_PC_MODE_CNTL);
+#if defined(HAKIOS_CHIP_A610)
+    CHECK_EQ(kStaticState[23].value, 0xfu);         // (PC_MODE_CNTL = 0xf)
+#else
     CHECK_EQ(kStaticState[23].value, 0x1fu);
+#endif
     CHECK_EQ(kStaticState[49].reg, REG_A6XX_SP_TP_MODE_CNTL);
     CHECK_EQ(kStaticState[49].value, 0xa2u);
     CHECK_EQ(kStaticState[n - 1].reg, REG_A6XX_VFD_MULTIVIEW_CNTL);
@@ -386,11 +416,21 @@ TEST(a6xx_batch_start_words) {
     for (const RegWrite& w : kStaticState) {
         CHECK(w.reg >= 0x0e12 && w.reg <= 0xbe04);
     }
+#if defined(HAKIOS_CHIP_A610)
+    // (the A610's row, freedreno_devices.py:459-477: TPL1_DBG_ECO_CNTL 0, RB_DBG_ECO_CNTL 0x04100000, VPC_DBG_ECO_CNTL 0,
+    // SP_CHICKEN_BITS 0, UCHE_CLIENT_PF 4)
+    CHECK_EQ(kMagicTpl1DbgEcoCntl, 0u);
+    CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
+    CHECK_EQ(kMagicVpcDbgEcoCntl, 0u);
+    CHECK_EQ(kMagicSpChickenBits, 0u);
+    CHECK_EQ(kMagicUcheClientPf, 4u);
+#else
     CHECK_EQ(kMagicTpl1DbgEcoCntl, 83918848u);
     CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
     CHECK_EQ(kMagicVpcDbgEcoCntl, 33554432u);
     CHECK_EQ(kMagicSpChickenBits, 5120u);
     CHECK_EQ(kMagicUcheClientPf, 132u);
+#endif
     CHECK_EQ(kBorderColorBytes, 32768u);
 }
 
@@ -744,7 +784,11 @@ TEST(a6xx_first_draw_program_words) {
     CHECK_EQ(hlsqFsCntl0(THREAD128, true), 0x3u);
     CHECK_EQ(hlsqFsCntl0(THREAD64, false), 0u);
     // the stage loads: NUM_UNIT is capped at the instruction cache, as compute's is
+#if defined(HAKIOS_CHIP_A610)
+    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 64u << 22);
+#else
     CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
+#endif
     // the private memory words are the compute ones' twins (same scales)
     CHECK_EQ(A6XX_SP_VS_PVT_MEM_PARAM_MEMSIZEPERITEM(512), 1u);
     CHECK_EQ(A6XX_SP_FS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x1000), 1u);

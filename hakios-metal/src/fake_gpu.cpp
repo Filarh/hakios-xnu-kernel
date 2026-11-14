@@ -410,6 +410,14 @@ bool FakeGpu::loadState(uint32_t opcode, const uint32_t* p, uint32_t count) {
         (xs ? xs->programLoaded : cs_.programLoaded) = true;
         (xs ? xs->programFrom : cs_.programFrom) = from;
         (xs ? xs->programUnits : cs_.programUnits) = units;
+        // A graphics stage's constants are held to the constlen of the program they were loaded for (checkStageProgram):
+        // another program's preload begins another set. Kept across the whole submission, a frame whose stages differ in
+        // constlen -- a compositor's -- faulted on the first draw of a shorter stage after a longer one's, for constants
+        // that stage never reads. (The same program preloaded again keeps them: a draw's loads follow its preload.)
+        if (xs != nullptr && xs->constsFor != from) {
+            xs->consts.clear();
+            xs->constsFor = from;
+        }
         break;
     case ST6_CONSTANTS:
         {
@@ -526,7 +534,9 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
         const uint32_t ccu = reg(REG_A6XX_RB_CCU_CNTL);
         const uint64_t cache = uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET__SHIFT)) << A6XX_RB_CCU_CNTL_COLOR_OFFSET__SCALE |
                                uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT)) << 21;
-        if (pitch != uint64_t(binW) * bpp || base + uint64_t(binW) * binH * bpp > cache ||
+        // (the descriptor's address is a GPU address: GMEM's own plus the bin's place in it, turnip's gmem_base +
+        // gmem_offset, tu_cmd_buffer.cc:1946 -- 0 on the A635, 0x100000 on the A610)
+        if (pitch != uint64_t(binW) * bpp || base < kGmemBase || base - kGmemBase + uint64_t(binW) * binH * bpp > cache ||
             fieldOf(d[2], A6XX_TEX_CONST_2_TYPE__MASK, A6XX_TEX_CONST_2_TYPE__SHIFT) != A6XX_TEX_2D ||
             fieldOf(d[5], A6XX_TEX_CONST_5_DEPTH__MASK, A6XX_TEX_CONST_5_DEPTH__SHIFT) != 1) {
             fault(who + text(": a GMEM read of pitch %llu at %#llx: ", pitch, base) + text("not the %llu-pixel bin's rows, ", binW) +

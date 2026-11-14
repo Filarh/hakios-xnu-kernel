@@ -58,7 +58,12 @@ TEST(c_api_copy_and_callbacks) {
     hakios_metal_queue_free(q);
     hakios_metal_close(d);
     CHECK(hakios_metal_open() == nullptr);      // no kernel GPU on this machine
+#if defined(HAKIOS_CHIP_A610)
+    CHECK(hakios_metal_chip_known(0x06010001));  // this phone's: the A610 as this port's kernel answers MSM_PARAM_CHIP_ID
+    CHECK(!hakios_metal_chip_known(0x06030500)); // the A635 these tables were first written for
+#else
     CHECK(hakios_metal_chip_known(0x06030500));  // this phone's
+#endif
     CHECK(hakios_metal_chip_known(0));           // a kernel that does not say
     CHECK(!hakios_metal_chip_known(0x06060000)); // another Adreno: the tables here would hang it
     CHECK(strlen(hakios_metal_error()) > 0);

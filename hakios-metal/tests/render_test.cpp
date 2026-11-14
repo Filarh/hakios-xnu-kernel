@@ -69,6 +69,15 @@ std::shared_ptr<Texture> target(Rig& r, uint32_t w = 64, uint32_t h = 64, uint32
 }
 
 constexpr uint32_t regid(uint32_t n, uint32_t c) { return n * 4 + c; }
+// What the chip the tests are built for has, where a test states it as a number (a6xx_test works each out from Mesa's row):
+// RB_CCU_CNTL in sysmem, and the instruction cache a program's preload is capped at.
+#if defined(HAKIOS_CHIP_A610)
+constexpr uint32_t kCcuSysmem = 0x01000001u;   // one CCU of 8 KiB caches (colour at 0x2000), no GMEM fast clear
+constexpr uint32_t kPreloadCap = 64;           // a6xx_gen1_low instr_cache_size
+#else
+constexpr uint32_t kCcuSysmem = 0x10000000u;
+constexpr uint32_t kPreloadCap = 127;
+#endif
 constexpr uint8_t kSlotPos = 0, kSlotVar0 = 32, kSlotVertexId = 9, kSlotBaryPerspPixel = 56, kFragData0 = 4;
 
 // A stage with no register read: every regid field kRegidNone, nothing else set. A zero-initialized Stage would name
@@ -656,11 +665,11 @@ TEST(render_encodes_the_first_triangles_registers) {
     CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), uint32_t(border));
     CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR + 1), uint32_t(border >> 32));
     CHECK_EQ(e.reg(REG_A6XX_SP_PS_TP_BORDER_COLOR_BASE_ADDR), uint32_t(border));
-    // RB_CCU_CNTL 0x10000000 right after a WFI
+    // RB_CCU_CNTL 0x10000000 (the A610's 0x01000001) right after a WFI
     {
         size_t ccu = e.findReg(REG_A6XX_RB_CCU_CNTL);
         CHECK(ccu != size_t(-1));
-        CHECK_EQ(w[ccu], 0x10000000u);
+        CHECK_EQ(w[ccu], kCcuSysmem);
         pm4::Header before = pm4::decode(w[ccu - 2]);
         CHECK(before.kind == pm4::Header::kCommand && before.opcode == pm4::kWaitForIdle && before.count == 0);
     }
@@ -964,7 +973,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
         CHECK_EQ(e.find(CP_SET_DRAW_STATE), size_t(-1));
         CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), Encoded::kNone);
         CHECK_EQ(e.writes(REG_A6XX_RB_ALPHA_CONTROL), 1u);   // blendZsa's alone
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000000u);   // ccuCntl is its own group
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), kCcuSysmem);   // ccuCntl is its own group
         CHECK(e.stream.size() < whole.stream.size());
     }
     {
@@ -974,7 +983,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
     }
     {
         Encoded e = with([](render::Options& o) { o.ccuConcurrentResolve = true; });
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000004u);
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), kCcuSysmem | 0x4u);   // CONCURRENT_RESOLVE, bit 2
     }
     {
         Encoded e = with([](render::Options& o) { o.passBegin = false; });
@@ -1851,7 +1860,9 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
         Twin w;
         size_t ccu = w.e.findReg(REG_A6XX_RB_CCU_CNTL);
         w.words[ccu - 2] = pm4::type7(pm4::kNop, 0);   // the WFI before it, gone
-        CHECK(has(w.fault(), "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
+        char said[96];
+        snprintf(said, sizeof said, "RB_CCU_CNTL (%#x) was not written in this submission right after a CP_WAIT_FOR_IDLE", kCcuSysmem);
+        CHECK(has(w.fault(), said));
     }
     {
         Twin w;
@@ -4412,7 +4423,8 @@ TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_bef
     CHECK_EQ((gw[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_2));
     CHECK_EQ(gw[0] & A6XX_TEX_CONST_0_SWAP__MASK, 0u);
     CHECK_EQ((gw[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 64u * 4);
-    CHECK(gw[4] == 0 && (gw[5] & A6XX_TEX_CONST_5_BASE_HI__MASK) == 0);
+    // (the bin's place 0 in GMEM, whose own GPU address is 0 on the A635 and 0x100000 on the A610)
+    CHECK(gw[4] == a6xx::kGmemBase && (gw[5] & A6XX_TEX_CONST_5_BASE_HI__MASK) == 0);
     pm4::Stream gb;
     std::string gwhy;
     auto gt = newBuffer(*r.gpu, render::kTableBytes, &gwhy);
@@ -4648,7 +4660,7 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
-            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
+            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, kPreloadCap);
             w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
             found = true;
         }
@@ -5339,13 +5351,19 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         std::printf("       %ux%u %s: %u x %u tiles of %u x %u\n", w, h, t->info().name, p.cols, p.rows, p.binW, p.binH);
     }
     // the screen at 4 bytes a pixel: two columns of 576 and twelve rows of 208, 24 tiles
+    // (the A610, 128 KiB of GMEM below the colour cache: a row of 576 pixels is 2304 bytes, 56 rows fit, 48 in whole
+    // granules of 16 -- two columns of 576 and 51 rows of 48, 102 tiles)
     {
         auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
         RenderPass a;
         a.color0 = t.get();
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
+#if defined(HAKIOS_CHIP_A610)
+        CHECK(p.cols == 2 && p.rows == 51 && p.binW == 576 && p.binH == 48);
+#else
         CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
+#endif
     }
     // what stays in sysmem: a second colour attachment of another size, an integer target
     {
@@ -5462,7 +5480,12 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
+#if defined(HAKIOS_CHIP_A610)
+        // (128 KiB shared out by bytes a pixel: 64 KiB each, 28 rows of 2304 bytes, 16 in whole granules)
+        CHECK(p.binW == 576 && p.binH == 16 && p.base[0] == 0 && p.base[1] == 0x10000 && p.room[0] == 0x10000 && p.room[1] == 0x10000);
+#else
         CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
+#endif
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
@@ -5500,7 +5523,12 @@ TEST(a_gmem_pass_is_tiled_over_its_render_area) {
     CHECK(cb->status() == CommandBuffer::kCompleted);
     const auto s = r.fake->stats();
     CHECK_EQ(s.faults, 0u);
+#if defined(HAKIOS_CHIP_A610)
+    // (the area's 68 rows from 992 are two of this chip's bins of 48 rows at most)
+    CHECK(s.tiles == 2 && s.tileLoads == 2 && s.tileStores == 2);
+#else
     CHECK(s.tiles == 1 && s.tileLoads == 1 && s.tileStores == 1);
+#endif
     // the area (300, 1000)-(449, 1059) in 16 x 4 granules: x 288 to 463, y 1000 to 1059
     CHECK_EQ(s.storedPixels, uint64_t(464 - 288) * (1060 - 1000));
     CHECK_EQ(coordsWrong(*t), 0u);
@@ -5528,7 +5556,11 @@ TEST(a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has) {
     const auto s = r.fake->stats();
     CHECK_EQ(s.faults, 0u);
     if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+#if defined(HAKIOS_CHIP_A610)
+    CHECK(cb->counts().gmemPasses == 1 && s.tiles == 2);   // (the area's 58 rows from 992: two bins of 48 rows at most)
+#else
     CHECK(cb->counts().gmemPasses == 1 && s.tiles == 1);
+#endif
     const auto gd = r.fake->memory(s.lastDraw.fsTexConst, 64);
     uint32_t gw[16] = {};
     if (gd.size() == 64) memcpy(gw, gd.data(), 64);

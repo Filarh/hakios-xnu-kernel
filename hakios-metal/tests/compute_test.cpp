@@ -180,7 +180,12 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
     Encoded big(r, kernels::fill_id, kGroups16, nullptr, tg);
     CHECK(big.ok);
     CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_SP_CS_CTRL_REG1)]), 7u);
-    CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
+    // (the HLSQ's copy is a chip with LPAC's alone, fd6_compute.cc:119-127: the A610 has none, and none is written)
+    if (a6xx::kHasLpac) {
+        CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
+    } else {
+        CHECK(big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1) == size_t(-1));
+    }
     tg.sharedBytes = 32 * 1024 + 1;
     Encoded over(r, kernels::fill_id, kGroups16, nullptr, tg);
     CHECK(!over.ok);
@@ -531,6 +536,12 @@ TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
             changed = true;
         }
         i += 1 + h.count;
+    }
+    // (the SP's copies are a chip with LPAC's alone, fd6_compute.cc:119-127: on the A610 there is no second copy to
+    // differ, and the stream writes none)
+    if (!a6xx::kHasLpac) {
+        CHECK(!changed);
+        return;
     }
     CHECK(changed);
     Raw raw(r);
@@ -1187,10 +1198,14 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
     {
         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
         CHECK(e.ok);
-        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
+        // (its 96 units fit the A635's instruction cache of 127 and get none of it; the A610's holds 64, and there it
+        // is a kernel longer than the cache like the other)
+        const bool fits = kernels::chain160_air.instrlen <= a6xx::kInstrCacheSize;
+        CHECK_EQ(kernels::chain160_air.instrlen, 96u);
+        CHECK((e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1)) == fits);
         size_t before = 0, after = 0;
         labels(e, &before, &after);
-        CHECK_EQ(before + after, size_t(0));
+        CHECK_EQ(before + after, fits ? size_t(0) : size_t(2));
         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
         compute::Options cut;
         cut.preloadCap = 64;
