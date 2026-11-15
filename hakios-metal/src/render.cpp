@@ -3433,6 +3433,7 @@ struct DrawCache {
     struct Slot {
         uint64_t uid = 0;
         uint32_t keyId = StateCache::kNoKey;
+        uint32_t epoch = 0;             // the command buffer (EPOCH below) that has named and kept the state's two programs
         const ProgramState* state = nullptr;
     };
     // (as many as a frame has programs several times over: two programs in one slot find each other's state gone at
@@ -3453,8 +3454,24 @@ struct DrawCache {
     // a draw's facts, here rather than on the stack so that what they hold of the heap (a direct range's words) is kept
     ProgramFacts pf, pfSys;
     DrawFacts facts, factsSys;
-    pm4::Stream scratch;
+    pm4::Stream scratch, head, headSys;
     std::vector<uint8_t> staticKey;
+    // A command buffer that is done hands this to the queue's next one (CommandQueue::Spare): the frame after draws
+    // with the programs of the frame before, and finds each state here without asking the queue under its lock. What
+    // the slots hold stays good -- a state is a program's for as long as the program has that uid -- but the buffers
+    // its stages' words lie in are each submission's to name: EPOCH counts the command buffers, and a slot's says
+    // whether this one has named them.
+    uint32_t epoch = 0;
+    void begin() {
+        epoch++;
+        hands.clear();   // (a Program made by hand is its command buffer's: nothing is kept of one across them)
+        staticKey.clear();
+        if (kept.size() > 1024 || epoch == 0) {
+            for (Slot& s : slots) s = Slot{};
+            kept.clear();
+            epoch = 1;
+        }
+    }
 };
 
 namespace {
@@ -4188,6 +4205,62 @@ render::StateCache& CommandQueue::states() {
     return *states_;
 }
 
+// An open pass let go: as a new one -- every field what OpenPass{} gives it, whatever fields there are -- but for what
+// its streams, its shadows and its cache took from the heap, which the next pass writes into.
+void CommandBuffer::PassReturn::operator()(OpenPass* p) const {
+    if (p == nullptr) return;
+    if (queue == nullptr) {
+        delete p;
+        return;
+    }
+    RegShadow regs = std::move(p->regs), bodyRegs = std::move(p->bodyRegs);
+    pm4::Stream bodies = std::move(p->bodies), sysStream = std::move(p->sysStream), headGmem = std::move(p->headGmem);
+    std::vector<uint8_t> staticKey = std::move(p->staticKey);
+    std::shared_ptr<render::PassCache> cache = std::move(p->cache);
+    *p = OpenPass{};
+    regs.clear();
+    bodyRegs.clear();
+    bodies.clear();
+    sysStream.clear();
+    headGmem.clear();
+    staticKey.clear();
+    p->regs = std::move(regs);
+    p->bodyRegs = std::move(bodyRegs);
+    p->bodies = std::move(bodies);
+    p->sysStream = std::move(sysStream);
+    p->headGmem = std::move(headGmem);
+    p->staticKey = std::move(staticKey);
+    if (cache != nullptr && cache.use_count() == 1) {
+        *cache = render::PassCache{};
+        p->cache = std::move(cache);
+    }
+    queue->givePass(p);
+}
+
+CommandBuffer::OpenPassPtr CommandQueue::takePass() {
+    CommandBuffer::OpenPass* p = nullptr;
+    {
+        std::lock_guard<std::mutex> g(poolLock_);
+        if (!sparePasses_.empty()) {
+            p = sparePasses_.back();
+            sparePasses_.pop_back();
+        }
+    }
+    if (p == nullptr) p = new CommandBuffer::OpenPass();
+    return CommandBuffer::OpenPassPtr(p, CommandBuffer::PassReturn{this});
+}
+
+void CommandQueue::givePass(CommandBuffer::OpenPass* p) {
+    {
+        std::lock_guard<std::mutex> g(poolLock_);
+        if (sparePasses_.size() < 4) {
+            sparePasses_.push_back(p);
+            return;
+        }
+    }
+    delete p;
+}
+
 void CommandBuffer::verifyDraws(bool on) { render::gVerifyDraws = on; }
 bool CommandBuffer::keepStates(bool on) { return render::gKeepStates.exchange(on); }
 
@@ -4202,6 +4275,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     std::string why;
     if (drawCache_ == nullptr) drawCache_ = std::make_shared<render::DrawCache>();
     render::DrawCache& dc = *drawCache_;
+    if (!drawCacheBegun_) {
+        // (new, or the one the queue's last command buffer had: this buffer's from here)
+        drawCacheBegun_ = true;
+        dc.begin();
+    }
     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
     // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
     // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
@@ -4234,9 +4312,18 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         render::DrawCache::Slot& slot = dc.slots[(program.uid * 0x9e3779b97f4a7c15ull) >> (64 - render::DrawCache::kSlotBits)];
         if (slot.uid == program.uid && slot.keyId == keyId) {
             ps = slot.state;
+            if (slot.epoch != dc.epoch) {
+                // (kept from a command buffer before this one: its two stages' words are this submission's to name
+                // and keep as well)
+                slot.epoch = dc.epoch;
+                use(*ps->vsBuffer, false);
+                keep(ps->vsBuffer);
+                use(*ps->fsBuffer, false);
+                keep(ps->fsBuffer);
+            }
         } else if (std::shared_ptr<const render::ProgramState> found = queue_.states().find(program.uid, keyId)) {
             ps = found.get();
-            slot = render::DrawCache::Slot{program.uid, keyId, ps};
+            slot = render::DrawCache::Slot{program.uid, keyId, dc.epoch, ps};
             dc.kept.push_back(std::move(found));
             // (its two stages' words where the queue keeps them: named by the submission and kept until it is done, as
             // programAddress does for a program met the long way)
@@ -4420,8 +4507,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
     }
     Piece passTable;
-    pm4::Stream head, headSys;
-    std::shared_ptr<render::PassCache> opened;   // a new pass's
+    pm4::Stream& head = dc.head;
+    pm4::Stream& headSys = dc.headSys;
+    head.clear();
+    headSys.clear();
+    OpenPassPtr fresh;                            // a new pass, from the queue's spares
+    std::shared_ptr<render::PassCache> opened;   // ...and what is kept of it
     if (!joins) {
         if (!piece(render::kTableBytes, &passTable, &why)) {
             return fail(std::string("no memory for the pass's table: ") + why);
@@ -4440,7 +4531,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             return refuseWork(why);
         }
         // (encodeBegin took the pass: it has an attachment, and every one of them is one a pass can have)
-        opened = std::make_shared<render::PassCache>();
+        fresh = queue_.takePass();
+        if (fresh->cache == nullptr) fresh->cache = std::make_shared<render::PassCache>();
+        opened = fresh->cache;
         opened->keyId = keyId;
         const auto [W, H] = render::windowOf(pass);
         opened->W = W;
@@ -4554,14 +4647,15 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
                 }
             }
         }
-        open_ = std::make_unique<OpenPass>();
+        open_ = std::move(fresh);
         open_->pass = pass;
         open_->options = options;
         open_->table = passTable.gpuAddress();
         open_->cache = std::move(opened);
         if (dual) {
             appendDeduped(open_->sysStream, headSys, open_->regs);
-            open_->headGmem = std::move(head);
+            open_->headGmem.clear();
+            open_->headGmem.append(head.words().data(), head.size());
         } else if (options.dedupRegs) {
             appendDeduped(stream_, head, open_->regs);
         } else {
@@ -4934,6 +5028,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
     // names and keeps afresh)
     memset(other.recent_, 0, sizeof other.recent_);
     other.drawCache_.reset();
+    other.drawCacheBegun_ = false;
     other.uploaded_.clear();
     counts_.passes += other.counts_.passes;
     counts_.draws += other.counts_.draws;

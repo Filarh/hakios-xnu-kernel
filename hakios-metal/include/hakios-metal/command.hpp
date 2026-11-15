@@ -214,8 +214,8 @@ public:
     void setNullFsTextures(bool on) { nullFsTextures_ = on; }
     // why the last pass that could not be drawn in GMEM was not (gmemPlan's or gmemDrawOk's reason), empty when none was refused
     const std::string& gmemRefusal() const { return gmemWhy_; }
-    // the words recorded so far (what the command processor will read)
-    size_t streamWords() const { return stream_.words().size(); }
+    // the words recorded so far (what the command processor will read; once it is done, what it was given)
+    size_t streamWords() const { return streamWords_ != 0 ? streamWords_ : stream_.words().size(); }
     // (for the tests) every draw taken from a program's kept state checked against the same draw encoded in full: a
     // difference in a word of the stream or a byte of the draw's table ends the buffer in error, saying which
     static void verifyDraws(bool on);
@@ -357,7 +357,19 @@ private:
     };
     void closePass();
     void useAttachments(const RenderPass& pass);
-    std::unique_ptr<OpenPass> open_;
+    // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
+    // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
+    // again from nothing, a doubling at a time.
+    struct PassReturn {
+        // (constructors of its own: a member initializer here is no use to unique_ptr while CommandBuffer itself is still
+        // being defined, and the iOS SDK's libc++ then finds no default constructor for the deleter)
+        PassReturn() : queue(nullptr) {}
+        explicit PassReturn(CommandQueue* q) : queue(q) {}
+        CommandQueue* queue;
+        void operator()(OpenPass* p) const;
+    };
+    using OpenPassPtr = std::unique_ptr<OpenPass, PassReturn>;
+    OpenPassPtr open_;
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
     // GPU spent 3 us on it. A piece is the command buffer's: written once, used for writing, kept until completion.
@@ -388,12 +400,14 @@ private:
     std::unordered_multimap<const uint32_t*, Uploaded> uploaded_;
     // the programs this buffer has drawn with and its scratch for a draw (render.cpp: DrawCache), made at the first draw
     std::shared_ptr<render::DrawCache> drawCache_;
+    bool drawCacheBegun_ = false;     // drawCache_ is this buffer's (DrawCache::begin: it may be one the queue handed on)
     std::shared_ptr<Texture> null_;   // the queue's null texture, asked for once a buffer rather than once a draw
 
     CommandQueue& queue_;
     std::atomic<Status> status_{kNotEnqueued};
     std::string error_;
     pm4::Stream stream_;
+    size_t streamWords_ = 0;   // the stream's words when the buffer was done and its stream handed back (finish)
     std::vector<BoUse> uses_;
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
@@ -474,6 +488,20 @@ public:
     // what the queue keeps of the programs drawn with it, from one command buffer to the next (render.cpp: StateCache;
     // under its own lock)
     render::StateCache& states();
+    // What a command buffer that is done hands to the next: its stream and its lists, emptied, with the memory they
+    // grew to; and what it had at hand of the programs it drew with (render.cpp: DrawCache), which the next frame
+    // draws with again. And the open passes let go (CommandBuffer::PassReturn).
+    struct Spare {
+        pm4::Stream stream;
+        std::vector<BoUse> uses;
+        std::vector<std::shared_ptr<const Buffer>> kept;
+        std::vector<std::shared_ptr<const void>> keptAny;
+        std::shared_ptr<render::DrawCache> drawCache;
+    };
+    void giveSpare(Spare&& spare);
+    bool takeSpare(Spare* spare);
+    CommandBuffer::OpenPassPtr takePass();
+    void givePass(CommandBuffer::OpenPass* pass);
 
 
 private:
@@ -489,6 +517,8 @@ private:
     // (under poolLock_, a lock of its own: a command buffer gives its stamps back as it is destroyed, which can be under
     // lock_ -- the queue letting go of the last one in flight -- and lock_ there was the window server hung at boot)
     std::mutex poolLock_;
+    std::vector<Spare> spares_;                            // (under poolLock_) giveSpare's, a few
+    std::vector<CommandBuffer::OpenPass*> sparePasses_;    // (under poolLock_) givePass's, a few
     std::unordered_map<uint64_t, std::vector<std::shared_ptr<Buffer>>> freeBuffers_;   // by size: giveSlabs', giveBuffer's
     uint64_t freeBytes_ = 0;
     struct Resident { std::vector<uint32_t> words; std::shared_ptr<Buffer> buffer; };

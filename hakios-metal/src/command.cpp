@@ -442,6 +442,16 @@ void CommandBuffer::finish(Status s) {
     slab_.reset();
     queue_.giveSlabs(&slabs_);   // (done with: the GPU has finished with this buffer, or never had it)
     keptAny_.clear();
+    // (and what its stream and lists grew to, and the programs it had at hand, to the queue's next command buffer)
+    streamWords_ = stream_.size();
+    stream_.clear();
+    uses_.clear();
+    queue_.giveSpare(CommandQueue::Spare{std::move(stream_), std::move(uses_), std::move(kept_), std::move(keptAny_), std::move(drawCache_)});
+    stream_ = pm4::Stream{};
+    uses_.clear();
+    kept_.clear();
+    keptAny_.clear();
+    drawCache_.reset();
     {
         std::lock_guard<std::mutex> g(lock_);
         finished_ = true;
@@ -550,11 +560,36 @@ CommandQueue::~CommandQueue() {
         thread_.join();
     }
     idle_.clear();
+    for (CommandBuffer::OpenPass* p : sparePasses_) delete p;
+    sparePasses_.clear();
+    spares_.clear();
     gpu_.closeQueue(id_);
 }
 
 std::shared_ptr<CommandBuffer> CommandQueue::commandBuffer() {
-    return std::shared_ptr<CommandBuffer>(new CommandBuffer(*this));
+    std::shared_ptr<CommandBuffer> cb(new CommandBuffer(*this));
+    Spare spare;
+    if (takeSpare(&spare)) {
+        cb->stream_ = std::move(spare.stream);
+        cb->uses_ = std::move(spare.uses);
+        cb->kept_ = std::move(spare.kept);
+        cb->keptAny_ = std::move(spare.keptAny);
+        cb->drawCache_ = std::move(spare.drawCache);
+    }
+    return cb;
+}
+
+void CommandQueue::giveSpare(Spare&& spare) {
+    std::lock_guard<std::mutex> g(poolLock_);
+    if (spares_.size() < 4) spares_.push_back(std::move(spare));
+}
+
+bool CommandQueue::takeSpare(Spare* spare) {
+    std::lock_guard<std::mutex> g(poolLock_);
+    if (spares_.empty()) return false;
+    *spare = std::move(spares_.back());
+    spares_.pop_back();
+    return true;
 }
 
 std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
