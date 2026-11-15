@@ -163,10 +163,12 @@ metal_fps	u
 metal_gmem	u
 metal_gmem_draws	u
 metal_gmem_off	u
+metal_keep	u
 metal_luma_boost	u
 metal_m2v	u
 metal_skip	u
 metal_trace	u
+metal_verify	u
 metal_watch	u
 mic	k
 mic_adc	k

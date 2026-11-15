@@ -149,10 +149,12 @@ METAL_FPS	arg	metal_fps	User space	u	HakiosMetalCA.m	each draw of a sysmem pass 
 METAL_GMEM	arg	metal_gmem	User space	u	HakiosMetalCA.m	
 METAL_GMEM_DRAWS	arg	metal_gmem_draws	User space	u	HakiosMetalCA.m	GMEM for a pass whose like had at least N draws in the frame before (hakios_metal_cb_set_gmem_min_draws), sysmem for the rest; 56 when not given, 0
 METAL_GMEM_OFF	arg	metal_gmem_off	User space	u	HakiosMetalCA.m	
+METAL_KEEP	arg	metal_keep	User space	u	HakiosMetalCA.m	no draw is taken from what hakios-metal keeps of its program (hakios_metal_draw_states): each is judged and written whole
 METAL_LUMA_BOOST	arg	metal_luma_boost	User space	u	HakiosMetalCA.m	
 METAL_M2V	arg	metal_m2v	User space	u	HakiosMetalCA.m	
 METAL_SKIP	arg	metal_skip	User space	u	HakiosMetalCA.m	
 METAL_TRACE	arg	metal_trace	User space	u	HakiosMetalCA.m	
+METAL_VERIFY	arg	metal_verify	User space	u	HakiosMetalCA.m	
 METAL_WATCH	arg	metal_watch	User space	u	inject.c	
 MIC_ADC	arg	mic_adc	Audio and battery	k	hakios.mic.c	
 MIC_INPUT	arg	mic_input	Audio and battery	k	hakios.mic.c	
