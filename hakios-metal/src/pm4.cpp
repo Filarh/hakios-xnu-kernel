@@ -83,4 +83,11 @@ void Stream::packet(uint32_t opcode, const uint32_t* words, uint32_t count) {
     words_.insert(words_.end(), words, words + count);
 }
 
+uint32_t* Stream::open(uint32_t opcode, uint32_t count) {
+    command(opcode, count);
+    const size_t at = words_.size();
+    words_.resize(at + count);
+    return words_.data() + at;
+}
+
 }  // namespace hakios::metal::pm4

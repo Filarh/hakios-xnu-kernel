@@ -73,6 +73,11 @@ public:
     void indirect(uint64_t address, uint32_t words);
     // any type-7 packet: OPCODE with WORDS after its header (the compute dispatch's packets, compute.cpp)
     void packet(uint32_t opcode, const uint32_t* words, uint32_t count);
+    // ...whose COUNT words the caller writes itself, where they lie in the stream (zeros until then): the pointer holds
+    // until the next packet. A load of constants is its three words and then the constants, with no copy made to join them.
+    uint32_t* open(uint32_t opcode, uint32_t count);
+    // room for WORDS more, taken at once (a command buffer's stream grows to what the last one's was)
+    void reserve(size_t words) { words_.reserve(words_.size() + words); }
 
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }
