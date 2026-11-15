@@ -28,6 +28,8 @@ namespace hakios::metal::render {
 
 // The groups, in the order the command processor runs the pending ones (lowest id first: the phone's microcode, and
 // the order both witnesses rely on -- turnip's TU_DRAW_STATE_PROGRAM_CONFIG and fd6's FD6_GROUP_PROG_CONFIG are 0):
+//   kDsBarrier   a framebuffer fetch's barrier (below): CP_WAIT_FOR_IDLE, CACHE_INVALIDATE, CP_WAIT_FOR_IDLE. No state:
+//                an act, run before everything else of the draw it runs at, in tiles alone
 //   kDsPass      what the pass's attachments decide: RB_MRT's buffer registers, the depth buffer's, MSAA, RB_RENDER_CNTL, LRZ
 //   kDsProgram   HLSQ_INVALIDATE_CMD first (turnip's and fd6's program config: tu6_emit_program_config, setup_config_stateobj),
 //                then every register the two stages and their link decide, then the two ST6_SHADER preloads
@@ -40,7 +42,31 @@ namespace hakios::metal::render {
 //   kDsViewport  the viewport, the guardband, the Z clamps, the two scissors (a group of their own: 21 words of the
 //                rasterizer's 49, and the ones a draw with a viewport of its own changes)
 //   kDsBlend     blending, depth and stencil
-enum DrawStateGroup : uint32_t { kDsPass = 0, kDsProgram = 1, kDsVertex = 2, kDsLoads = 3, kDsRaster = 4, kDsViewport = 5, kDsBlend = 6, kDsGroups = 7 };
+enum DrawStateGroup : uint32_t {
+    kDsBarrier = 0, kDsPass = 1, kDsProgram = 2, kDsVertex = 3, kDsLoads = 4, kDsRaster = 5, kDsViewport = 6, kDsBlend = 7, kDsGroups = 8,
+};
+
+// A framebuffer fetch's barrier. A draw whose fragment stage reads its target in a tile reads the bin through the
+// texture caches, in raster order by GRAS_SC_CNTL.SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP as both witnesses order it
+// (fd6 build_prim_mode, fd6_emit.cc:533-555; turnip, tu_pipeline.cc:4468-4500). The rasterizer orders it after the
+// fetching draws before it and knows nothing of draws that ran without the mode, so the first fetching draw after
+// one that did not fetch is recorded with a barrier before it: wait for idle, drop the texture caches, wait
+// (render.cpp: encodeDraw). In the plain stream that barrier is three packets every tile runs as it walks past,
+// whether the tile draws any of the fetching draws or not: 102 tiles x 27 such places were 5 568 waits for idle a
+// frame.
+//   kDsFetchGroup    the barrier is a draw-state group of its own, set DIRTY by the draw it was recorded before and
+//                    let go by the first draw after that run of fetching draws that does not fetch. Pending from the
+//                    one to the other, it runs at the first draw of the run that a tile draws -- which is where a
+//                    tile needs it -- and in no tile that draws none of them. (The microcode runs a group's packets
+//                    through its one packet table and waits for the waits a group left pending before the draw.)
+//                    The barrier each tile had before its draws, for the caches the tile before left, goes: the
+//                    first fetch a tile draws has this one.
+//   kDsFetchInline   in the stream itself, before the draw's groups are set, as recorded
+//   kDsFetchOrdered  no barrier at all between draws: every draw of the pass runs FLUSH_PER_OVERLAP, fetching or not,
+//                    so the rasterizer has every primitive to order a fetch after (GRAS_SC_CNTL rewritten in the
+//                    recorded draws); each tile keeps the barrier before its draws. Not what either witness does, and
+//                    what it costs the draws that do not fetch is unmeasured: the bisect's alternative.
+enum DrawStateFetch : uint32_t { kDsFetchGroup = 0, kDsFetchInline = 1, kDsFetchOrdered = 2 };
 
 struct DrawStates {
     // Packets to run once, before the binning pass: the copies of constants bound off a 16-byte boundary into the
@@ -55,13 +81,14 @@ struct DrawStates {
     std::vector<uint32_t> list;
     std::vector<uint32_t> relocs;   // the indices in LIST of each entry's ADDR_LO word
     uint32_t draws = 0, entries = 0, fragments = 0;   // draws listed, groups set over them all, fragments written
+    uint32_t barriers = 0;          // barriers made a group's (kDsFetchGroup): the tiles then need none before their draws
     // the fragments now at GPU address BLOBS_ADDRESS: LIST's entries point there
     void place(uint64_t blobsAddress);
 };
 
 // BODY's WORDS as draw-state groups, each for the modes MODES names (CP_SET_DRAW_STATE__0_BINNING | _GMEM | _SYSMEM);
 // false, with *OUT unspecified, when the stream holds something this does not know how to move into a group (the pass
-// is then drawn from the stream as it is). TWIN: the fake's twins (Options::gmemTwin).
-bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* out, uint8_t twin = 0);
+// is then drawn from the stream as it is). FETCH: a DrawStateFetch. TWIN: the fake's twins (Options::gmemTwin).
+bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* out, uint8_t twin = 0, uint32_t fetch = kDsFetchGroup);
 
 }  // namespace hakios::metal::render

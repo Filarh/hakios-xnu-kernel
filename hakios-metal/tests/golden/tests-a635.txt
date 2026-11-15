@@ -139,10 +139,10 @@ a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submit
 a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 17db46b630d582d5 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
 a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 6c62378d52407e41 state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
 a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream e1fb977932e98a2d state 6a704e6fd77244ca names 8 2e72016e06717bd7
-a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43766 draws 288 loads 936 stream aa9933ba494f591d state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
+a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43862 draws 288 loads 936 stream 7821e568e6a81941 state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
 the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        39692 draws taken, 26778 of them from a kept state; 6388 refused
-random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 9916716 draws 81284 loads 233776 stream bf307e81309087cd state 770230a57fb4e26d names 39702 496ebe5110dc271a
+random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 9917280 draws 81284 loads 233776 stream c150df51c576c63d state 770230a57fb4e26d names 39702 496ebe5110dc271a
 more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream 52ca32fc2f9646cd state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
 end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
@@ -270,18 +270,20 @@ gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11
 a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 4aba82bef7c44036 state 179f28010791cba5 names 20 8e8d1b2d6669327e
 a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 41847c8a56cf0cf3 state b2db15d81d80c4dd names 8 05d20adef5c3adcc
 a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 636ff9ea866da3b2 state 29f464ce110bdd85 names 32 17482b7bd70eb730
-a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams submits 2 words 4080 draws 24 loads 16 stream 5cfdf777d5cc976c state 29f464ce110bdd85 names 10 943c5dc4edf77a16
-a_visibility_stream_overflow_turns_the_binning_off submits 3 words 5690 draws 33 loads 34 stream ea57874d5b57dcd8 state 02baaf7f8c6b344c names 14 8663c6b799261a67
+a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams submits 2 words 4080 draws 24 loads 16 stream 488a7b8ecf72d49c state 29f464ce110bdd85 names 10 943c5dc4edf77a16
+a_visibility_stream_overflow_turns_the_binning_off submits 3 words 5690 draws 33 loads 34 stream 5fa555f381d09b78 state 02baaf7f8c6b344c names 14 8663c6b799261a67
 each_profiled_pass_says_why_it_was_drawn_in_sysmem submits 3 words 1867 draws 3 loads 6 stream b911ba4b51bf9332 state 6daed77ff6dca4f4 names 15 453446a64590f0dd
 a_binned_tile_runs_the_draws_its_streams_name_and_skips_the_rest submits 1 words 7383 draws 63 loads 189 stream f1064639a865377e state 0ad3bb16f5dd291c names 13 a4875359d8b88f52
-       6 tiles: plain 7383 words, 3121 registers, 259 loads; groups 7994 words (6055 in groups), 4074 registers, 124 loads, 5 buffers left early
-draw_state_groups_give_each_draw_that_runs_the_state_the_plain_stream_gives_it submits 3 words 37729 draws 189 loads 567 stream e61e0f15a37c69ce state e8636343f66c9070 names 39 ed95fa0d8a29adf6
-the_twins_of_the_draw_state_groups_show submits 7 words 57942 draws 294 loads 875 stream 857358c36503bd17 state ed4eb83d067cc000 names 73 5f713a13f198bf57
-bins_laid_from_the_render_areas_corner_are_not_the_vscs submits 2 words 3273 draws 10 loads 10 stream ef165282f7375ac0 state 16abf57547b8731c names 10 92ae1a2586e14416
-a_pass_gives_gmem_to_the_attachments_its_draws_touch submits 8 words 59260 draws 184 loads 316 stream 9899b3e20e3de38f state 0d69f2a311459f55 names 42 ff850aa65d41c62c
+       6 tiles: plain 7383 words, 3121 registers, 259 loads; groups 8004 words (6071 in groups), 4074 registers, 124 loads, 5 buffers left early
+draw_state_groups_give_each_draw_that_runs_the_state_the_plain_stream_gives_it submits 3 words 37777 draws 189 loads 567 stream 7dffb0b11512732e state e8636343f66c9070 names 39 ed95fa0d8a29adf6
+the_twins_of_the_draw_state_groups_show submits 7 words 58014 draws 294 loads 875 stream 9660026aee9327c1 state ed4eb83d067cc000 names 73 5f713a13f198bf57
+bins_laid_from_the_render_areas_corner_are_not_the_vscs submits 2 words 3273 draws 10 loads 10 stream 3a4ca9e10277ee48 state 16abf57547b8731c names 10 92ae1a2586e14416
+a_pass_gives_gmem_to_the_attachments_its_draws_touch submits 8 words 59260 draws 184 loads 316 stream f08dcca49799a8f7 state 0d69f2a311459f55 names 42 ff850aa65d41c62c
 a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+       6 tiles: waits for idle with the barrier a group 26, in the stream 34, the plain stream 34, every draw ordered 20
+a_fetchs_barrier_runs_where_a_tile_draws_the_fetch submits 5 words 32124 draws 140 loads 364 stream d6010da6d4114db3 state fb1d6719dced4b65 names 30 7b3e8fd04d1dff98
 draw_states_keep_each_groups_registers_whole submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
-the_fake_runs_draw_state_groups_as_the_microcode_does submits 5 words 2998 draws 7 loads 10 stream c69c055cd24dea92 state 16abf57547b8731c names 0 0000000000000000
+the_fake_runs_draw_state_groups_as_the_microcode_does submits 5 words 2998 draws 7 loads 10 stream c6e4035cd28b9ccf state 16abf57547b8731c names 0 0000000000000000
 texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_make_lays_the_memory_out_and_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_replace_and_read_convert_the_callers_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

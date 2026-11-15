@@ -492,7 +492,8 @@ struct Options {
                                  // before the tile's CP_SET_BIN_DATA5, which clears it, 4 the groups not let go between tiles,
                                  // 5 the bins from the render area's corner instead of the window's origin, 6 an attachment no
                                  // draw touched left with the RB_MRT_BASE_GMEM its draws were recorded with when the bins grow
-                                 // over it (gmemTouched); 0 the stream as it is meant)
+                                 // over it (gmemTouched), 7 a fetch's barrier let go at the next draw though that one fetches
+                                 // too; 0 the stream as it is meant)
     uint8_t rotate2d = 0;        // encodeBlit's RB_2D_BLIT_CNTL.ROTATE (a6xx_rotation: 0, 90, 180, 270, hflip, vflip as 0..5);
                                  // a quarter turn takes a destination rectangle of the source's sides swapped
 };
@@ -578,8 +579,10 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
 // BODY: what the draws' words are, of a binned pass -- kGmemBodyGroups: draw-state groups and draws (gmem.hpp), the
 // groups let go after the binning pass and after each tile's draws as fd6 lets its own go (emit_binning_pass,
 // fd6_emit_tile_gmem2mem); kGmemBodyLeave: each tile leaves them once its visibility streams name no more draws
-// (CP_SKIP_IB2_ENABLE_LOCAL beside _GLOBAL, written after the tile's CP_SET_BIN_DATA5, which clears it)
-enum : uint32_t { kGmemBodyGroups = 1, kGmemBodyLeave = 2 };
+// (CP_SKIP_IB2_ENABLE_LOCAL beside _GLOBAL, written after the tile's CP_SET_BIN_DATA5, which clears it);
+// kGmemBodyBarriers: the draws that fetch carry their barrier as a group (gmem.hpp: kDsFetchGroup), so a tile has none
+// before its draws
+enum : uint32_t { kGmemBodyGroups = 1, kGmemBodyLeave = 2, kGmemBodyBarriers = 4 };
 void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, uint64_t bodies, uint32_t bodyWords, uint64_t table, const Options& o,
                 uint32_t load, uint32_t store, bool fetch, uint32_t clear = 0, const uint32_t (*clearWords)[4] = nullptr, uint64_t vsc = 0,
                 uint32_t body = 0);

@@ -542,6 +542,7 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
                                uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT)) << 21;
         // (the bin by GMEM's own GPU address, kGmemBase: where the kernel maps GMEM for the texture unit, 0x100000 on the
         // Adreno 610 and 0 on the 7c+ -- turnip adds the device's gmem_base to the offset, tu_emit_input_attachments)
+        drawReadsGmem_ = true;
         if (pitch != uint64_t(binW) * bpp || base < kGmemBase || base - kGmemBase + uint64_t(binW) * binH * bpp > cache ||
             fieldOf(d[2], A6XX_TEX_CONST_2_TYPE__MASK, A6XX_TEX_CONST_2_TYPE__SHIFT) != A6XX_TEX_2D ||
             fieldOf(d[5], A6XX_TEX_CONST_5_DEPTH__MASK, A6XX_TEX_CONST_5_DEPTH__SHIFT) != 1) {
@@ -1230,6 +1231,7 @@ bool FakeGpu::eventBlit() {
 // nothing, and a fault here stands for either. Nothing is rasterized.
 bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     using namespace a6xx;
+    drawReadsGmem_ = false;
     if (count != 3 && count != 7) {
         fault(text("CP_DRAW_INDX_OFFSET of %llu words: the 3-word auto-indexed form and the 7-word indexed one are what this GPU model runs", count));
         return false;
@@ -1924,6 +1926,17 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             return false;
         }
     }
+    // a framebuffer fetch in a tile, and what the texture caches hold of the bin (fake_gpu.hpp)
+    if (inTile_) {
+        if (drawReadsGmem_ && gmemCachesStale_) {
+            fault("a draw reads its target's bin through texture caches that are stale: since the tile began, or since a draw the rasterizer was not "
+                  "ordering, no CP_WAIT_FOR_IDLE and CACHE_INVALIDATE came before it");
+            return false;
+        }
+        if (fieldOf(reg(REG_A6XX_GRAS_SC_CNTL), A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK, A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT) == NO_FLUSH) {
+            gmemCachesStale_ = true;
+        }
+    }
     stats_.draws++;
     drawsInSubmission_++;
     drawsWithoutCcuFlush_++;
@@ -2132,9 +2145,13 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
             // a draw-state group holds what both witnesses put in theirs and this driver in its own: register writes
             // and CP_LOAD_STATE6. Whatever else the microcode would run there, nothing here was written to be run so.
             stats_.sdsWords += 1 + h.count;
+            // (...and a framebuffer fetch's barrier: CP_WAIT_FOR_IDLE and the CACHE_INVALIDATE event, which the microcode
+            // runs from a group as from the stream, waiting out a group's waits before the draw)
+            const bool barrier = h.kind == pm4::Header::kCommand && (h.opcode == pm4::kWaitForIdle ||
+                                 (h.opcode == CP_EVENT_WRITE && h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == CACHE_INVALIDATE));
             if (h.kind == pm4::Header::kCommand && h.opcode != pm4::kNop && h.opcode != CP_LOAD_STATE6_FRAG && h.opcode != CP_LOAD_STATE6_GEOM &&
-                h.opcode != CP_LOAD_STATE6) {
-                fault(text("opcode 0x%02llx in a draw-state group: register writes and CP_LOAD_STATE6 are what a group holds", h.opcode));
+                h.opcode != CP_LOAD_STATE6 && !barrier) {
+                fault(text("opcode 0x%02llx in a draw-state group: register writes, CP_LOAD_STATE6 and a fetch's barrier are what a group holds", h.opcode));
                 return false;
             }
         }
@@ -2272,6 +2289,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     binning_ = false;
                     tileReset();
                     tileStreams_ = false;
+                    gmemCachesStale_ = true;
                     tileOrdinal_ = tilesInSubmission_++;
                     drawOrdinal_ = 0;
                     stats_.tiles++;
@@ -2443,6 +2461,10 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 // RB_SAMPLE_COUNT_CONTROL.COPY asks for it (turnip's occlusion query, A6XX path)
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == BLIT && !eventBlit()) {
                     return false;
+                }
+                // (the texture caches dropped once everything before has landed: what a fetch reads of its bin is the bin)
+                if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == CACHE_INVALIDATE && lastWasWfi_) {
+                    gmemCachesStale_ = false;
                 }
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == ZPASS_DONE) {
                     if ((reg(REG_A6XX_RB_SAMPLE_COUNT_CONTROL) & A6XX_RB_SAMPLE_COUNT_CONTROL_COPY) == 0) {

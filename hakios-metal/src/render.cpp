@@ -2814,7 +2814,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             // A framebuffer fetch reads GMEM through the texture caches, which still hold what the last tile's fetches
             // read at the same GMEM addresses (probe "GMEM: framebuffer fetch": 9221 pixels of 24 tiles from the tile
             // before): dropped once a tile, the loads waited for first
-            if (fetch) {
+            // (not when the fetching draws carry their barrier as a group: the first of them a tile draws has it)
+            if (fetch && !(groups && (body & kGmemBodyBarriers))) {
                 stream.waitForIdle();
                 event(stream, CACHE_INVALIDATE);
             }
@@ -4823,9 +4824,10 @@ void CommandBuffer::closePass() {
         uint32_t perPipeX = 1, perPipeY = 1;
         const bool binned = (open_->options.gmemBinning || gmemBinning_) && queue_.binningOk() && render::gmemPipes(plan, &perPipeX, &perPipeY);
         render::DrawStates groups;
+        const uint32_t fetchBy = gmemOff_ & kGmemAllOrdered ? render::kDsFetchOrdered : gmemOff_ & kGmemInlineBarriers ? render::kDsFetchInline : render::kDsFetchGroup;
         const bool grouped = binned && !(gmemOff_ & kGmemPlainBody) &&
                              render::drawStates(body.data(), body.size(), a6xx::CP_SET_DRAW_STATE__0_BINNING | a6xx::CP_SET_DRAW_STATE__0_GMEM, &groups,
-                                                open_->options.gmemTwin);
+                                                open_->options.gmemTwin, fetchBy);
         const size_t ibWords = grouped ? groups.blobs.size() + groups.list.size() : w.size();
         if (!piece(4 * ibWords, &ib, &why)) {
             // (the draws were encoded for tiles: they cannot run in sysmem instead)
@@ -4893,7 +4895,10 @@ void CommandBuffer::closePass() {
             }
         }
         render::encodeGmem(tiles, open_->pass, plan, bodyAt, bodyWords, open_->table, open_->options, load, store, open_->read != 0, open_->clears,
-                           open_->clearWords, vsc, grouped ? render::kGmemBodyGroups | (gmemOff_ & kGmemNoLeave ? 0u : render::kGmemBodyLeave) : 0u);
+                           open_->clearWords, vsc,
+                           grouped ? render::kGmemBodyGroups | (gmemOff_ & kGmemNoLeave ? 0u : render::kGmemBodyLeave) |
+                                         (groups.barriers != 0 ? render::kGmemBodyBarriers : 0u)
+                                   : 0u);
         appendStream(stream_, tiles);
         counts_.gmemPasses++;
         if (vsc != 0) counts_.binnedPasses++;
