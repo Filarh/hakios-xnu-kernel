@@ -5282,6 +5282,8 @@ void CommandBuffer::closePass() {
             profiled_.back().attached = attached;
             profiled_.back().touched = uint16_t(((open_->written | open_->read) & 0xffu) | (open_->read != 0 ? kPassReads : 0u) | (belowBar ? kPassBelowBar : 0u) |
                                                 (load == 0 ? kPassNoLoad : 0u));
+            profiled_.back().wrote = uint8_t(open_->written);
+            profiled_.back().read = uint8_t(open_->read);
         }
     }
     {

@@ -5824,10 +5824,15 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 					hm_print("passes: %d passes, %.2f ms on the GPU\n", n, total / 1e3);
 					for (int i = 0; i < n; i++) {
 						hakios_metal_cb_pass_time(cb, (unsigned)i, &kind, &width, &height, &draws, &us);
-						unsigned attached = 0, touched = 0;
+						unsigned attached = 0, touched = 0, wrote = 0, read = 0;
 						hakios_metal_cb_pass_attachments(cb, (unsigned)i, &attached, &touched);
-						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x %.3f ms\n", i, kind, width, height,
-							 draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, us / 1e3);
+						hakios_metal_cb_pass_access(cb, (unsigned)i, &wrote, &read);
+						/* (a tiled pass's attachments: those set, those its draws write or read -- TOUCHED's low byte, with why
+						 * it was tiled above it -- and the two apart: written by a fragment stage's output, read by a fetch) */
+						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x %.3f ms%s%s\n", i, kind,
+							 width, height, draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, wrote, read, us / 1e3,
+							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)[0] != 0 ? " sysmem: " : "",
+							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i));
 					}
 				}
 			}
