@@ -159,6 +159,7 @@ METAL_TRACE_CBS	arg	metal_trace_cbs	User space	u	HakiosMetalCA.m
 METAL_TRACE_DIR	arg	metal_trace_dir	User space	u	HakiosMetalCA.m	
 METAL_TRACE_EVERY	arg	metal_trace_every	User space	u	HakiosMetalCA.m	
 METAL_VERIFY	arg	metal_verify	User space	u	HakiosMetalCA.m	
+METAL_WARMUP	arg	metal_warmup	User space	u	HakiosMetalCA.m	
 METAL_WATCH	arg	metal_watch	User space	u	inject.c	
 MIC_ADC	arg	mic_adc	Audio and battery	k	hakios.mic.c	
 MIC_INPUT	arg	mic_input	Audio and battery	k	hakios.mic.c	

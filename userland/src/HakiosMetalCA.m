@@ -2784,6 +2784,31 @@ hm_dump_refused(const char *label, id function)
 	hm_dump_function(label, function, "metal_dump=refused", NULL, 0);
 }
 
+/*
+ * Nothing compiled in use. Every stage and kernel the core compiles, or finds in the cache, leaves its recipe there
+ * (hakios-metal compiler.hpp: warmUp): the bitcode, the constants, and for CoreAnimation's generic uber shader the bytes
+ * of its configuration the compilation read. Here, as the device is made -- in the window server before it draws its
+ * first frame, with the boot screen still up -- every recipe whose result this build has not filed is compiled, in
+ * this thread, one after the other: after a driver whose compiler changed (a new cache key), what the window server
+ * compiled before is compiled again now and not when the interface first asks for it. With everything filed it is a
+ * look at each recipe and its stage's file: milliseconds. What no recipe holds yet (a pipeline first made in use) is
+ * compiled when it is asked for and leaves its recipe for the next start. Boot-arg metal_warmup=0: not run.
+ */
+static void
+hm_warm_up(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	hakios_metal_warmup_report r;
+
+	if (!hakios_metal_has_compiler() || (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_warmup=0") != NULL)) {
+		return;
+	}
+	hakios_metal_warmup(&r);
+	hm_print("warm-up: %u recipes, %u filed already, %u compiled in %.0f ms, %u failed, %.0f ms in all%s%s\n", r.recipes, r.cached, r.compiled,
+		 r.compile_milliseconds, r.failed, r.milliseconds, r.first_failure[0] != 0 ? "; first failure: " : "", r.first_failure);
+}
+
 @implementation HakiosMetalDevice
 
 /* Declared at +load because Metal loads this bundle and is therefore already in the process; -initWithAcceleratorPort:
@@ -3279,6 +3304,7 @@ hm_boot_arg_set(const char *what)
 		 [_name UTF8String], (unsigned)port,
 		 hakios_metal_has_compiler() ? "in this build" : "NOT in this build (make ios MESA=1): every pipeline will be refused",
 		 _targetName);
+	hm_warm_up();
 	return self;
 }
 

@@ -258,6 +258,18 @@ hakios_metal_device* hakios_metal_open_fake(void) { return deviceOn(std::make_un
 
 void hakios_metal_close(hakios_metal_device* d) { delete d; }
 
+void hakios_metal_warmup(hakios_metal_warmup_report* out) {
+    const WarmUpReport r = warmUp();
+    *out = hakios_metal_warmup_report{};
+    out->recipes = r.recipes;
+    out->cached = r.cached;
+    out->compiled = r.compiled;
+    out->failed = r.failed;
+    out->milliseconds = r.milliseconds;
+    out->compile_milliseconds = r.compileMilliseconds;
+    snprintf(out->first_failure, sizeof(out->first_failure), "%s", r.firstFailure.c_str());
+}
+
 uint64_t hakios_metal_gpu_id(hakios_metal_device* d) { return d->gpu->chipId(); }
 
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }

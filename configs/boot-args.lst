@@ -173,6 +173,7 @@ metal_trace_cbs	u
 metal_trace_dir	u
 metal_trace_every	u
 metal_verify	u
+metal_warmup	u
 metal_watch	u
 mic	k
 mic_adc	k
