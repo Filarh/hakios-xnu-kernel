@@ -168,6 +168,9 @@ metal_luma_boost	u
 metal_m2v	u
 metal_skip	u
 metal_trace	u
+metal_trace_cbs	u
+metal_trace_dir	u
+metal_trace_every	u
 metal_verify	u
 metal_watch	u
 mic	k

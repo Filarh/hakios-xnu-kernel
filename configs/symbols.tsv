@@ -153,7 +153,10 @@ METAL_KEEP	arg	metal_keep	User space	u	HakiosMetalCA.m	no draw is taken from wha
 METAL_LUMA_BOOST	arg	metal_luma_boost	User space	u	HakiosMetalCA.m	
 METAL_M2V	arg	metal_m2v	User space	u	HakiosMetalCA.m	
 METAL_SKIP	arg	metal_skip	User space	u	HakiosMetalCA.m	
-METAL_TRACE	arg	metal_trace	User space	u	HakiosMetalCA.m	
+METAL_TRACE	arg	metal_trace	User space	u	HakiosMetalCA.m	the tex line, the first time a recorded command buffer names this texture
+METAL_TRACE_CBS	arg	metal_trace_cbs	User space	u	HakiosMetalCA.m	
+METAL_TRACE_DIR	arg	metal_trace_dir	User space	u	HakiosMetalCA.m	
+METAL_TRACE_EVERY	arg	metal_trace_every	User space	u	HakiosMetalCA.m	
 METAL_VERIFY	arg	metal_verify	User space	u	HakiosMetalCA.m	
 METAL_WATCH	arg	metal_watch	User space	u	inject.c	
 MIC_ADC	arg	mic_adc	Audio and battery	k	hakios.mic.c	
