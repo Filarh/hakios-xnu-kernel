@@ -168,6 +168,7 @@ metal_gmem_off	u
 metal_keep	u
 metal_m2v	u
 metal_nocopy	u
+metal_samples	u
 metal_skip	u
 metal_spec_mask	u
 metal_swizzle	u

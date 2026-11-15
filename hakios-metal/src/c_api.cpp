@@ -1051,6 +1051,17 @@ int hakios_metal_cb_pass_tiles(hakios_metal_cb* cb, unsigned i) {
     return i < t.size() ? int(t[i].tiles) : -1;
 }
 
+void hakios_metal_cb_set_profile_samples(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setProfileSamples(on != 0); });
+    cb->cb->setProfileSamples(on != 0);
+}
+
+long long hakios_metal_cb_pass_samples(hakios_metal_cb* cb, unsigned i) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    return i < t.size() ? (long long)t[i].samples : -1;
+}
+
 int hakios_metal_cb_refuse(hakios_metal_cb* cb, const char* why) {
     if (deferring(cb)) {
         std::string w = why != nullptr ? why : "refused";
