@@ -1548,6 +1548,9 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
     out->program.fsIboBase = fs->iboBase;
     out->program.ssboWrites = uint8_t((vs->writesMemory ? 1 : 0) | (fs->writesMemory ? 2 : 0));
     out->program.name = out->name.c_str();
+    // (what CommandBuffer::draw knows it by from now on: the stages it points into are this object's, and nothing changes
+    // it but the C interface's setters, each of which gives it another)
+    out->program.uid = newProgramUid();
     return out;
 }
 

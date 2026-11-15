@@ -843,6 +843,21 @@ a6xx::TexConst Texture::sampledDescriptor() const {
     return d;
 }
 
+const uint32_t* Texture::sampledWords() const {
+    if (sampledState_.load(std::memory_order_acquire) == 2) return sampledWords_;
+    const a6xx::TexConst d = sampledDescriptor();
+    uint8_t none = 0;
+    if (sampledState_.compare_exchange_strong(none, 1)) {
+        memcpy(sampledWords_, d.dword, sizeof sampledWords_);
+        sampledState_.store(2, std::memory_order_release);
+    } else {
+        // (another thread is writing the same sixteen words: until it has)
+        while (sampledState_.load(std::memory_order_acquire) != 2) {
+        }
+    }
+    return sampledWords_;
+}
+
 a6xx::TexConst Texture::levelDescriptor(uint32_t level) const {
     const TextureLevel L = this->level(level);
     a6xx::TexConst d = texture2d(levelAddress(level), L.width, L.height, uint32_t(L.pitch), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),

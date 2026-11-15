@@ -39,12 +39,18 @@ $(OUT)/drawbench: $(CORE_O) $(OUT)/obj/tools/drawbench.o
 	$(CXX) $(OPT) -pthread -o $@ $^
 
 # the golden streams: every scene of drawbench and every test's submissions, word for word what they were when
-# tests/golden/ was written (drawbench --golden, tests --golden)
+# tests/golden/ was written (drawbench --golden, tests --golden), with the draws taken from their programs' kept states
+# (each checked against the long way as it is taken, and again with no such check: --unchecked, the driver as a device
+# runs it) and with every draw written whole (--long)
 check: $(OUT)/tests $(OUT)/drawbench
 	$(OUT)/tests > $(OUT)/tests.log 2>&1; tail -1 $(OUT)/tests.log; grep -q ' 0 failed checks' $(OUT)/tests.log
 	$(OUT)/drawbench --golden | diff -u tests/golden/drawbench-$(CHIP).txt -
 	$(OUT)/tests --golden | diff -u tests/golden/tests-$(CHIP).txt -
-	@echo "golden streams: the same ($(CHIP))"
+	$(OUT)/drawbench --golden --long | diff -u tests/golden/drawbench-$(CHIP).txt -
+	$(OUT)/tests --golden --long 2>/dev/null | diff -u tests/golden/tests-$(CHIP).txt -
+	$(OUT)/tests --unchecked > $(OUT)/tests-unchecked.log 2>&1; tail -1 $(OUT)/tests-unchecked.log; grep -q ' 0 failed checks' $(OUT)/tests-unchecked.log
+	$(OUT)/tests --golden --unchecked | diff -u tests/golden/tests-$(CHIP).txt -
+	@echo "golden streams: the same -- from kept states (each draw checked, and unchecked) and written whole ($(CHIP))"
 golden: $(OUT)/tests $(OUT)/drawbench
 	@mkdir -p tests/golden
 	$(OUT)/drawbench --golden > tests/golden/drawbench-$(CHIP).txt

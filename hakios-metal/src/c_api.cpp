@@ -925,6 +925,11 @@ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb* cb, int on) {
     cb->cb->setNullFsTextures(on != 0);
 }
 
+void hakios_metal_draw_states(int keep, int verify) {
+    CommandBuffer::keepStates(keep != 0);
+    CommandBuffer::verifyDraws(verify != 0);
+}
+
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setProfileDraws(on != 0); });
     cb->cb->setProfileDraws(on != 0);
@@ -1179,6 +1184,7 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     p->program.blend = was.blend;
     for (uint32_t i = 0; i + 1 < kMaxColorOutputs; i++) p->program.moreBlend[i] = was.moreBlend[i];
     p->program.samples = was.samples;
+    p->program.uid = newProgramUid();   // (changed after the link: another program to a draw)
     auto* r = new hakios_metal_program;
     r->program = std::move(p);
     r->color = base->color;
@@ -1224,6 +1230,7 @@ hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const St
     out->program.fsIboBase = out->fs->iboBase;
     out->program.ssboWrites = uint8_t((out->vs->writesMemory ? 1 : 0) | (out->fs->writesMemory ? 2 : 0));
     out->program.name = out->name.c_str();
+    out->program.uid = newProgramUid();
     auto* r = new hakios_metal_program;
     r->program = std::move(out);
     r->color = colorPixelFormat;
@@ -1292,6 +1299,7 @@ int hakios_metal_program_set_vertex_attribute(hakios_metal_program* p, unsigned 
         return -1;
     }
     p->program->program.vertexDescriptor.attributes[index] = VertexAttribute{VertexFormat(format), offset, bufferIndex};
+    p->program->program.uid = newProgramUid();   // (changed: what a draw kept of it is not this program's)
     return 0;
 }
 
@@ -1301,6 +1309,7 @@ int hakios_metal_program_set_vertex_layout(hakios_metal_program* p, unsigned buf
         return -1;
     }
     p->program->program.vertexDescriptor.layouts[bufferIndex] = VertexLayout{stride, VertexStep(stepFunction), stepRate};
+    p->program->program.uid = newProgramUid();
     return 0;
 }
 
@@ -1315,6 +1324,7 @@ int hakios_metal_program_set_samples(hakios_metal_program* p, unsigned samples) 
         return -1;
     }
     p->program->program.samples = samples;
+    p->program->program.uid = newProgramUid();
     return 0;
 }
 
@@ -1326,6 +1336,7 @@ int hakios_metal_program_set_blend_at(hakios_metal_program* p, unsigned index, i
     }
     const ColorBlend b{enabled != 0, rgbOp, alphaOp, srcRgb, dstRgb, srcAlpha, dstAlpha, writeMask};
     (index == 0 ? p->program->program.blend : p->program->program.moreBlend[index - 1]) = b;
+    p->program->program.uid = newProgramUid();
     return 0;
 }
 

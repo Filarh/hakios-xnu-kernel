@@ -1,21 +1,29 @@
 #include <cstring>
 
 #include "golden.hpp"
+#include "hakios-metal/command.hpp"
 #include "test.hpp"
 
-// tests [--golden] [NAME]: every test whose name holds NAME. With --golden, instead of the verdicts, what each test
-// submitted to the fake GPU, summed (golden.hpp): a line a test, compared with tests/golden/tests-<chip>.txt by
-// `make -f tools/dev.mk check`.
+// tests [--golden] [--long] [NAME]: every test whose name holds NAME. With --golden, instead of the verdicts, what each
+// test submitted to the fake GPU, summed (golden.hpp): a line a test, compared with tests/golden/tests-<chip>.txt by
+// `make -f tools/dev.mk check`. With --long no draw is taken from a program's kept state (CommandBuffer::keepStates):
+// the sums are the same, which check holds them to (the tests that count the draws so taken fail then, as they should).
+// With --unchecked the draws taken from kept states are not each checked against the long way (CommandBuffer::
+// verifyDraws): the driver as a device runs it, with the tests' own verdicts and the same sums.
 int main(int argc, char** argv) {
     int ran = 0;
-    bool sums = false;
+    bool sums = false, checked = true;
     const char* only = nullptr;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--golden") == 0) sums = true;
+        else if (strcmp(argv[i], "--long") == 0) hakios::metal::CommandBuffer::keepStates(false);
+        else if (strcmp(argv[i], "--unchecked") == 0) checked = false;
         else only = argv[i];
     }
     golden::Sums s;
     if (sums) golden::sumInto(&s);
+    // every draw the tests make from a program's kept state is checked against the same draw encoded in full
+    hakios::metal::CommandBuffer::verifyDraws(checked);
     // tests whose submissions depend on which thread got there first (a command buffer let go while the GPU has it:
     // whether its memory is back in the queue's pools when the next one asks is the race the test is about), so that
     // the addresses in their streams differ from run to run: counted, not summed

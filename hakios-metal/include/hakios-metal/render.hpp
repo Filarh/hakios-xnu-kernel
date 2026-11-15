@@ -249,7 +249,15 @@ struct Program {
     // found in the NIR: a stage that only reads them may be replayed tile by tile (gmemDrawOk). A program not made by
     // linkProgram says all: unknown is taken as writing.
     uint8_t ssboWrites = 3;
+    // What says, without reading it, that this Program is the one a draw was encoded with before: a number no other
+    // Program has had (newProgramUid), given by whoever makes the Program and owns everything it points at -- linkProgram,
+    // and again by every change made to it afterwards (the C interface's setters). CommandBuffer::draw keeps what a
+    // program with a uid comes to (its validation, its registers) and finds it again by the uid alone. 0, as a Program
+    // made by hand has it: no such promise, and a draw then compares the whole Program with the one it kept.
+    uint64_t uid = 0;
 };
+// a uid no Program has had (never 0)
+uint64_t newProgramUid();
 
 namespace render {
 

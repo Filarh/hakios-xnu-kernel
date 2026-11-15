@@ -486,6 +486,12 @@ void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb *cb, unsigned draws);
 void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
 /* every fragment texture of CB's draws the null texture (CommandBuffer::setNullFsTextures): for measuring only */
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
+/* How the process's command buffers take their draws from now on (CommandBuffer::keepStates, verifyDraws). KEEP 0:
+ * each draw judged and written whole, as the first with its program is -- the stream is the same either way, so this is
+ * a bisect's switch and a measurement's. VERIFY 1: each draw taken from its program's kept state is also written whole
+ * and the two compared; a difference ends the command buffer in error, saying what differs (a draw's cost more than
+ * twice over: for a check on the device, not for use). 1 and 0 when never called. */
+void hakios_metal_draw_states(int keep, int verify);
 /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
  * has completed, draw I's program name (valid while CB lives) and microseconds; the count is returned, -1 past them */
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb *cb, int on);

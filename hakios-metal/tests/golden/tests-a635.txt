@@ -135,6 +135,15 @@ the_fake_refuses_a_load_of_ibos_into_the_texture_block submits 1 words 145 draws
 the_fake_refuses_a_zero_ibo_descriptor submits 2 words 274 draws 0 loads 6 stream 63c73bc6ec578015 state 81494f49fbe365ae names 0 0000000000000000
 a_dispatch_loads_the_ubo_descriptors_an_ldc_reads_through submits 2 words 234 draws 0 loads 4 stream 1c284906c094d544 state 01bfc3782cab1405 names 0 0000000000000000
 a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits 1 words 1130 draws 0 loads 3 stream 8dcbe08bc49a37d2 state 767fa2306040d214 names 4 bb062d7fae986371
+a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submits 3 words 2895 draws 11 loads 22 stream 0b1b2ca465b80e3a state 09bde857f6d3d994 names 13 38f44a1414b10600
+a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 17db46b630d582d5 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
+a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 6c62378d52407e41 state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
+a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream e1fb977932e98a2d state 6a704e6fd77244ca names 8 2e72016e06717bd7
+a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 24432 draws 288 loads 1032 stream f12a0503c667ac99 state 2b9afb08f54ec5d9 names 98 4f1ea5a3e689aba6
+the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+       39692 draws taken, 26778 of them from a kept state; 6388 refused
+random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 9716800 draws 81284 loads 238788 stream 0f34067d6130a8f1 state 7cb488da1169ac1d names 39698 8433597f78a9fec2
+more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream 52ca32fc2f9646cd state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
 end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 fill_id_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

@@ -3,6 +3,8 @@
 //
 //   drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv]     the measurements
 //   drawbench --golden                                                                     each scene's sums, nothing else
+//   drawbench --verify ...                                                                 every draw checked against itself encoded in full
+//   drawbench --long ...                                                                   no draw taken from its program's kept state
 //
 // The scenes are frames a window server draws, at the phone's size (750 x 1624):
 //   A B C D E F P Q R G H   the core's own interface (CommandBuffer::draw) with hand-made Programs
@@ -70,7 +72,7 @@ namespace {
 
 // --- what is asked -------------------------------------------------------------------------------------------------
 struct Asked {
-    bool golden = false, hist = false, csv = false;
+    bool golden = false, hist = false, csv = false, verify = false;
     uint32_t runs = 5;
     size_t coldBytes = 0;
     std::string scenes, stages;
@@ -855,6 +857,8 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--golden") asked.golden = true;
+        else if (a == "--verify") asked.verify = true;
+        else if (a == "--long") CommandBuffer::keepStates(false);
         else if (a == "--hist") asked.hist = true;
         else if (a == "--csv") asked.csv = true;
         else if (a == "--runs") asked.runs = std::max(1, atoi(value()));
@@ -862,11 +866,13 @@ int main(int argc, char** argv) {
         else if (a == "--scene") asked.scenes = value();
         else if (a == "--stages") asked.stages = value();
         else {
-            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] | --golden\n");
+            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--verify] [--long] | --golden [--long]\n");
             return 2;
         }
     }
     if (asked.golden) asked.coldBytes = 0;
+    // (--verify, and always for the golden sums: every draw taken from a program's kept state against the same draw in full)
+    CommandBuffer::verifyDraws(asked.golden || asked.verify);
     FakeGpu::submitHook = onSubmit;
     const Scene scenes[] = {
         {"A", "light frame: 1 command buffer, 1 pass (Load), 20 blended draws (14 textured, 6 with uniforms), sysmem", 20, 0, 6, 0, false, true, 1},

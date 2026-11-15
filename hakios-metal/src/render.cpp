@@ -8,10 +8,14 @@
 #include "hakios-metal/render.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
 #include <tuple>
+#include <unordered_map>
 
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
@@ -231,6 +235,7 @@ struct PushedRange {
     uint32_t copyAt;
     const Buffer* buffer;
     uint64_t bufferOffset;
+    const uint32_t* direct;        // ...or NUM_WORDS words kept elsewhere (a program's constant data, worked out once: ProgramState)
 };
 // A stage's ranges for one draw: as many as a Kernel holds, in place -- a vector of them, each with a vector of words,
 // was two allocations a stage a draw. The words of the ranges loaded direct lie one after another in WORDS, which stays
@@ -259,7 +264,7 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
             if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
                 return refuse(why, name() + ": its constant data's range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
             }
-            const PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, uint32_t(out->words.size()), r.sizeDwords, false, 0, nullptr, 0};
+            const PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, uint32_t(out->words.size()), r.sizeDwords, false, 0, nullptr, 0, nullptr};
             out->words.resize(out->words.size() + r.sizeDwords, 0u);
             for (uint32_t d = 0; d < r.sizeDwords; d++) {
                 const uint64_t at = uint64_t(r.startDword + d) * 4;
@@ -286,7 +291,7 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
             return refuse(why, name() + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
         }
-        PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0};
+        PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0, nullptr};
         if (p.from % 16 != 0) {
             p.copy = true;
             p.buffer = x.buffer;
@@ -1334,7 +1339,7 @@ enum : uint32_t {
 struct ProgramFacts {
     // the fragment stage's colour registers, kRegidNone where the pass has no attachment for the output
     uint32_t colorRegid[kMaxColorOutputs];
-    uint32_t samples, numRt, numOut, blendMask, W, H;
+    uint32_t numRt, numOut, blendMask;
     bool dual;
     BlendWords blends[kMaxColorOutputs];
     Linkage link;
@@ -1347,6 +1352,7 @@ struct DrawFacts {
     Ubos vsUbos, fsUbos;
     VertexFetch fetch;
     uint32_t vsNumTex, vsNumSamp, fsNumTex, fsNumSamp, iboCount;
+    uint32_t W, H, samples;       // the pass's window and its attachments' sample count
     bool depthTest;
     pc_di_primtype prim;
     uint64_t maxIndices;
@@ -1469,7 +1475,7 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
     // validation names the mismatch, but validation is off in a shipping app, and an Apple GPU then draws -- SiriUICore
     // builds its orb's pipelines at 1 sample and draws them into a 4-sample target. Nothing a stage was compiled into
     // depends on the count (the MSAA state is the attachments', below), so the attachments' is the one taken.
-    pf.samples = firstAttachment(pass)->samples();
+    f.samples = firstAttachment(pass)->samples();
     const bool dual = pf.dual = fs.dualSrcBlend != 0;
     const uint32_t numRt = pf.numRt = dual ? 1u : std::max<uint32_t>(fs.numColorOutputs, 1);   // the attachments drawn into
     pf.numOut = dual ? 2u : numRt;                                                  // the registers the stage hands the RB
@@ -1627,8 +1633,8 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
         return refuse(why, "cull mode " + n(draw.cullMode) + ", winding " + n(draw.winding) + ": MTLCullMode is 0 to 2, MTLWinding 0 or 1");
     }
     const auto [W, H] = windowOf(pass);
-    pf.W = W;
-    pf.H = H;
+    f.W = W;
+    f.H = H;
     const Viewport& vp = draw.viewport;
     if (!finite(vp.x) || !finite(vp.y) || !finite(vp.width) || !finite(vp.height) || !finite(vp.znear) || !finite(vp.zfar)) {
         return refuse(why, "a viewport with a non-finite value");
@@ -1695,7 +1701,7 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
     const Stage& vs = program.vs;
     const Stage& fs = program.fs;
     const uint32_t* const colorRegid = pf.colorRegid;
-    const uint32_t samples = pf.samples, numRt = pf.numRt, numOut = pf.numOut, blendMask = pf.blendMask, W = pf.W, H = pf.H;
+    const uint32_t samples = f.samples, numRt = pf.numRt, numOut = pf.numOut, blendMask = pf.blendMask, W = f.W, H = f.H;
     const bool dual = pf.dual;
     const BlendWords* const blends = pf.blends;
     const Linkage& link = pf.link;
@@ -1926,7 +1932,7 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
                 stream.waitForMe();
                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, table + r.copyAt);
             } else if (r.numWords != 0) {
-                loadDirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, ranges.words.data() + r.wordsAt, r.numWords);
+                loadDirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, r.direct != nullptr ? r.direct : ranges.words.data() + r.wordsAt, r.numWords);
             } else {
                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, r.from);
             }
@@ -2305,7 +2311,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         return false;
     }
     if (whole) {
-        passStart(stream, pf.W, pf.H, table, o);
+        passStart(stream, f.W, f.H, table, o);
         // a Clear: the 2D engine fills the target before any draw state is written, as turnip's subpass begin does it;
         // the depth attachment's Clear after it (tu_clear_sysmem_attachment, each attachment in turn)
         clearAll(stream, pass, f.clears, table);
@@ -2914,6 +2920,910 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
     passTail(stream, table, o, false);
 }
 
+
+// =====================================================================================================================
+// What is kept between draws
+// =====================================================================================================================
+// A compositor's draw differs from the one before it in a texture, a few constants, sometimes the program. Encoded
+// whole, every draw judged its program and its pass again, made its 350 to 600 words again and had the pass's register
+// shadow throw most of them away. What follows keeps, instead:
+//
+//   ProgramState   what a program comes to in one kind of pass (StateKey: the attachments' formats, depth or none, the
+//                  options): the facts drawFacts found for it and the words of the groups that are the program's alone,
+//                  made by emitDraw itself the first time a draw with it was taken. Kept by the queue from one command
+//                  buffer to the next (StateCache) for a Program with a uid; by the command buffer, against a copy of
+//                  the Program, for one made by hand.
+//   PassCache      what an open pass's attachments come to (the groups that are the pass's alone, a fetch's descriptor)
+//                  and, for each stream the pass is recorded into, a Cursor: which kept words that stream last held for
+//                  each group, and the last draw's viewport, rasterizer, blend and vertex fetch numbers.
+//
+// A draw with a kept state is judged by what it binds alone (fastFacts, fastTables: drawFacts' own rules for the
+// bindings and the draw's numbers) and writes only what differs from what the cursor says the stream holds; whatever
+// fastFacts is not sure of goes the long way, where drawFacts judges it and refuses it by name. The words that reach
+// the stream are the ones the long way would have left there: a group left out is one whose every register the shadow
+// would have dropped, and what is written goes through the same shadow (DedupSink).
+namespace {
+
+// which packets leave the registers as the stream wrote them: the waits, loads, draws, events and markers a draw is made
+// of. Any other (CP_SET_DRAW_STATE, a memory write the command processor may act on) and the shadow forgets what it knew.
+bool leavesRegisters(uint32_t opcode) {
+    switch (opcode) {
+    case pm4::kNop: case CP_WAIT_MEM_GTE: case CP_SKIP_IB2_ENABLE_GLOBAL: case CP_WAIT_FOR_IDLE: case CP_LOAD_STATE6_GEOM:
+    case CP_LOAD_STATE6_FRAG: case CP_LOAD_STATE6: case CP_DRAW_INDX_OFFSET: case CP_DRAW_INDIRECT_MULTI: case CP_WAIT_REG_MEM:
+    case CP_EVENT_WRITE: case CP_SET_MODE: case CP_SET_VISIBILITY_OVERRIDE: case CP_SET_MARKER: case CP_REG_TO_MEM:
+    case pm4::kMemcpy: case pm4::kWaitMemWrites: case pm4::kWaitForMe:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A pass's stream behind its register shadow: appendDeduped's rule applied as the words are made, with no stream in
+// between to make and read back. A register write that would put the value the register holds is left out, the writes
+// kept going out as the runs they form inside the packet they came in (as pm4::Stream cuts packets: a run does not
+// span two); HLSQ_INVALIDATE_CMD, a command, is written whatever it holds.
+class DedupSink {
+public:
+    DedupSink(pm4::Stream& to, CommandBuffer::RegShadow& regs) : to_(to), regs_(regs) {}
+    void registers(uint32_t reg, const uint32_t* values, uint32_t count) {
+        while (count > 0) {
+            const uint32_t n = count < pm4::kMaxType4Count ? count : pm4::kMaxType4Count;
+            uint32_t runStart = 0, runLen = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                const bool same = regs_.hold(reg + k, values[k]) && reg + k != REG_A6XX_HLSQ_INVALIDATE_CMD;
+                if (!same) {
+                    if (runLen == 0) runStart = k;
+                    runLen++;
+                } else if (runLen != 0) {
+                    to_.registers(reg + runStart, values + runStart, runLen);
+                    runLen = 0;
+                }
+            }
+            if (runLen != 0) to_.registers(reg + runStart, values + runStart, runLen);
+            reg += n;
+            values += n;
+            count -= n;
+        }
+    }
+    void packet(uint32_t opcode, const uint32_t* words, uint32_t count) {
+        note(opcode);
+        to_.packet(opcode, count != 0 ? words : nullptr, count);
+    }
+    uint32_t* open(uint32_t opcode, uint32_t count) {
+        note(opcode);
+        return to_.open(opcode, count);
+    }
+    void waitForIdle() { to_.waitForIdle(); }
+    void waitMemWrites() { to_.waitMemWrites(); }
+    void waitForMe() { to_.waitForMe(); }
+    void memcpy(uint64_t destination, uint64_t source, uint32_t words) { to_.memcpy(destination, source, words); }
+    // whether a packet made the shadow forget what the registers hold
+    bool forgot() const { return forgot_; }
+
+private:
+    void note(uint32_t opcode) {
+        if (!leavesRegisters(opcode)) {
+            regs_.clear();
+            forgot_ = true;
+        }
+    }
+    pm4::Stream& to_;
+    CommandBuffer::RegShadow& regs_;
+    bool forgot_ = false;
+};
+
+// what a pass's shape and a draw's options are to a program: everything of the pass that ProgramFacts and the program's
+// own groups read (which colour outputs have an attachment, what format each is, whether there is depth), and every
+// switch. Compared as bytes: made zeroed, then filled.
+struct StateKey {
+    uint32_t format[kMaxColorOutputs];   // each colour attachment's pixel format + 1; 0: none
+    uint32_t depth;                      // a depth attachment
+    Options options;
+};
+
+void stateKeyOf(const RenderPass& pass, const Options& o, StateKey* k) {
+    memset(k, 0, sizeof *k);
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        const Texture* t = attachmentOf(pass, i).texture;
+        k->format[i] = t != nullptr ? uint32_t(t->format()) + 1 : 0;
+    }
+    k->depth = pass.depth != nullptr ? 1 : 0;
+    k->options = o;
+}
+
+// what a stage needs of a draw's bindings, read off the Stage once
+struct StagePlan {
+    enum : uint8_t { kNone = 0, kSampled = 1, kNull = 2, kFetch = 3 };
+    struct Tex {
+        uint8_t kind, dim, isArray, element, fbTarget;
+    };
+    struct Range {
+        bool direct;            // the constant data's: its words are RANGE_WORDS from wordsAt, the program's own
+        uint32_t block, offsetVec4, units, startDword, sizeDwords, wordsAt;
+    };
+    uint32_t numTex = 0, numSamp = 0, samplerMask = 0;
+    Tex tex[kMaxTextureSlots] = {};
+    bool needsNull = false;         // a slot that is the null texture's, whatever is bound
+    std::vector<Range> ranges;
+    std::vector<uint32_t> rangeWords;
+    uint32_t numUbos = 0, constantDataUbo = 0;
+    uint32_t constUbo[2] = {0, 0};  // the constant data's UBO descriptor: where the program's words lie
+    uint32_t numSsbos = 0;
+};
+
+void planStage(const Stage& s, uint64_t program, StagePlan* p) {
+    const Kernel& k = s.k;
+    p->numTex = std::min(k.numTextureSlots, kMaxTextureSlots);
+    p->samplerMask = k.samplerMask;
+    if (p->numTex != 0) {
+        p->numSamp = 1;
+        for (uint32_t m = 0; m < kMaxTextureSlots; m++) {
+            if ((k.samplerMask >> m) & 1) p->numSamp = m + 1;
+        }
+    }
+    for (uint32_t t = 0; t < p->numTex; t++) {
+        const KernelTexture& kt = k.textures[t];
+        StagePlan::Tex& x = p->tex[t];
+        x.kind = kt.kind != kTexSampled ? StagePlan::kNone : kt.fbTarget != 0 ? StagePlan::kFetch : kt.isNull ? StagePlan::kNull : StagePlan::kSampled;
+        x.dim = kt.dim;
+        x.isArray = kt.isArray;
+        x.element = kt.element;
+        x.fbTarget = kt.fbTarget;
+        if (x.kind == StagePlan::kNull) p->needsNull = true;
+    }
+    for (uint32_t i = 0; i < k.numUboRanges && i < kMaxUboRanges; i++) {
+        const KernelUboRange& r = k.uboRanges[i];
+        StagePlan::Range x{false, r.block, r.offsetVec4, r.sizeDwords / 4, r.startDword, r.sizeDwords, 0};
+        if (k.constantDataUbo != 0 && r.block == k.constantDataUbo - 1) {
+            // (pushedRanges: its words from the program's own, zeros past their end)
+            x.direct = true;
+            x.wordsAt = uint32_t(p->rangeWords.size());
+            p->rangeWords.resize(p->rangeWords.size() + r.sizeDwords, 0u);
+            for (uint32_t d = 0; d < r.sizeDwords; d++) {
+                const uint64_t at = uint64_t(r.startDword + d) * 4;
+                if (at + 4 <= k.constantDataSize) p->rangeWords[x.wordsAt + d] = k.words[k.constantDataOffset / 4 + r.startDword + d];
+            }
+        }
+        p->ranges.push_back(x);
+    }
+    p->numUbos = std::min(k.numUbos, kMaxVertexBuffers);
+    p->constantDataUbo = k.constantDataUbo;
+    if (k.constantDataUbo != 0) uboDescriptor(program + k.constantDataOffset, (k.constantDataSize + 15) / 16, p->constUbo);
+    p->numSsbos = k.numSsbos;
+}
+
+}  // namespace
+
+// What a program comes to in one kind of pass. Made once, read by any thread after.
+struct ProgramState {
+    uint64_t uid = 0;
+    uint32_t keyId = 0;
+    // false: every draw of it goes the long way (a stage with private memory, whose registers are the queue's to move)
+    bool fast = false;
+    ProgramFacts pf{};
+    // the two stages' words where the queue keeps them (a program with a uid), and their addresses
+    std::shared_ptr<Buffer> vsBuffer, fsBuffer;
+    uint64_t vsProgram = 0, fsProgram = 0;
+    StagePlan vs, fs;
+    // the vertex stage's attributes as vertexFetch reads them off the descriptor: the buffer each is fetched from, its
+    // stride and step, and the bytes its last element needs from the element's start
+    struct Attr {
+        uint32_t bufferIndex, stride, stepRate;
+        uint64_t need;
+        bool perInstance;
+    };
+    std::vector<Attr> attrs;
+    uint32_t fetchCount = 0;
+    uint32_t fsIboBase = 0;
+    uint32_t tileCode = 0;          // why no draw of it can be replayed tile by tile (tileWhy), 0 when one can
+    bool fbRead = false, hasKill = false, driverParams = false;
+    uint32_t depthRegid = 0;
+    // the words of the groups that are the program's: register packets, but for the two stages' loads
+    std::vector<uint32_t> words;
+    struct Frag {
+        uint32_t at = 0, n = 0;
+    };
+    Frag invalidate, config, vsRegs, vsLoads, fsRegs, fsLoads, vfd, link, blend;
+    const uint32_t* at(const Frag& f) const { return words.data() + f.at; }
+};
+
+// What a queue keeps of the programs drawn with it.
+struct StateCache {
+    static constexpr uint32_t kNoKey = ~0u;
+    std::mutex lock;
+    std::vector<StateKey> keys;
+    std::unordered_map<uint64_t, std::vector<std::shared_ptr<const ProgramState>>> states;   // by uid, one a kind of pass
+    size_t count = 0;
+
+    // the number this kind of pass goes by in the queue (kNoKey: more kinds than are kept, the long way for all of them)
+    uint32_t keyId(const StateKey& k) {
+        std::lock_guard<std::mutex> g(lock);
+        for (size_t i = 0; i < keys.size(); i++) {
+            if (memcmp(&keys[i], &k, sizeof k) == 0) return uint32_t(i);
+        }
+        if (keys.size() >= 1024) return kNoKey;
+        keys.push_back(k);
+        return uint32_t(keys.size() - 1);
+    }
+    std::shared_ptr<const ProgramState> find(uint64_t uid, uint32_t key) {
+        std::lock_guard<std::mutex> g(lock);
+        auto it = states.find(uid);
+        if (it == states.end()) return nullptr;
+        for (const auto& s : it->second) {
+            if (s->keyId == key) return s;
+        }
+        return nullptr;
+    }
+    void put(std::shared_ptr<const ProgramState> s) {
+        std::lock_guard<std::mutex> g(lock);
+        // (a program let go leaves its states behind, a uid never coming back: past this many, all are dropped -- the
+        // ones in use are found again by their next draw, and a command buffer in flight keeps its own)
+        if (count >= 4096) {
+            states.clear();
+            count = 0;
+        }
+        states[s->uid].push_back(std::move(s));
+        count++;
+    }
+};
+
+namespace {
+
+// what a pass's stream last held of a draw's groups: for each group that is kept as words, the words; for each that is
+// made of the draw's numbers, the numbers
+struct Cursor {
+    enum : uint32_t { kPass, kConfig, kVsRegs, kFsRegs, kVfd, kLink, kBlend, kSlots };
+    struct Last {
+        const uint32_t* at = nullptr;
+        uint32_t n = 0;
+    } last[kSlots];
+    bool rastSet = false, viewportSet = false, blendSet = false, vfdSet = false;
+    uint32_t rast = 0;
+    struct ViewportIn {
+        double v[6];
+        uint32_t sc[4], W, H;
+        bool operator==(const ViewportIn& o) const {
+            for (int i = 0; i < 6; i++) {
+                if (v[i] != o.v[i]) return false;
+            }
+            return sc[0] == o.sc[0] && sc[1] == o.sc[1] && sc[2] == o.sc[2] && sc[3] == o.sc[3] && W == o.W && H == o.H;
+        }
+    } viewport;
+    struct BlendIn {
+        uint32_t color[4];          // the blend colour's bits
+        uint32_t depthCompare, depthWrite, hasDepth, hasKill, depthRegid;
+        uint32_t stencilOn, face[2][6], reference[2];
+        bool operator==(const BlendIn& o) const {
+            if (stencilOn != o.stencilOn) return false;
+            // (a stencil state that is off is the same whatever its faces say)
+            if (stencilOn != 0 && (memcmp(face, o.face, sizeof face) != 0 || reference[0] != o.reference[0] || reference[1] != o.reference[1])) return false;
+            return memcmp(color, o.color, sizeof color) == 0 && depthCompare == o.depthCompare && depthWrite == o.depthWrite && hasDepth == o.hasDepth &&
+                   hasKill == o.hasKill && depthRegid == o.depthRegid;
+        }
+    } blend;
+    struct VfdIn {
+        static constexpr uint32_t kMost = 4;
+        uint32_t n;                 // the fetches used; kMost + 1: more than are compared
+        uint32_t bi[kMost], size[kMost], stride[kMost];
+        uint64_t base[kMost];
+        uint32_t indexOffset, baseInstance, restart;
+        bool operator==(const VfdIn& o) const {
+            if (n != o.n || n > kMost || indexOffset != o.indexOffset || baseInstance != o.baseInstance || restart != o.restart) return false;
+            for (uint32_t i = 0; i < n; i++) {
+                if (bi[i] != o.bi[i] || size[i] != o.size[i] || stride[i] != o.stride[i] || base[i] != o.base[i]) return false;
+            }
+            return true;
+        }
+    } vfd;
+    // (a packet that changes registers behind the stream's back, or a draw encoded the long way: nothing is known)
+    void forget() { *this = Cursor{}; }
+};
+
+}  // namespace
+
+// What an open pass's attachments come to, and where its streams are.
+struct PassCache {
+    uint32_t keyId = StateCache::kNoKey;
+    uint32_t W = 0, H = 0, samples = 1;
+    // [0] the pass in sysmem (the command buffer's stream, or the sysmem side of a pass recorded both ways), [1] its
+    // draws gathered for tiles
+    Cursor cur[2];
+    // the groups that are the pass's alone (depth and stencil, the colour targets, MSAA, RB_RENDER_CNTL, LRZ), by how
+    // many targets a program draws into, which of its outputs have one, and sysmem or tiles
+    struct Frag {
+        uint32_t sig;
+        std::vector<uint32_t> words;
+    };
+    std::vector<std::unique_ptr<Frag>> frags;
+    // a framebuffer fetch's descriptor of each attachment: [0] where it lies in memory, [1] its bin in GMEM
+    uint32_t fb[2][kMaxColorOutputs][16];
+    uint8_t fbHave[2] = {0, 0};
+};
+
+// What a command buffer has at hand for a draw.
+struct DrawCache {
+    // the states of the programs with a uid this buffer drew with: found by the uid, one a slot
+    struct Slot {
+        uint64_t uid = 0;
+        uint32_t keyId = StateCache::kNoKey;
+        const ProgramState* state = nullptr;
+    };
+    static constexpr uint32_t kSlots = 64;
+    Slot slots[kSlots];
+    std::vector<std::shared_ptr<const ProgramState>> kept;   // ...alive until the buffer is done
+    // a Program made by hand, as it was when its state was made: a draw with the Program at that address is the same
+    // draw only while every byte of it, its immediates and its two addresses in this buffer are the same
+    struct Hand {
+        const Program* at = nullptr;
+        uint32_t keyId = StateCache::kNoKey;
+        std::vector<uint8_t> bytes;
+        std::vector<uint32_t> vsImm, fsImm;
+        std::shared_ptr<const ProgramState> state;
+    };
+    std::vector<Hand> hands;
+    // a draw's facts, here rather than on the stack so that what they hold of the heap (a direct range's words) is kept
+    ProgramFacts pf, pfSys;
+    DrawFacts facts, factsSys;
+    pm4::Stream scratch;
+    std::vector<uint8_t> staticKey;
+};
+
+namespace {
+
+// --- a kept state from the first draw taken with the program ------------------------------------------------------------------
+std::shared_ptr<ProgramState> buildState(const Program& program, uint32_t keyId, const Options& o, const ProgramFacts& pf, const DrawFacts& f,
+                                         const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, uint64_t vsProgram,
+                                         uint64_t fsProgram) {
+    auto s = std::make_shared<ProgramState>();
+    const Stage& vs = program.vs;
+    const Stage& fs = program.fs;
+    s->uid = program.uid;
+    s->keyId = keyId;
+    s->pf = pf;
+    s->vsProgram = vsProgram;
+    s->fsProgram = fsProgram;
+    planStage(vs, vsProgram, &s->vs);
+    planStage(fs, fsProgram, &s->fs);
+    s->fast = vs.k.pvtmemSize == 0 && fs.k.pvtmemSize == 0;
+    s->fetchCount = f.fetch.count;
+    for (uint32_t i = 0; i < vs.numInputs; i++) {
+        const StageInput& in = vs.inputs[i];
+        if (in.sysval || in.regid == kRegidNone) continue;
+        // (vertexFetch took this draw: every attribute is one the descriptor describes, in a format served)
+        const uint32_t loc = in.slot - kVertAttribGeneric0;
+        const VertexAttribute& a = loc < kMaxVertexAttributes ? program.vertexDescriptor.attributes[loc] : program.vertexDescriptor.attributes[0];
+        const VertexFormatInfo* fi = vertexFormatInfo(a.format);
+        if (loc >= kMaxVertexAttributes || fi == nullptr || a.bufferIndex >= kMaxVertexBuffers) {
+            s->fast = false;
+            break;
+        }
+        const VertexLayout& l = program.vertexDescriptor.layouts[a.bufferIndex];
+        const bool perInstance = l.step == VertexStep::kPerInstance;
+        s->attrs.push_back(ProgramState::Attr{a.bufferIndex, l.stride, perInstance && l.stepRate != 0 ? l.stepRate : 1, uint64_t(a.offset) + fi->bytes, perInstance});
+    }
+    s->fsIboBase = program.fsIboBase;
+    // (gmemDrawOk's rules for the program alone)
+    if ((vs.k.numSsbos != 0 && (program.ssboWrites & 1)) || (fs.k.numSsbos != 0 && (program.ssboWrites & 2))) s->tileCode = 1;
+    for (const Stage* st : {&vs, &fs}) {
+        for (uint32_t i = 0; s->tileCode == 0 && i < kMaxTextureSlots && i < st->k.numTextureSlots; i++) {
+            if (st->k.textures[i].kind == kTexImage) s->tileCode = 2;
+        }
+    }
+    s->fbRead = fs.fbRead != 0;
+    s->hasKill = fs.hasKill != 0;
+    s->depthRegid = fs.depthRegid;
+    s->driverParams = vs.k.driverParamsOffsetVec4 >= 0;
+    // the program's groups, each as emitDraw writes it for this draw: nothing in them is the draw's
+    pm4::Stream st;
+    auto frag = [&](uint32_t groups) {
+        st.clear();
+        emitDraw(st, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, 0, o, nullptr, false, groups);
+        ProgramState::Frag r{uint32_t(s->words.size()), uint32_t(st.words().size())};
+        s->words.insert(s->words.end(), st.words().begin(), st.words().end());
+        return r;
+    };
+    s->invalidate = frag(kGInvalidate);
+    // (with no device buffer in either stage SP_IBO_COUNT is 0 for every draw, and goes with the stages' configuration)
+    s->config = frag(kGConfig | (vs.k.numSsbos == 0 && fs.k.numSsbos == 0 ? uint32_t(kGIbos) : 0u));
+    s->vsRegs = frag(kGVsRegs);
+    s->vsLoads = frag(kGVsLoads);
+    s->fsRegs = frag(kGFsRegs);
+    s->fsLoads = frag(kGFsLoads);
+    s->vfd = frag(kGVfdStatic);
+    s->link = frag(kGVpc | kGFsInputs | kGFsOutputs);
+    s->blend = frag(kGBlendStatic);
+    return s;
+}
+
+// --- a draw's own facts against a kept state: drawFacts' rules for the bindings and the draw's numbers ----------------------
+
+bool fastRanges(const StagePlan& p, const Bindings& b, PushedRanges* out) {
+    out->count = 0;
+    out->words.clear();
+    for (const StagePlan::Range& r : p.ranges) {
+        if (r.direct) {
+            out->r[out->count++] = PushedRange{r.offsetVec4, r.units, 0, 0, r.sizeDwords, false, 0, nullptr, 0, p.rangeWords.data() + r.wordsAt};
+            continue;
+        }
+        if (r.block >= b.buffers.size() || b.buffers[r.block].buffer == nullptr) return false;
+        const Binding& x = b.buffers[r.block];
+        if (x.offset % 4 != 0 || x.offset > x.buffer->length()) return false;
+        const uint64_t mapped = x.buffer->bo().size() - x.offset;
+        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) return false;
+        PushedRange q{r.offsetVec4, r.units, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0, nullptr};
+        if (q.from % 16 != 0) {
+            q.copy = true;
+            q.buffer = x.buffer;
+            q.bufferOffset = x.offset + 4ull * r.startDword;
+        }
+        out->r[out->count++] = q;
+    }
+    return true;
+}
+
+bool fastUbos(const StagePlan& p, const Bindings& b, Ubos* out) {
+    out->count = 0;
+    for (uint32_t u = 0; u < p.numUbos; u++) {
+        if (p.constantDataUbo != 0 && u == p.constantDataUbo - 1) {
+            out->push_back(p.constUbo[0]);
+            out->push_back(p.constUbo[1]);
+            continue;
+        }
+        if (u >= b.buffers.size() || b.buffers[u].buffer == nullptr) {
+            if (u + 1 == p.numUbos) return false;
+            out->push_back(0);
+            out->push_back(0);
+            continue;
+        }
+        const Binding& x = b.buffers[u];
+        if (x.offset % 4 != 0 || x.offset > x.buffer->length()) return false;
+        const uint64_t vec4s = (x.buffer->length() - x.offset + 15) / 16;
+        uint32_t d[2];
+        uboDescriptor(x.buffer->gpuAddress() + x.offset, uint32_t(std::min<uint64_t>(vec4s, kUboMaxVec4)), d);
+        out->push_back(d[0]);
+        out->push_back(d[1]);
+    }
+    return true;
+}
+
+bool fastFacts(const ProgramState& ps, const PassCache& pc, const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, DrawFacts* f) {
+    f->p = &ps.pf;
+    f->W = pc.W;
+    f->H = pc.H;
+    f->samples = pc.samples;
+    // the constants: each stage's ranges, the copies' places in the table, the UBO descriptors
+    if (!fastRanges(ps.vs, vsb, &f->vsRanges) || !fastRanges(ps.fs, fsb, &f->fsRanges)) return false;
+    uint32_t copyAt = kConstCopyAt;
+    for (PushedRanges* ranges : {&f->vsRanges, &f->fsRanges}) {
+        for (PushedRange& r : *ranges) {
+            if (!r.copy) continue;
+            if (copyAt + r.units * 16 > kConstCopyEnd) return false;   // (no room in the table: placeCopies reads it here instead)
+            r.copyAt = copyAt;
+            copyAt += r.units * 16;
+        }
+    }
+    if (!fastUbos(ps.vs, vsb, &f->vsUbos) || !fastUbos(ps.fs, fsb, &f->fsUbos)) return false;
+    // the vertex fetch: each attribute's buffer bound, its last element inside it
+    VertexFetch& fetch = f->fetch;
+    fetch.count = ps.fetchCount;
+    memset(fetch.used, 0, sizeof fetch.used);
+    for (const ProgramState::Attr& a : ps.attrs) {
+        if (a.bufferIndex >= vsb.buffers.size() || vsb.buffers[a.bufferIndex].buffer == nullptr) return false;
+        const Binding& x = vsb.buffers[a.bufferIndex];
+        if (x.offset > x.buffer->length()) return false;
+        const uint64_t bytes = x.buffer->length() - x.offset;
+        if (!((!a.perInstance && draw.indexBuffer != nullptr) || draw.indirect != nullptr)) {
+            const uint64_t last = a.perInstance ? uint64_t(draw.baseInstance) + uint64_t(draw.instanceCount == 0 ? 0 : draw.instanceCount - 1) / a.stepRate
+                                                : uint64_t(draw.vertexStart) + (draw.vertexCount == 0 ? 0 : draw.vertexCount - 1);
+            if (last * a.stride + a.need > bytes) return false;
+        }
+        fetch.used[a.bufferIndex] = true;
+        fetch.base[a.bufferIndex] = x.buffer->gpuAddress() + x.offset;
+        fetch.size[a.bufferIndex] = uint32_t(std::min<uint64_t>(bytes, 0xffffffffu));
+        fetch.stride[a.bufferIndex] = a.stride;
+    }
+    // the draw's numbers
+    for (int i = 0; i < 4; i++) {
+        if (!std::isfinite(draw.blendColor[i])) return false;
+    }
+    if (draw.depth.compare > 7) return false;
+    f->depthTest = draw.depth.compare != 7 || draw.depth.write;
+    const StencilState& st = draw.stencil;
+    if (st.enabled) {
+        if (pass.stencil == nullptr) return false;
+        for (const StencilFace* face : {&st.front, &st.back}) {
+            if (face->compare > 7 || face->stencilFail > 7 || face->depthFail > 7 || face->pass > 7) return false;
+        }
+    }
+    if (f->depthTest && pass.depth == nullptr) return false;
+    switch (draw.primitive) {
+    case Primitive::kTriangle: f->prim = DI_PT_TRILIST; break;
+    case Primitive::kTriangleStrip: f->prim = DI_PT_TRISTRIP; break;
+    case Primitive::kLine: f->prim = DI_PT_LINELIST; break;
+    case Primitive::kLineStrip: f->prim = DI_PT_LINESTRIP; break;
+    case Primitive::kPoint: f->prim = DI_PT_POINTLIST; break;
+    default: return false;
+    }
+    if (draw.indirect != nullptr || draw.visibilityMode != 0) return false;   // (the long way's)
+    if (draw.vertexCount == 0 || draw.instanceCount == 0) return false;
+    uint64_t maxIndices = 0;
+    if (draw.indexBuffer != nullptr) {
+        if (draw.indexType > 1) return false;
+        const uint32_t indexSize = draw.indexType == 0 ? 2 : 4;
+        if (draw.indexOffset % indexSize != 0 || draw.indexOffset > draw.indexBuffer->length()) return false;
+        maxIndices = (draw.indexBuffer->length() - draw.indexOffset) / indexSize;
+        if (draw.vertexCount > maxIndices || draw.baseVertex < 0) return false;
+        if (maxIndices > 0xffffffffull) maxIndices = 0xffffffffull;
+    }
+    f->maxIndices = maxIndices;
+    if (draw.cullMode > 2 || draw.winding > 1) return false;
+    const uint32_t W = pc.W, H = pc.H;
+    const Viewport& vp = draw.viewport;
+    if (!finite(vp.x) || !finite(vp.y) || !finite(vp.width) || !finite(vp.height) || !finite(vp.znear) || !finite(vp.zfar)) return false;
+    if (!(vp.width > 0.0) || !(vp.height > 0.0)) return false;
+    if (vp.x >= double(W) || vp.y >= double(H) || vp.x + vp.width <= 0.0 || vp.y + vp.height <= 0.0) return false;
+    Scissor sc = draw.scissor;
+    if (sc.width == 0) {
+        sc = Scissor{0, 0, W, H};
+    } else if (sc.height == 0 || uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
+        return false;
+    }
+    f->sc = sc;
+    return true;
+}
+
+// One stage's texture and sampler descriptors straight into the draw's table: as many as the stage declares and no
+// more (the loads read no further). A slot the stage does not sample is zeros; the null texture's slot, and one the
+// draw leaves unbound, the null texture; a fetch's the attachment (PassCache keeps it). False: a bound texture the
+// stage cannot sample as it is (stageTextures says which and why).
+bool fastTextures(const StagePlan& p, const Bindings& b, const RenderPass& pass, PassCache& pc, const Texture* nullTexture, bool measured, uint8_t* tableCpu,
+                  uint32_t constAt, uint32_t sampAt, const GmemPlan* gmem) {
+    if (p.numTex == 0) return true;
+    for (uint32_t t = 0; t < p.numTex; t++) {
+        uint8_t* at = tableCpu + constAt + 64 * t;
+        const StagePlan::Tex& kt = p.tex[t];
+        if (kt.kind == StagePlan::kNone) {
+            memset(at, 0, 64);
+            continue;
+        }
+        if (kt.kind == StagePlan::kFetch) {
+            const uint32_t target = kt.fbTarget - 1u;
+            const uint32_t where = gmem != nullptr ? 1 : 0;
+            if (target >= kMaxColorOutputs) return false;
+            if (!((pc.fbHave[where] >> target) & 1)) {
+                const Attachment a = attachmentOf(pass, target);
+                if (a.texture == nullptr || a.slice != 0) return false;
+                TexConst d = a.texture->levelDescriptor(a.level);
+                if (gmem != nullptr) {
+                    // (stageTextures: the attachment's bin in GMEM, as the fetch reads it in a tile)
+                    d.dword[0] &= ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK);
+                    d.dword[0] |= A6XX_TEX_CONST_0_TILE_MODE(TILE6_2);
+                    d.dword[2] = A6XX_TEX_CONST_2_TYPE(A6XX_TEX_2D) | A6XX_TEX_CONST_2_PITCH(gmem->binW * a.texture->info().bytesPerPixel);
+                    d.dword[3] = 0;
+                    d.dword[4] = kGmemBase + gmem->base[target];
+                    d.dword[5] &= A6XX_TEX_CONST_5_DEPTH__MASK;
+                    for (uint32_t w = 6; w < 16; w++) d.dword[w] = 0;
+                }
+                memcpy(pc.fb[where][target], d.dword, 64);
+                pc.fbHave[where] |= uint8_t(1u << target);
+            }
+            memcpy(at, pc.fb[where][target], 64);
+            continue;
+        }
+        const Texture* tex = t < b.textures.size() ? b.textures[t] : nullptr;
+        if (kt.kind == StagePlan::kNull || tex == nullptr || measured) {
+            if (nullTexture == nullptr) return false;
+            memcpy(at, nullTexture->sampledWords(), 64);
+            continue;
+        }
+        KernelTexture shape{};
+        shape.dim = kt.dim;
+        shape.isArray = kt.isArray;
+        if (!tex->isShaped(shape) || kt.element != tex->info().element || (tex->usage() & kTextureUsageRead) == 0) return false;
+        memcpy(at, tex->sampledWords(), 64);
+    }
+    for (uint32_t m = 0; m < p.numSamp; m++) {
+        uint8_t* at = tableCpu + sampAt + 16 * m;
+        if (((p.samplerMask >> m) & 1) != 0 && m < b.samplers.size() && b.samplers[m] != nullptr) {
+            memcpy(at, b.samplers[m]->words, 16);
+        } else {
+            memset(at, 0, 16);   // (not named by the stage, or nothing bound: a valid sampler, nearest and repeat)
+        }
+    }
+    return true;
+}
+
+// the 3D IBO table straight into the draw's table (gfxIbos' rules); *COUNT the table's size
+bool fastIbos(const ProgramState& ps, const Bindings& vsb, const Bindings& fsb, uint8_t* tableCpu, uint32_t* count) {
+    *count = 0;
+    if (ps.vs.numSsbos == 0 && ps.fs.numSsbos == 0) return true;
+    const Binding* chosen[kMaxVertexBuffers] = {};
+    uint32_t n = 0;
+    for (int stage = 0; stage < 2; stage++) {
+        const Bindings& b = stage == 0 ? vsb : fsb;
+        const uint32_t base = stage == 0 ? 0 : ps.fsIboBase, numSsbos = stage == 0 ? ps.vs.numSsbos : ps.fs.numSsbos;
+        if (numSsbos > kMaxVertexBuffers) return false;
+        for (uint32_t tableSlot = base; tableSlot < numSsbos; tableSlot++) {
+            const uint32_t slot = tableSlot - base;
+            if (slot >= b.buffers.size() || b.buffers[slot].buffer == nullptr) {
+                if (tableSlot + 1 == numSsbos) return false;
+                n = std::max(n, tableSlot + 1);
+                continue;
+            }
+            const Binding& x = b.buffers[slot];
+            if (x.offset % 4 != 0 || x.offset >= x.buffer->length()) return false;
+            if (chosen[tableSlot] != nullptr && (chosen[tableSlot]->buffer != x.buffer || chosen[tableSlot]->offset != x.offset)) return false;
+            if (chosen[tableSlot] == nullptr) {
+                chosen[tableSlot] = &x;
+                const uint64_t elements = (x.buffer->length() - x.offset) / 4;
+                if (elements >= (1ull << 30)) return false;
+                const TexConst d = bufferIbo(x.buffer->gpuAddress() + x.offset, uint32_t(elements));
+                memcpy(tableCpu + kGfxIboAt + 64 * tableSlot, d.dword, 64);
+            }
+            n = std::max(n, tableSlot + 1);
+        }
+    }
+    // (a slot below the count that nothing is bound at: turnip's null descriptor, zeros)
+    for (uint32_t i = 0; i < n; i++) {
+        if (chosen[i] == nullptr) memset(tableCpu + kGfxIboAt + 64 * i, 0, 64);
+    }
+    *count = n;
+    return true;
+}
+
+// a draw's table from a kept state: the fetch flush's word, the IBO table, both stages' textures and samplers
+bool fastTables(const ProgramState& ps, PassCache& pc, const RenderPass& pass, const Bindings& vsb, const Bindings& fsb, const Texture* nullTexture,
+                bool nullFsTextures, uint8_t* tableCpu, const GmemPlan* gmem, uint32_t* iboCount) {
+    memset(tableCpu + kTableFbReadFlushAt, 0, 4);
+    return fastIbos(ps, vsb, fsb, tableCpu, iboCount) &&
+           fastTextures(ps.vs, vsb, pass, pc, nullTexture, false, tableCpu, kVsTexConstAt, kVsTexSampAt, gmem) &&
+           fastTextures(ps.fs, fsb, pass, pc, nullTexture, nullFsTextures, tableCpu, kFsTexConstAt, kFsTexSampAt, gmem);
+}
+
+// whether a draw of this stage's bindings puts the null texture somewhere (CommandBuffer::draw's rule)
+bool planWantsNull(const StagePlan& p, const Bindings& b, bool measured) {
+    if (p.needsNull) return true;
+    for (uint32_t t = 0; t < p.numTex; t++) {
+        if (p.tex[t].kind != StagePlan::kSampled) continue;
+        if (measured || t >= b.textures.size() || b.textures[t] == nullptr) return true;
+    }
+    return false;
+}
+// ...the same read off the stage itself, for a program with no state yet
+bool stageWantsNull(const Kernel& k, const Bindings& b, bool measured) {
+    for (uint32_t i = 0; i < kMaxTextureSlots && i < k.numTextureSlots; i++) {
+        const KernelTexture& kt = k.textures[i];
+        if (kt.kind != kTexSampled || kt.fbTarget != 0) continue;
+        if (kt.isNull || measured || i >= b.textures.size() || b.textures[i] == nullptr) return true;
+    }
+    return false;
+}
+
+// gmemDrawOk's rule for what a draw binds: a texture over an attachment's memory. 0, or 4 + the attachment. A slot the
+// null texture takes is not what is bound there.
+uint32_t boundOverAttachment(const StagePlan& p, const Bindings& b, const RenderPass& pass, bool measured) {
+    for (size_t t = 0; t < b.textures.size(); t++) {
+        const Texture* tex = b.textures[t];
+        if (tex == nullptr) continue;
+        if (t < p.numTex && (p.tex[t].kind == StagePlan::kNull || (measured && p.tex[t].kind == StagePlan::kSampled))) continue;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const Texture* a = attachmentOf(pass, i).texture;
+            if (a != nullptr && tex->buffer() == a->buffer()) return 4 + i;
+        }
+    }
+    return 0;
+}
+std::string tileWhy(uint32_t code) {
+    switch (code) {
+    case 1: return "a stage that writes its device buffers: replayed per tile it would write them per tile";
+    case 2: return "a stage that writes a texture";
+    case 3: return "a visibility result: the tiles would count each sample once a tile";
+    default: return "a texture over colour attachment " + n(code - 4) + "'s memory";
+    }
+}
+
+// whether a draw into B's attachments is a draw into A's: every attachment the same texture at the same level and
+// slice, every load action one that begins no pass (what CommandBuffer::draw's join asks, and what checkTarget read of
+// the pass when it opened)
+bool sameTargets(const RenderPass& a, const RenderPass& b) {
+    if (a.color0 != b.color0 || a.level != b.level || a.slice != b.slice || a.depth != b.depth || a.depthLevel != b.depthLevel ||
+        a.depthSlice != b.depthSlice || a.stencil != b.stencil || a.store != b.store || a.depthStore != b.depthStore || a.stencilStore != b.stencilStore) {
+        return false;
+    }
+    auto loads = [](LoadAction l) { return l == LoadAction::kLoad || l == LoadAction::kDontCare; };
+    if (!loads(b.load) || (b.depth != nullptr && !loads(b.depthLoad)) || (b.stencil != nullptr && !loads(b.stencilLoad))) return false;
+    for (uint32_t i = 0; i < kMaxColorOutputs - 1; i++) {
+        const ColorAttachment &x = a.more[i], &y = b.more[i];
+        if (x.texture != y.texture || x.level != y.level || x.slice != y.slice || x.store != y.store || (y.texture != nullptr && !loads(y.load))) return false;
+    }
+    return true;
+}
+
+// --- a draw onto a pass's stream from a kept state --------------------------------------------------------------------------
+// The groups in the order a draw has them. One kept as words goes through the shadow unless the stream last held those
+// very words for it; one made of the draw's numbers is made when the numbers are not the last draw's; the two stages'
+// loads and HLSQ_INVALIDATE_CMD, which no shadow drops, go as they are, every draw.
+void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, const ProgramState& ps, PassCache& pc, const DrawFacts& f, const Program& program,
+              const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, uint64_t table, const Options& o, const GmemPlan* gmem,
+              bool afterFetch, pm4::Stream& scratch) {
+    DedupSink sink(to, regs);
+    uint32_t pending = 0;
+    auto flush = [&]() {
+        if (pending == 0) return;
+        emitDraw(sink, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch, pending);
+        pending = 0;
+    };
+    auto kept = [&](uint32_t slot, const uint32_t* w, uint32_t count) {
+        Cursor::Last& l = cur.last[slot];
+        if (l.n == count && (l.at == w || count == 0 || memcmp(l.at, w, 4ull * count) == 0)) {
+            l.at = w;
+            return;
+        }
+        flush();
+        for (uint32_t i = 0; i < count;) {
+            const pm4::Header h = pm4::decode(w[i]);
+            sink.registers(h.reg, w + i + 1, h.count);
+            i += 1 + h.count;
+        }
+        l.at = w;
+        l.n = count;
+    };
+    auto asIs = [&](const ProgramState::Frag& fr) {
+        if (fr.n == 0) return;
+        flush();
+        to.append(ps.at(fr), fr.n);
+    };
+
+    if (ps.fbRead) pending |= kGBarrier;
+    // the pass's own groups, for what this program draws into
+    {
+        uint32_t valid = 0;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) valid |= ps.pf.colorRegid[i] != kRegidNone ? 1u << i : 0u;
+        const uint32_t sig = ps.pf.numRt | valid << 4 | (gmem != nullptr ? 1u << 12 : 0u);
+        const PassCache::Frag* fr = nullptr;
+        for (const auto& x : pc.frags) {
+            if (x->sig == sig) fr = x.get();
+        }
+        if (fr == nullptr) {
+            scratch.clear();
+            emitDraw(scratch, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch,
+                     kGZs | kGMrt | kGMsaa | kGRenderCntl | kGLrz);
+            pc.frags.push_back(std::make_unique<PassCache::Frag>(PassCache::Frag{sig, scratch.words()}));
+            fr = pc.frags.back().get();
+        }
+        kept(Cursor::kPass, fr->words.data(), uint32_t(fr->words.size()));
+    }
+    asIs(ps.invalidate);
+    kept(Cursor::kConfig, ps.at(ps.config), ps.config.n);
+    if (ps.vs.numSsbos != 0 || ps.fs.numSsbos != 0) pending |= kGIbos;
+    kept(Cursor::kVsRegs, ps.at(ps.vsRegs), ps.vsRegs.n);
+    asIs(ps.vsLoads);
+    if (!ps.vs.ranges.empty() || ps.vs.numUbos != 0) pending |= kGVsConsts;
+    if (ps.driverParams) pending |= kGDriverParams;
+    kept(Cursor::kFsRegs, ps.at(ps.fsRegs), ps.fsRegs.n);
+    asIs(ps.fsLoads);
+    if (!ps.fs.ranges.empty() || ps.fs.numUbos != 0) pending |= kGFsConsts;
+    pending |= kGFsTex | kGVsTex;
+    kept(Cursor::kVfd, ps.at(ps.vfd), ps.vfd.n);
+    {
+        Cursor::VfdIn in;
+        in.n = 0;
+        for (uint32_t bi = 0; f.fetch.count != 0 && bi < kMaxVertexBuffers; bi++) {
+            if (!f.fetch.used[bi]) continue;
+            if (in.n < Cursor::VfdIn::kMost) {
+                in.bi[in.n] = bi;
+                in.size[in.n] = f.fetch.size[bi];
+                in.stride[in.n] = f.fetch.stride[bi];
+                in.base[in.n] = f.fetch.base[bi];
+            }
+            in.n++;
+        }
+        in.indexOffset = draw.indexBuffer != nullptr ? uint32_t(draw.baseVertex) : draw.vertexStart;
+        in.baseInstance = draw.baseInstance;
+        in.restart = draw.indexBuffer != nullptr && draw.indexType == 0 ? 0xffffu : 0xffffffffu;
+        if (!cur.vfdSet || !(cur.vfd == in)) {
+            pending |= kGVfdDynamic;
+            cur.vfd = in;
+            cur.vfdSet = true;
+        }
+    }
+    kept(Cursor::kLink, ps.at(ps.link), ps.link.n);
+    {
+        const bool ordered = ps.fbRead && o.fbReadOrdered && gmem != nullptr;
+        const uint32_t in = draw.cullMode | draw.winding << 2 | (ordered ? 8u : 0u) | (draw.indexBuffer != nullptr ? 16u : 0u);
+        if (!cur.rastSet || cur.rast != in) {
+            pending |= kGRast;
+            cur.rast = in;
+            cur.rastSet = true;
+        }
+    }
+    {
+        Cursor::ViewportIn in;
+        const Viewport& vp = draw.viewport;
+        in.v[0] = vp.x, in.v[1] = vp.y, in.v[2] = vp.width, in.v[3] = vp.height, in.v[4] = vp.znear, in.v[5] = vp.zfar;
+        in.sc[0] = f.sc.x, in.sc[1] = f.sc.y, in.sc[2] = f.sc.width, in.sc[3] = f.sc.height;
+        in.W = f.W;
+        in.H = f.H;
+        if (!cur.viewportSet || !(cur.viewport == in)) {
+            pending |= kGViewport;
+            cur.viewport = in;
+            cur.viewportSet = true;
+        }
+    }
+    kept(Cursor::kBlend, ps.at(ps.blend), ps.blend.n);
+    {
+        Cursor::BlendIn in;
+        memcpy(in.color, draw.blendColor, sizeof in.color);
+        in.depthCompare = draw.depth.compare;
+        in.depthWrite = draw.depth.write ? 1 : 0;
+        in.hasDepth = pass.depth != nullptr ? 1 : 0;
+        in.hasKill = ps.hasKill ? 1 : 0;
+        in.depthRegid = ps.depthRegid;
+        const StencilState& st = draw.stencil;
+        in.stencilOn = st.enabled ? 1 : 0;
+        const StencilFace* faces[2] = {&st.front, &st.back};
+        for (int k = 0; k < 2; k++) {
+            in.face[k][0] = faces[k]->compare, in.face[k][1] = faces[k]->stencilFail, in.face[k][2] = faces[k]->depthFail;
+            in.face[k][3] = faces[k]->pass, in.face[k][4] = faces[k]->readMask, in.face[k][5] = faces[k]->writeMask;
+        }
+        in.reference[0] = st.frontReference;
+        in.reference[1] = st.backReference;
+        if (!cur.blendSet || !(cur.blend == in)) {
+            pending |= kGBlendDynamic;
+            cur.blend = in;
+            cur.blendSet = true;
+        }
+    }
+    pending |= kGDraw;
+    flush();
+    // (nothing a draw taken this way writes makes the shadow forget: no occlusion query, no memory write)
+}
+
+// (the tests': CommandBuffer::verifyDraws) The same draw the long way -- drawFacts over a table of its own, every group
+// through SHADOW, the pass's shadow as it was before the draw -- against what the short way put on TO from MARK on and
+// into its table. "" when they are the same, else what differs.
+std::string verifyDraw(const pm4::Stream& to, size_t mark, CommandBuffer::RegShadow& shadow, const Program& program, const RenderPass& pass, const Draw& draw,
+                       const Bindings& vsb, const Bindings& fsb, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, const uint8_t* tableCpu, const Options& o,
+                       const GmemPlan* gmem, bool afterFetch) {
+    std::vector<uint8_t> ownTable(kTableBytes, 0xa5);
+    ProgramFacts pf;
+    DrawFacts f;
+    std::string why;
+    if (!drawFacts(program, pass, draw, vsb, fsb, vsProgram, fsProgram, ownTable.data(), &why, false, gmem, &pf, &f)) {
+        return "the long way refuses it: " + why;
+    }
+    pm4::Stream long_;
+    long_.packet(pm4::kNop, nullptr, 0);
+    DedupSink sink(long_, shadow);
+    emitDraw(sink, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, table, o, gmem, afterFetch, kGAll);
+    const std::vector<uint32_t>& a = to.words();
+    const std::vector<uint32_t>& b = long_.words();
+    if (a.size() - mark != b.size()) return n(a.size() - mark) + " words, " + n(b.size()) + " the long way";
+    for (size_t i = 0; i < b.size(); i++) {
+        if (a[mark + i] != b[i]) {
+            char text[96];
+            snprintf(text, sizeof text, "word %zu of %zu is %#x, %#x the long way", i, b.size(), a[mark + i], b[i]);
+            return text;
+        }
+    }
+    const struct {
+        uint32_t at, bytes;
+        const char* what;
+    } parts[] = {{kTableFbReadFlushAt, 4, "the fetch flush's word"},        {kGfxIboAt, f.iboCount * 64, "the IBO descriptors"},
+                 {kFsTexConstAt, f.fsNumTex * 64, "the FS's textures"},     {kFsTexSampAt, f.fsNumSamp * 16, "the FS's samplers"},
+                 {kVsTexConstAt, f.vsNumTex * 64, "the VS's textures"},     {kVsTexSampAt, f.vsNumSamp * 16, "the VS's samplers"}};
+    for (const auto& p : parts) {
+        if (memcmp(tableCpu + p.at, ownTable.data() + p.at, p.bytes) != 0) return std::string(p.what) + " in its table are not the long way's";
+    }
+    return {};
+}
+
+std::atomic<bool> gVerifyDraws{false};
+std::atomic<bool> gKeepStates{true};
+std::atomic<uint64_t> gProgramUids{0};
+
+}  // namespace
+
 }  // namespace render
 
 // a pass's words onto the command buffer's stream, packet by packet, behind a NOP that marks where an encoder began
@@ -2960,16 +3870,9 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
             }
             if (runLen != 0) to.registers(h.reg + runStart, &w[i + 1 + runStart], runLen);
         } else {
-            switch (h.opcode) {
-            case pm4::kNop: case CP_WAIT_MEM_GTE: case CP_SKIP_IB2_ENABLE_GLOBAL: case CP_WAIT_FOR_IDLE: case CP_LOAD_STATE6_GEOM:
-            case CP_LOAD_STATE6_FRAG: case CP_LOAD_STATE6: case CP_DRAW_INDX_OFFSET: case CP_DRAW_INDIRECT_MULTI: case CP_WAIT_REG_MEM:
-            case CP_EVENT_WRITE: case CP_SET_MODE: case CP_SET_VISIBILITY_OVERRIDE: case CP_SET_MARKER: case CP_REG_TO_MEM:
-            case pm4::kMemcpy: case pm4::kWaitMemWrites: case pm4::kWaitForMe:
-                break;
-            default:
+            if (!render::leavesRegisters(h.opcode)) {
                 regs.clear();   // (CP_SET_DRAW_STATE and the like: what the registers hold is no longer known here)
                 forgot = true;
-                break;
             }
             to.packet(h.opcode, h.count ? &w[i + 1] : nullptr, h.count);
         }
@@ -2977,6 +3880,17 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
     }
     return forgot;
 }
+
+uint64_t newProgramUid() { return render::gProgramUids.fetch_add(1) + 1; }
+
+render::StateCache& CommandQueue::states() {
+    std::lock_guard<std::mutex> g(lock_);
+    if (states_ == nullptr) states_ = std::make_shared<render::StateCache>();
+    return *states_;
+}
+
+void CommandBuffer::verifyDraws(bool on) { render::gVerifyDraws = on; }
+bool CommandBuffer::keepStates(bool on) { return render::gKeepStates.exchange(on); }
 
 bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
                          const render::Options& options) {
@@ -2987,65 +3901,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     // copy first, by the 2D engine into the UBWC layout, in a pass of its own before this draw's
     if (!freshen(vsBindings, options) || !freshen(fsBindings, options)) return false;
     std::string why;
-    // the null texture's slot is the front end's, not the application's: the queue's texture goes there, over anything
-    // bound at that index (an application cannot know the index, so whatever it bound there was not meant for it)
-    Bindings vsWithNull, fsWithNull;
-    const Bindings* vsb = &vsBindings;
-    const Bindings* fsb = &fsBindings;
-    std::shared_ptr<Texture> null;
-    // And so does a sampled slot the application left empty: an uber shader (chronod's widget renderer) declares
-    // textures that the branches a given draw takes never read, and Metal lets such a slot go unbound. What a read of
-    // it gives is undefined in Metal; here it is the null texture's zero, as Apple's GPUs answer. Both stages alike.
-    for (const auto& [k, given, with, at] : {std::tuple<const Kernel*, const Bindings*, Bindings*, const Bindings**>{&program.vs.k, &vsBindings, &vsWithNull, &vsb},
-                                             {&program.fs.k, &fsBindings, &fsWithNull, &fsb}}) {
-        for (uint32_t i = 0; i < kMaxTextureSlots && i < k->numTextureSlots; i++) {
-            const KernelTexture& kt = k->textures[i];
-            if (kt.kind != kTexSampled || kt.fbTarget != 0) continue;
-            const bool unbound = i >= given->textures.size() || given->textures[i] == nullptr;
-            const bool measured = nullFsTextures_ && k == &program.fs.k;   // (setNullFsTextures: what a draw costs without its reads)
-            if (!kt.isNull && !unbound && !measured) continue;
-            if (null == nullptr && (null = queue_.nullTexture(&why)) == nullptr) {
-                return fail(std::string("no null texture: ") + why);
-            }
-            if (*at != with) {
-                *with = *given;
-                *at = with;
-            }
-            if (with->textures.size() <= i) with->textures.resize(i + 1, nullptr);
-            with->textures[i] = null.get();
-            if (!kt.isNull) with->nullMask |= 1u << i;
-        }
-    }
-    // private memory is the queue's too: a stage that wants some is given the queue's buffer, which the submission
-    // names for writing (the stage spills into it)
-    for (const auto& [k, from, to] : {std::tuple<const Kernel*, const Bindings**, Bindings*>{&program.vs.k, &vsb, &vsWithNull}, {&program.fs.k, &fsb, &fsWithNull}}) {
-        if (k->pvtmemSize == 0) continue;
-        PrivateMemory pm;
-        std::shared_ptr<Buffer> scratch = queue_.privateMemory(k->pvtmemSize, k->pvtmemPerWave, &pm, &why);
-        if (scratch == nullptr) {
-            return fail(std::string("no private memory: ") + why);
-        }
-        if (*from != to) {
-            *to = **from;
-            *from = to;
-        }
-        to->privateMemory = pm;
-        use(*scratch, true);
-    }
-    // the two programs' words, once per command buffer, and the draw's table, in pieces (command.hpp: Piece): a piece is
-    // 256-byte aligned, so SP_xS_OBJ_START is 128-byte aligned as the ST6_SHADER preload wants it (tu_shader.cc:1313-1316)
-    const uint64_t vsProgram = programAddress(program.vs.k, &why);
-    if (vsProgram == 0) {
-        return fail(std::string("no memory for the vertex program: ") + why);
-    }
-    const uint64_t fsProgram = programAddress(program.fs.k, &why);
-    if (fsProgram == 0) {
-        return fail(std::string("no memory for the fragment program: ") + why);
-    }
-    Piece table;
-    if (!piece(render::kTableBytes, &table, &why)) {
-        return fail(std::string("no memory for the draw's table: ") + why);
-    }
+    if (drawCache_ == nullptr) drawCache_ = std::make_shared<render::DrawCache>();
+    render::DrawCache& dc = *drawCache_;
     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
     // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
     // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
@@ -3059,20 +3916,160 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         const ColorAttachment &a = pass.more[i], &b = open_->pass.more[i];
         joins = a.texture == b.texture && a.level == b.level && a.store == b.store && (a.texture == nullptr || a.load != LoadAction::kClear);
     }
+
+    // --- what this program came to the last time it was drawn into a pass of this kind (render.cpp: ProgramState) ---
+    const bool measured = nullFsTextures_;   // (setNullFsTextures: what a draw costs without its reads)
+    uint32_t keyId = render::StateCache::kNoKey;
+    if (options.dedupRegs && render::gKeepStates.load(std::memory_order_relaxed)) {
+        if (joins) {
+            keyId = open_->cache->keyId;
+        } else {
+            render::StateKey key;
+            render::stateKeyOf(pass, options, &key);
+            keyId = queue_.states().keyId(key);
+        }
+    }
+    const render::ProgramState* ps = nullptr;
+    render::DrawCache::Hand* hand = nullptr;
+    if (keyId != render::StateCache::kNoKey && program.uid != 0) {
+        render::DrawCache::Slot& slot = dc.slots[(program.uid * 0x9e3779b97f4a7c15ull) >> 58];
+        if (slot.uid == program.uid && slot.keyId == keyId) {
+            ps = slot.state;
+        } else if (std::shared_ptr<const render::ProgramState> found = queue_.states().find(program.uid, keyId)) {
+            ps = found.get();
+            slot = render::DrawCache::Slot{program.uid, keyId, ps};
+            dc.kept.push_back(std::move(found));
+            // (its two stages' words where the queue keeps them: named by the submission and kept until it is done, as
+            // programAddress does for a program met the long way)
+            use(*ps->vsBuffer, false);
+            keep(ps->vsBuffer);
+            use(*ps->fsBuffer, false);
+            keep(ps->fsBuffer);
+        }
+    } else if (keyId != render::StateCache::kNoKey) {
+        // a Program made by hand: the one kept for this address, if it is still that Program byte for byte
+        auto same = [](const Kernel& k, const std::vector<uint32_t>& imm) {
+            return k.numImmediates == imm.size() && (imm.empty() || memcmp(k.immediates, imm.data(), 4 * imm.size()) == 0);
+        };
+        for (render::DrawCache::Hand& h : dc.hands) {
+            if (h.at == &program && h.keyId == keyId && memcmp(h.bytes.data(), &program, sizeof(Program)) == 0 && same(program.vs.k, h.vsImm) &&
+                same(program.fs.k, h.fsImm)) {
+                hand = &h;
+            }
+        }
+    }
+
+    // the null texture's slot is the front end's, not the application's: the queue's texture goes there, over anything
+    // bound at that index (an application cannot know the index, so whatever it bound there was not meant for it)
+    // And so does a sampled slot the application left empty: an uber shader (chronod's widget renderer) declares
+    // textures that the branches a given draw takes never read, and Metal lets such a slot go unbound. What a read of
+    // it gives is undefined in Metal; here it is the null texture's zero, as Apple's GPUs answer. Both stages alike.
+    const bool wantsNull = ps != nullptr ? render::planWantsNull(ps->vs, vsBindings, false) || render::planWantsNull(ps->fs, fsBindings, measured)
+                                         : render::stageWantsNull(program.vs.k, vsBindings, false) || render::stageWantsNull(program.fs.k, fsBindings, measured);
+    if (wantsNull && null_ == nullptr && (null_ = queue_.nullTexture(&why)) == nullptr) {
+        return fail(std::string("no null texture: ") + why);
+    }
+    // (the bindings with the null texture in them, as the long way reads them: copies, made only when it is taken -- a
+    // draw with a kept state reads the caller's own and puts the null texture's descriptor where it goes)
+    Bindings vsWithNull, fsWithNull;
+    const Bindings* vsb = &vsBindings;
+    const Bindings* fsb = &fsBindings;
+    bool substituted = false;
+    auto substitute = [&]() {
+        if (substituted) return;
+        substituted = true;
+        for (const auto& [k, given, with, at] : {std::tuple<const Kernel*, const Bindings*, Bindings*, const Bindings**>{&program.vs.k, &vsBindings, &vsWithNull, &vsb},
+                                                 {&program.fs.k, &fsBindings, &fsWithNull, &fsb}}) {
+            for (uint32_t i = 0; i < kMaxTextureSlots && i < k->numTextureSlots; i++) {
+                const KernelTexture& kt = k->textures[i];
+                if (kt.kind != kTexSampled || kt.fbTarget != 0) continue;
+                const bool unbound = i >= given->textures.size() || given->textures[i] == nullptr;
+                const bool none = measured && k == &program.fs.k;
+                if (!kt.isNull && !unbound && !none) continue;
+                if (*at != with) {
+                    *with = *given;
+                    *at = with;
+                }
+                if (with->textures.size() <= i) with->textures.resize(i + 1, nullptr);
+                with->textures[i] = null_.get();
+                if (!kt.isNull) with->nullMask |= 1u << i;
+            }
+        }
+    };
+    bool fast = ps != nullptr && ps->fast;
+    // private memory is the queue's too: a stage that wants some is given the queue's buffer, which the submission
+    // names for writing (the stage spills into it)
+    if (!fast && (program.vs.k.pvtmemSize != 0 || program.fs.k.pvtmemSize != 0)) {
+        substitute();
+        for (const auto& [k, from, to] : {std::tuple<const Kernel*, const Bindings**, Bindings*>{&program.vs.k, &vsb, &vsWithNull}, {&program.fs.k, &fsb, &fsWithNull}}) {
+            if (k->pvtmemSize == 0) continue;
+            PrivateMemory pm;
+            std::shared_ptr<Buffer> scratch = queue_.privateMemory(k->pvtmemSize, k->pvtmemPerWave, &pm, &why);
+            if (scratch == nullptr) {
+                return fail(std::string("no private memory: ") + why);
+            }
+            if (*from != to) {
+                *to = **from;
+                *from = to;
+            }
+            to->privateMemory = pm;
+            use(*scratch, true);
+        }
+    }
+    // the two programs' words, once per command buffer, and the draw's table, in pieces (command.hpp: Piece): a piece is
+    // 256-byte aligned, so SP_xS_OBJ_START is 128-byte aligned as the ST6_SHADER preload wants it (tu_shader.cc:1313-1316)
+    uint64_t vsProgram = 0, fsProgram = 0;
+    if (ps != nullptr) {
+        vsProgram = ps->vsProgram;
+        fsProgram = ps->fsProgram;
+    } else {
+        vsProgram = programAddress(program.vs.k, &why);
+        if (vsProgram == 0) {
+            return fail(std::string("no memory for the vertex program: ") + why);
+        }
+        fsProgram = programAddress(program.fs.k, &why);
+        if (fsProgram == 0) {
+            return fail(std::string("no memory for the fragment program: ") + why);
+        }
+        if (hand != nullptr && hand->state->vsProgram == vsProgram && hand->state->fsProgram == fsProgram) {
+            ps = hand->state.get();
+            fast = ps->fast;
+        }
+    }
+    Piece table;
+    if (!piece(render::kTableBytes, &table, &why)) {
+        return fail(std::string("no memory for the draw's table: ") + why);
+    }
+    // (the rare kinds of draw go the long way whatever is kept: one whose numbers the GPU reads, one that counts samples)
+    if (d.indirect != nullptr || d.visibilityMode != 0) fast = false;
     // GMEM is decided as a pass opens, before its first draw is encoded (a draw in a tile is encoded for the tile:
     // encodeInPass). A draw a tile cannot replay ends a GMEM pass and opens a sysmem one of its own.
     std::string gmemWhy;
-    const bool tileable = options.gmem && gmem_ && render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
+    uint32_t tileCode = 0;
+    bool tileable = false;
+    if (options.gmem && gmem_) {
+        if (fast) {
+            tileCode = ps->tileCode;
+            if (tileCode == 0) tileCode = render::boundOverAttachment(ps->vs, vsBindings, pass, false);
+            if (tileCode == 0) tileCode = render::boundOverAttachment(ps->fs, fsBindings, pass, measured);
+            tileable = tileCode == 0;
+        } else {
+            substitute();
+            tileable = render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
+        }
+    }
+    // (why not, said only where it is kept: a string a draw was an allocation a draw)
+    auto whyNotTiled = [&]() { return tileCode != 0 ? render::tileWhy(tileCode) : gmemWhy; };
     if (joins && open_->dual && !tileable) {
         // (recorded both ways: the pass goes on in sysmem, what it has so far onto the stream)
-        gmemWhy_ = gmemWhy;
+        gmemWhy_ = whyNotTiled();
         appendStream(stream_, open_->sysStream);
         open_->sysStream.clear();
         open_->bodies.clear();
         open_->dual = open_->gmem = false;
     }
     if (joins && open_->gmem && !tileable) {
-        gmemWhy_ = gmemWhy;
+        gmemWhy_ = whyNotTiled();
         joins = false;
     }
     if (!joins) {
@@ -3088,7 +4085,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         plan = open_->plan;
     } else if (options.gmem && gmem_) {
         gmem = render::gmemPlan(pass, &plan, &gmemWhy_) && tileable;
-        if (!tileable) gmemWhy_ = gmemWhy;
+        if (!tileable) gmemWhy_ = whyNotTiled();
         if (gmem && gmemMinDraws_ != 0) {
             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so
             // (a light pass is most of CoreAnimation's, and recording each of its draws twice was 7.5 us a draw on the
@@ -3118,7 +4115,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
     }
     Piece passTable;
-    pm4::Stream head, body, headSys, bodySys;
+    pm4::Stream head, headSys;
+    std::shared_ptr<render::PassCache> opened;   // a new pass's
     if (!joins) {
         if (!piece(render::kTableBytes, &passTable, &why)) {
             return fail(std::string("no memory for the pass's table: ") + why);
@@ -3136,15 +4134,83 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             gmemClears_ = 0;
             return refuseWork(why);
         }
+        // (encodeBegin took the pass: it has an attachment, and every one of them is one a pass can have)
+        opened = std::make_shared<render::PassCache>();
+        opened->keyId = keyId;
+        const auto [W, H] = render::windowOf(pass);
+        opened->W = W;
+        opened->H = H;
+        opened->samples = render::firstAttachment(pass)->samples();
+    } else if (fast && !render::sameTargets(open_->pass, pass)) {
+        // (the pass's attachments at another slice or with another action than it opened with: the long way judges it)
+        fast = false;
     }
+    render::PassCache& pc = joins ? *open_->cache : *opened;
+    const render::GmemPlan* const tiled = gmem ? &plan : nullptr;
+    const bool afterFetch = joins && open_->lastFetched;
     render::Options encodeOptions = options;
+    if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
+    // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
+    if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
+    render::Options sysOptions = encodeOptions;   // (recorded both ways: the sysmem side's)
+    sysOptions.visCullUse = options.visCullUse;
+
+    // --- the draw's facts: by what it binds alone when the program's are kept, else in full (and refused by name) ---
+    render::DrawFacts& f = dc.facts;
+    // the same draw for sysmem when the pass is recorded both ways: its table the same words but for a fetch's
+    // descriptor, which reads memory there
+    Piece sysTable = table;
+    auto shortWay = [&]() {
+        uint32_t ibos = 0;
+        if (!render::fastFacts(*ps, pc, pass, d, vsBindings, fsBindings, &f) ||
+            !render::fastTables(*ps, pc, pass, vsBindings, fsBindings, null_.get(), measured, table.contents(), tiled, &ibos)) {
+            return false;
+        }
+        f.iboCount = ibos;
+        f.vsNumTex = ps->vs.numTex;
+        f.vsNumSamp = ps->vs.numSamp;
+        f.fsNumTex = ps->fs.numTex;
+        f.fsNumSamp = ps->fs.numSamp;
+        return true;
+    };
+    if (fast && !shortWay()) fast = false;
+    if (!fast) {
+        substitute();
+        if (!render::drawFacts(program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.contents(), &why, false, tiled, &dc.pf, &f)) {
+            gmemClears_ = 0;
+            return refuseWork(why);
+        }
+    }
+    if (dual) {
+        if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why)) {
+            gmemClears_ = 0;
+            return fail(std::string("no memory for the draw's table: ") + why);
+        }
+        if (fast && program.fs.fbRead) {
+            uint32_t ibos = 0;
+            if (!render::fastTables(*ps, pc, pass, vsBindings, fsBindings, null_.get(), measured, sysTable.contents(), nullptr, &ibos)) {
+                // (what the first table took the second takes: not reached; the long way judges both if it ever is)
+                fast = false;
+                substitute();
+                if (!render::drawFacts(program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.contents(), &why, false, tiled, &dc.pf, &f)) {
+                    gmemClears_ = 0;
+                    return refuseWork(why);
+                }
+            }
+        }
+        if (!fast && !render::drawFacts(program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.contents(), &why, false, nullptr, &dc.pfSys, &dc.factsSys)) {
+            gmemClears_ = 0;
+            return refuseWork(why);
+        }
+    }
     // The state a draw's program and pass alone decide (render::Options' zsNone, mrt, msaaOff, renderCntl, lrzOff, vpc,
-    // fsInputs, fsOutputs: register writes and nothing else) is not encoded again for a draw whose program, blending,
-    // sample count and options are the last draw's in this pass: deduplication dropped every word of it anyway, and
-    // making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made the
-    // deduplication forget what the registers hold (staticKey emptied then).
-    std::vector<uint8_t> staticKey;
-    if (options.dedupRegs) {
+    // fsInputs, fsOutputs: register writes and nothing else) is not encoded again, the long way, for a draw whose
+    // program, blending, sample count and options are the last draw's in this pass: deduplication dropped every word of
+    // it anyway, and making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made
+    // the deduplication forget what the registers hold (staticKey emptied then).
+    std::vector<uint8_t>& staticKey = dc.staticKey;
+    staticKey.clear();
+    if (!fast && options.dedupRegs) {
         const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
         const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
         auto add = [&](const void* p, size_t n) { staticKey.insert(staticKey.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
@@ -3152,35 +4218,17 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         add(sizes, sizeof sizes);
         add(&program.blend, sizeof program.blend);
         add(program.moreBlend, sizeof program.moreBlend);
-        add(&encodeOptions, sizeof encodeOptions);
+        // (the options before the two lines above changed them, as they were keyed when the key was made of them: a pass's
+        // draws have the same two changes or none)
+        add(&options, sizeof options);
         if (joins && !open_->staticKey.empty() && open_->staticKey == staticKey) {
             encodeOptions.zsNone = encodeOptions.mrt = encodeOptions.msaaOff = encodeOptions.renderCntl = encodeOptions.lrzOff = false;
             encodeOptions.vpc = encodeOptions.fsInputs = encodeOptions.fsOutputs = false;
+            sysOptions.zsNone = sysOptions.mrt = sysOptions.msaaOff = sysOptions.renderCntl = sysOptions.lrzOff = false;
+            sysOptions.vpc = sysOptions.fsInputs = sysOptions.fsOutputs = false;
         }
     }
-    if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
-    // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
-    if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
-    if (!render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), table.contents(), &why, encodeOptions,
-                              gmem ? &plan : nullptr, joins && open_->lastFetched)) {
-        gmemClears_ = 0;
-        return refuseWork(why);
-    }
-    if (dual) {
-        // the same draw for sysmem: its table the same words but for a fetch's descriptor, which reads memory there
-        Piece sysTable = table;
-        if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why)) {
-            gmemClears_ = 0;
-            return fail(std::string("no memory for the draw's table: ") + why);
-        }
-        render::Options sysOptions = encodeOptions;
-        sysOptions.visCullUse = options.visCullUse;
-        if (!render::encodeInPass(bodySys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysTable.contents(), &why,
-                                  sysOptions, nullptr, joins && open_->lastFetched)) {
-            gmemClears_ = 0;
-            return refuseWork(why);
-        }
-    }
+
     if (!joins) {
         {
             const Texture* first = pass.color0 != nullptr ? pass.color0 : pass.depth;
@@ -3202,6 +4250,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         open_->pass = pass;
         open_->options = options;
         open_->table = passTable.gpuAddress();
+        open_->cache = std::move(opened);
         if (dual) {
             appendDeduped(open_->sysStream, headSys, open_->regs);
             open_->headGmem = std::move(head);
@@ -3261,19 +4310,122 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         drawsProfiled_.push_back(dt);
         drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)));
     }
+
+    // --- the draw's words, straight onto the pass's stream (and onto its sysmem side, for a pass recorded both ways) ---
+    RegShadow& shadow = open_->gmem ? open_->bodyRegs : open_->regs;
+    render::Cursor& cursor = open_->cache->cur[open_->gmem ? 1 : 0];
     if (options.dedupRegs && open_->options.dedupRegs) {
-        bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
-        if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
-        open_->staticKey = forgot ? std::vector<uint8_t>() : std::move(staticKey);
+        if (fast) {
+            // (render::gVerifyDraws: the same draw the long way, through a copy of the shadow as it was, must come to the
+            // same words and the same table -- the tests' check that what is kept is what drawFacts and emitDraw make)
+            const bool verify = render::gVerifyDraws.load(std::memory_order_relaxed);
+            RegShadow before, beforeSys;
+            const size_t mark = into.size(), markSys = open_->sysStream.size();
+            if (verify) {
+                before = shadow;
+                if (open_->dual) beforeSys = open_->regs;
+            }
+            into.packet(pm4::kNop, nullptr, 0);
+            render::emitFast(into, shadow, cursor, *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings, table.gpuAddress(), encodeOptions, tiled,
+                             afterFetch, dc.scratch);
+            if (open_->dual) {
+                open_->sysStream.packet(pm4::kNop, nullptr, 0);
+                render::emitFast(open_->sysStream, open_->regs, open_->cache->cur[0], *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings,
+                                 sysTable.gpuAddress(), sysOptions, nullptr, afterFetch, dc.scratch);
+            }
+            open_->staticKey.clear();   // (the long way's key: what it would skip is no longer what the last draw made)
+            counts_.keptDraws++;
+            if (verify) {
+                // (the long way's bindings, with the null texture in them: the check's alone -- what the draw names and
+                // keeps below goes on as it does unchecked)
+                const bool had = substituted;
+                substitute();
+                std::string differs = render::verifyDraw(into, mark, before, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(),
+                                                         table.contents(), encodeOptions, tiled, afterFetch);
+                if (differs.empty() && open_->dual) {
+                    differs = render::verifyDraw(open_->sysStream, markSys, beforeSys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(),
+                                                 sysTable.contents(), sysOptions, nullptr, afterFetch);
+                }
+                if (!differs.empty()) return fail("a draw of " + std::string(program.name != nullptr ? program.name : "?") + " from its kept state: " + differs);
+                if (!had) {
+                    substituted = false;
+                    vsb = &vsBindings;
+                    fsb = &fsBindings;
+                }
+            }
+        } else {
+            into.packet(pm4::kNop, nullptr, 0);
+            render::DedupSink sink(into, shadow);
+            render::emitDraw(sink, f, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), encodeOptions, tiled, afterFetch, render::kGAll);
+            bool forgot = sink.forgot();
+            if (open_->dual) {
+                open_->sysStream.packet(pm4::kNop, nullptr, 0);
+                render::DedupSink sys(open_->sysStream, open_->regs);
+                render::emitDraw(sys, dc.factsSys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysOptions, nullptr, afterFetch,
+                                 render::kGAll);
+                forgot = sys.forgot() || forgot;
+            }
+            if (forgot) {
+                open_->staticKey.clear();
+            } else {
+                open_->staticKey = staticKey;
+            }
+            // (written the long way: what the streams hold of the kept groups is no longer known)
+            open_->cache->cur[0].forget();
+            open_->cache->cur[1].forget();
+            // the first draw taken with this program in a pass of this kind: what it came to, kept for the next
+            if (ps == nullptr && keyId != render::StateCache::kNoKey) {
+                std::shared_ptr<render::ProgramState> made =
+                    render::buildState(program, keyId, options, dc.pf, f, pass, d, *vsb, *fsb, vsProgram, fsProgram);
+                if (program.uid != 0) {
+                    std::string no;
+                    made->vsBuffer = queue_.programBuffer(program.vs.k, &no);
+                    made->fsBuffer = queue_.programBuffer(program.fs.k, &no);
+                    if (made->vsBuffer != nullptr && made->fsBuffer != nullptr && made->vsBuffer->gpuAddress() == vsProgram &&
+                        made->fsBuffer->gpuAddress() == fsProgram) {
+                        queue_.states().put(made);
+                    }
+                } else {
+                    render::DrawCache::Hand h;
+                    h.at = &program;
+                    h.keyId = keyId;
+                    h.bytes.resize(sizeof(Program));
+                    memcpy(h.bytes.data(), &program, sizeof(Program));
+                    if (program.vs.k.numImmediates != 0) h.vsImm.assign(program.vs.k.immediates, program.vs.k.immediates + program.vs.k.numImmediates);
+                    if (program.fs.k.numImmediates != 0) h.fsImm.assign(program.fs.k.immediates, program.fs.k.immediates + program.fs.k.numImmediates);
+                    h.state = std::move(made);
+                    bool replaced = false;
+                    for (render::DrawCache::Hand& x : dc.hands) {
+                        if (x.at == h.at && x.keyId == h.keyId) {
+                            x = std::move(h);
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        if (dc.hands.size() >= 64) dc.hands.erase(dc.hands.begin());
+                        dc.hands.push_back(std::move(h));
+                    }
+                }
+            }
+        }
     } else {
-        appendStream(into, body);
-        if (open_->dual) appendStream(open_->sysStream, bodySys);
+        // (no deduplication asked: every draw writes all of its state)
+        into.packet(pm4::kNop, nullptr, 0);
+        render::emitDraw(into, f, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), encodeOptions, tiled, afterFetch, render::kGAll);
+        if (open_->dual) {
+            open_->sysStream.packet(pm4::kNop, nullptr, 0);
+            render::emitDraw(open_->sysStream, dc.factsSys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysOptions, nullptr,
+                             afterFetch, render::kGAll);
+        }
+        open_->cache->cur[0].forget();
+        open_->cache->cur[1].forget();
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
     counts_.draws++;
     if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing
-    for (const auto& [b, writes] : {std::pair<const Bindings*, bool>{vsb, program.vs.k.numSsbos != 0}, {fsb, program.fs.k.numSsbos != 0}}) {
+    for (const auto& [b, writes] : {std::pair<const Bindings*, bool>{&vsBindings, program.vs.k.numSsbos != 0}, {&fsBindings, program.fs.k.numSsbos != 0}}) {
         for (const Binding& x : b->buffers) {
             if (x.buffer != nullptr) {
                 use(*x.buffer, writes);
@@ -3290,12 +4442,34 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         use(*d.visibility, true);   // the result word is written; the command buffer keeps the buffer until it is
     }
     // both stages' sampled textures: read, and alive until the GPU is done (the descriptors in the table point at them)
-    for (const Bindings* b : {vsb, fsb}) {
-        for (const Texture* t : b->textures) {
-            if (t != nullptr) {
+    if (substituted) {
+        for (const Bindings* b : {vsb, fsb}) {
+            for (const Texture* t : b->textures) {
+                if (t != nullptr) {
+                    use(*t->buffer(), false);
+                    keep(t->buffer());
+                }
+            }
+        }
+    } else {
+        // (the caller's own bindings: what is bound where the null texture goes is not what the draw reads)
+        for (int stage = 0; stage < 2; stage++) {
+            const Bindings& b = stage == 0 ? vsBindings : fsBindings;
+            const Kernel& k = stage == 0 ? program.vs.k : program.fs.k;
+            for (size_t i = 0; i < b.textures.size(); i++) {
+                const Texture* t = b.textures[i];
+                if (t == nullptr) continue;
+                if (i < kMaxTextureSlots && i < k.numTextureSlots && k.textures[i].kind == kTexSampled && k.textures[i].fbTarget == 0 &&
+                    (k.textures[i].isNull || (measured && stage == 1))) {
+                    continue;
+                }
                 use(*t->buffer(), false);
                 keep(t->buffer());
             }
+        }
+        if (wantsNull) {
+            use(*null_->buffer(), false);
+            keep(null_->buffer());
         }
     }
     return true;
@@ -3440,6 +4614,11 @@ bool CommandBuffer::append(CommandBuffer& other) {
     other.uses_.clear();
     other.kept_.clear();
     other.keptAny_.clear();
+    // (what OTHER remembers having named and kept is in those lists no longer: anything recorded into it after this
+    // names and keeps afresh)
+    memset(other.recent_, 0, sizeof other.recent_);
+    other.drawCache_.reset();
+    other.uploaded_.clear();
     counts_.passes += other.counts_.passes;
     counts_.draws += other.counts_.draws;
     counts_.dispatches += other.counts_.dispatches;
@@ -3448,6 +4627,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
     counts_.gmemPasses += other.counts_.gmemPasses;
     counts_.binnedPasses += other.counts_.binnedPasses;
     counts_.tiles += other.counts_.tiles;
+    counts_.keptDraws += other.counts_.keptDraws;
     other.counts_ = Counts{};
     return true;
 }

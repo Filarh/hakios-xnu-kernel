@@ -330,6 +330,10 @@ public:
     // DEPTH 1, ARRAY_PITCH the layer's bytes, the format's swap and swizzle (fd6_view.c:232-250)
     // (with mip levels: all of them, MIPLVLS levels - 1 and the layer the whole of them, fd6_view.c:232-250)
     a6xx::TexConst sampledDescriptor() const;
+    // ...its sixteen words, worked out once and kept: they are the texture's for as long as it lives (its memory, its
+    // size, its format and its swizzle are fixed when it is made), and a draw that samples it copies them into its table
+    // -- working them out again for every texture of every draw was a draw's stageTextures
+    const uint32_t* sampledWords() const;
     // ...of mip level L alone: what a framebuffer fetch reads of an attachment drawn at that level
     a6xx::TexConst levelDescriptor(uint32_t level) const;
     // the descriptor a stib/ldib addresses it through, at IBO slot numSsbos + index: the same without PITCHALIGN,
@@ -364,6 +368,8 @@ private:
     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
     std::shared_ptr<Texture> staging_;
     mutable std::atomic<bool> stale_{false};
+    mutable std::atomic<uint8_t> sampledState_{0};   // sampledWords': 0 not worked out, 1 being written, 2 there
+    mutable uint32_t sampledWords_[16];
 public:
     const Texture* staging() const { return staging_.get(); }
     bool takeStale() const { return stale_.exchange(false); }   // true once a draw is to copy the rows in
