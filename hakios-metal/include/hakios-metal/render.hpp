@@ -547,6 +547,32 @@ uint32_t gmemTouched(GmemPlan* plan, uint32_t touched, uint32_t W, uint32_t H);
 // hold more than 32 bins, which CP_SET_BIN_DATA5 cannot name (fd6 use_hw_binning, turnip is_hw_binning_possible): such
 // a pass is not binned.
 bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY);
+// GMEM or sysmem for a pass that can have either, by what it holds once its draws are known: turnip's criteria
+// (tu_autotune.cc: get_optimal_mode and the bandwidth estimate behind it) with what a pass here knows of itself.
+//   - A pass of fewer draws than kGmemFewDraws stays in sysmem: turnip's "too few draws to tune" (:1855-1870), sysmem
+//     being the mode a wrong choice costs least in (:1836-1840). (Fewer than BAR when BAR is below that: a bar of 1
+//     is the measurement's "every pass that can".)
+//   - A pass one of whose draws reads its target is tiled: turnip's rule for a pass that runs SINGLE_PRIM_MODE in
+//     sysmem (:1815-1820). Here a fetching draw in sysmem is more than that mode: two waits for idle, the colour
+//     cache flushed to memory and waited for, the texture caches dropped (encodeDraw), then the target read back
+//     from memory; in a tile it reads the bin, the barrier where a tile draws it (gmem.hpp).
+//   - Otherwise by memory moved, as turnip's estimate has it (:1043-1067, tu_pass.cc:905-932): the tiles load and
+//     store their attachments (LOADED + STORED bytes a pixel) whatever is drawn, a sysmem pass fills what its load
+//     action clears (CLEARED) and then every draw's writes and blends go through memory (D); sysmem when
+//     CLEARED * px + D <= (11 * (LOADED + STORED) * px + D) / 10, that is 9 D <= (11 (LOADED + STORED) - 10 CLEARED) px.
+//     turnip has D from the samples a pass's like passed last time; here it is taken to grow with the draws, by what
+//     BAR says: BAR draws are where tiles begin to pay for a pass that loads and stores all it touches (TOUCHED
+//     bytes: 9 D = 22 TOUCHED px there). So tiles when DRAWS * 22 TOUCHED >= BAR * (11 (LOADED + STORED) - 10 CLEARED):
+//     at BAR draws for such a pass as before, at half of it when nothing need be loaded (DontCare, or a Clear the
+//     tiles do themselves), at kGmemFewDraws when the sysmem pass would fill what the tiles store anyway.
+// WHY: when sysmem, the reason in words (for the pass's profile).
+constexpr uint32_t kGmemFewDraws = 5;
+struct GmemChoice {
+    uint32_t draws = 0, bar = 0;
+    bool fetch = false;
+    uint32_t touched = 0, loaded = 0, stored = 0, cleared = 0;   // bytes a pixel
+};
+bool gmemWorth(const GmemChoice& c, std::string* why);
 // PLAN's bins over the render area AREA (X0 Y0 X1 Y1 inclusive, inside the window): the bins of the plan's own grid
 // that the area touches. The grid is the window's, from its origin, as both of Mesa's drivers have it on this family
 // (freedreno_gmem.c: "on a6xx, the max-scissor-rect is handled in fd6_gmem, and we just rely on CP_COND_EXEC to skip
