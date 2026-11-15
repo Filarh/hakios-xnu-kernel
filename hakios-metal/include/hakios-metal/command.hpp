@@ -193,9 +193,15 @@ public:
     // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
     // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
+    // ...and the samples each pass's draws passed: the RB's running count copied out by ZPASS_DONE at the pass's start
+    // and after its tail, as turnip's autotune takes it (tu_autotune.cc:642-733), into PassTime::samples. What a pass
+    // writes through the RB is its samples times the bytes of what it writes (doubled when it blends): the measured half
+    // of the choice between tiles and sysmem (dev-notes/investigacion/13 §10.4). Off by default: three packets at each
+    // end of a pass.
+    void setProfileSamples(bool on) { profileSamples_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
     // the counter at both (so the draws no longer overlap: what each costs alone), with its program's name. Which
     // draws of a heavy frame are heavy is read off these (metal_fps=draws).
@@ -277,6 +283,9 @@ private:
     std::unordered_map<uint64_t, uint32_t> ordinals_;   // passes opened so far into each kind of target
     std::vector<PassTime> profiled_;   // as recorded; us filled in by passTimes from the stamps
     std::shared_ptr<Buffer> profileStamps_;
+    bool profileSamples_ = false;
+    std::shared_ptr<Buffer> sampleStamps_;   // setProfileSamples's: the sample count at each pass's start and end
+    void sampleStamp(uint32_t slot);
     // the counter into stamp slot SLOT (two a pass: start, end), when profiling and there is room
     void stamp(uint32_t slot);
     void stampStart(PassKind kind, uint32_t width, uint32_t height);

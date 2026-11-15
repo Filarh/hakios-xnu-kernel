@@ -367,11 +367,37 @@ void CommandBuffer::stampStart(PassKind kind, uint32_t width, uint32_t height) {
     if (!(profile_ || tuning_) || profiled_.size() >= kMaxProfiled) return;
     { PassTime t{}; t.kind = kind, t.width = width, t.height = height; profiled_.push_back(std::move(t)); }
     stamp(uint32_t(2 * (profiled_.size() - 1)));
+    if (profileSamples_) sampleStamp(uint32_t(2 * (profiled_.size() - 1)));
 }
 
 void CommandBuffer::stampEnd() {
     if (!(profile_ || tuning_) || profiled_.empty()) return;
     stamp(uint32_t(2 * (profiled_.size() - 1) + 1));
+    if (profileSamples_) sampleStamp(uint32_t(2 * (profiled_.size() - 1) + 1));
+}
+
+// The RB's running sample count into slot SLOT: RB_SAMPLE_COUNT_CONTROL.COPY, the address, ZPASS_DONE (turnip's
+// tu_autotune_begin_renderpass / _end_renderpass, A6XX path). The copy lands when the RB has it; the submission's own
+// end (the kernel's CP_WAIT_FOR_IDLE and CACHE_FLUSH_TS before the fence) is past it when the buffer completes, which
+// is when passTimes reads it.
+void CommandBuffer::sampleStamp(uint32_t slot) {
+    if (sampleStamps_ == nullptr) {
+        std::string why;
+        sampleStamps_ = queue_.takeBuffer(16 * kMaxProfiled, &why);
+        if (sampleStamps_ == nullptr) {
+            profileSamples_ = false;
+            return;
+        }
+        memset(sampleStamps_->contents(), 0, 16 * kMaxProfiled);
+        keep(sampleStamps_);
+    }
+    const uint64_t at = sampleStamps_->gpuAddress() + 8ull * slot;
+    const uint32_t control = a6xx::A6XX_RB_SAMPLE_COUNT_CONTROL_COPY, address[2] = {uint32_t(at), uint32_t(at >> 32)};
+    stream_.registers(a6xx::REG_A6XX_RB_SAMPLE_COUNT_CONTROL, &control, 1);
+    stream_.registers(a6xx::REG_A6XX_RB_SAMPLE_COUNT_ADDR, address, 2);
+    const uint32_t event = a6xx::eventWrite0(a6xx::ZPASS_DONE);
+    stream_.packet(a6xx::CP_EVENT_WRITE, &event, 1);
+    use(*sampleStamps_, true);
 }
 
 void CommandBuffer::drawStamp(uint32_t slot) {
@@ -409,6 +435,12 @@ std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
     const auto* t = static_cast<const uint64_t*>(profileStamps_->contents());
     for (size_t i = 0; i < out.size(); i++) {
         out[i].us = t[2 * i + 1] > t[2 * i] ? double(t[2 * i + 1] - t[2 * i]) / 19.2 : 0.0;
+    }
+    if (sampleStamps_ != nullptr) {
+        const auto* c = static_cast<const uint64_t*>(sampleStamps_->contents());
+        for (size_t i = 0; i < out.size(); i++) {
+            if (c[2 * i + 1] >= c[2 * i]) out[i].samples = int64_t(c[2 * i + 1] - c[2 * i]);
+        }
     }
     return out;
 }
@@ -452,6 +484,7 @@ CommandBuffer::~CommandBuffer() {
     if (finished_) {
         queue_.giveBuffer(std::move(profileStamps_));
         queue_.giveBuffer(std::move(drawStamps_));
+        queue_.giveBuffer(std::move(sampleStamps_));
     }
 }
 

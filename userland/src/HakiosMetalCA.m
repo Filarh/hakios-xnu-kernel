@@ -2126,6 +2126,24 @@ hm_ft_take(double created)
 }
 
 /* the gpass lines of a command buffer the GPU is done with (or never had): the core's passes as it timed them */
+/* Boot-arg metal_samples=1: each timed pass also counts the samples its draws passed (ZPASS_DONE at both ends,
+ * hakios_metal_cb_set_profile_samples), shown in the passes: lines and the gpass lines of a trace. What a pass writes
+ * through the RB is its samples times the bytes it writes (doubled when it blends): the measured half of the choice
+ * between tiles and sysmem (13 §10.4). Off by default (three packets at each end of a pass). */
+static BOOL
+hm_samples_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_samples=1") != NULL;
+	}
+	return on == 1;
+}
+
 static void
 hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
 {
@@ -2143,10 +2161,10 @@ hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
 		(void)hakios_metal_cb_pass_access(cb, (unsigned)i, &wrote, &read);
 		(void)hakios_metal_cb_pass_moved(cb, (unsigned)i, &loaded, &stored);
 		hm_ft_line(ft, "gpass i=%d kind=%s w=%u h=%u draws=%u us=%.1f mode=%s tiles=%d attached=0x%x touched=0x%x wrote=0x%x read=0x%x loaded=0x%x "
-			   "stored=0x%x why=%s\n", i,
+			   "stored=0x%x samples=%lld why=%s\n", i,
 			   HM_FT_NAME(kind, "draw", "copy", "clear", "dispatch"), width, height, draws, us,
 			   kind != 0 ? "-" : tiles > 0 ? "gmem" : "sysmem", MAX(tiles, 0), attached, touched, wrote, read, loaded, stored,
-			   hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
+			   hakios_metal_cb_pass_samples(cb, (unsigned)i), hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
 	}
 }
 
@@ -6763,6 +6781,7 @@ HM_REFUSES_OUT_LOUD
 	if (_cb != NULL) {
 		hakios_metal_cb_skip_refused(_cb, !hm_strict());
 		hakios_metal_cb_set_profile(_cb, hm_fps_on() || _ftrace != NULL);   /* (a recorded buffer's passes are timed, for its gpass lines) */
+		hakios_metal_cb_set_profile_samples(_cb, (hm_fps_on() || _ftrace != NULL) && hm_samples_on());
 		hakios_metal_cb_set_gmem(_cb, hm_gmem_on() || hm_gmem_draws() != 0);
 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
 		hakios_metal_cb_set_gmem_binning(_cb, (hm_gmem_off() & 16) == 0);   /* metal_gmem_off's 16: every draw in every tile */
@@ -7495,9 +7514,13 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 						/* (a tiled pass's attachments: those set, those its draws write or read -- TOUCHED's low byte, with why
 						 * it was tiled above it -- the two apart: written by a fragment stage's output, read by a fetch; and
 						 * those its tiles loaded from memory and stored to it) */
-						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x loaded %#x stored %#x %.3f ms%s%s\n", i, kind,
+						char samples[48] = "";
+						const long long counted = hakios_metal_cb_pass_samples(cb, (unsigned)i);
+
+						if (counted >= 0) snprintf(samples, sizeof(samples), " samples %lld", counted);
+						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x loaded %#x stored %#x %.3f ms%s%s%s\n", i, kind,
 							 width, height, draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, wrote, read, loaded, stored, us / 1e3,
-							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)[0] != 0 ? " sysmem: " : "",
+							 samples, hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)[0] != 0 ? " sysmem: " : "",
 							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i));
 					}
 				}

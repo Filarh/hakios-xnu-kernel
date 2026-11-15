@@ -518,6 +518,10 @@ void hakios_metal_cb_skip_refused(hakios_metal_cb *cb, int on);
  * passes timed is returned, -1 for an I past them (any pointer may be NULL) */
 void hakios_metal_cb_set_profile(hakios_metal_cb *cb, int on);
 int hakios_metal_cb_pass_time(hakios_metal_cb *cb, unsigned i, unsigned *kind, unsigned *width, unsigned *height, unsigned *draws, double *us);
+/* ...and with the profile, the samples each pass's draws passed, counted by the RB (CommandBuffer::setProfileSamples:
+ * ZPASS_DONE at each end of a pass); pass I's count once CB has completed, -1 when not counted or past the passes */
+void hakios_metal_cb_set_profile_samples(hakios_metal_cb *cb, int on);
+long long hakios_metal_cb_pass_samples(hakios_metal_cb *cb, unsigned i);
 /* what CB holds so far (CommandBuffer::counts): passes opened, draws, dispatches, copies and clears; any pointer NULL */
 void hakios_metal_cb_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *draws, unsigned *dispatches, unsigned *copies, unsigned *clears);
 /* tiled rendering (render::Options::gmem) for CB's passes from now on, on by default; and of what CB holds, the passes

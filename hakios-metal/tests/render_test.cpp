@@ -2990,6 +2990,41 @@ TEST(a_profiled_command_buffer_lists_its_passes) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// The samples each pass passed (setProfileSamples): ZPASS_DONE copies the RB's count at the pass's start and after its
+// tail, and the difference is the pass's. The fake counts a draw's indices times its instances (no rasterizer), so a
+// pass of two 3-vertex draws and one of a 6-vertex draw read 6 each, the copy between them 0; without the switch no
+// sample is counted and no packet is added (the twin: the same buffer's stream is shorter by the six packets)
+TEST(a_profiled_command_buffer_counts_each_passes_samples) {
+    Rig r;
+    auto t = target(r), u = target(r);
+    RenderPass a, b;
+    a.color0 = t.get();
+    b.color0 = u.get();
+    uint64_t words[2] = {};
+    for (int counted = 0; counted < 2; counted++) {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setProfileSamples(counted == 1);
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb->blit(*t, 0, render::BlitRect{0, 0, 16, 16}, *u, 0, render::BlitRect{0, 0, 16, 16}, false));
+        CHECK(cb->draw(flatProgram(), b, wholeDraw(6), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        const auto p = cb->passTimes();
+        CHECK_EQ(p.size(), size_t(3));
+        if (p.size() == 3) {
+            CHECK_EQ(p[0].samples, counted ? 6 : -1);
+            CHECK_EQ(p[1].samples, counted ? 0 : -1);
+            CHECK_EQ(p[2].samples, counted ? 6 : -1);
+        }
+        words[counted] = r.fake->stats().cpWords;
+    }
+    CHECK(words[1] > 2 * words[0]);   // (the second buffer's stream read on top of the first's, and longer)
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 // (a measurement, not a rule: how many words a draw adds to its pass, and of which packets -- the per-draw cost on the
 // phone is the command processor reading these)
 // A second draw of the same state into the same pass writes only what changed: far fewer words than the first, which
