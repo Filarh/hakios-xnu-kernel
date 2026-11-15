@@ -5365,14 +5365,39 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         CHECK(p.cols * p.binW >= w && (p.cols - 1) * p.binW < w && p.rows * p.binH >= h && (p.rows - 1) * p.binH < h);
         std::printf("       %ux%u %s: %u x %u tiles of %u x %u\n", w, h, t->info().name, p.cols, p.rows, p.binW, p.binH);
     }
-    // the screen at 4 bytes a pixel: two columns of 576 and twelve rows of 208, 24 tiles
+    // The layouts turnip gives the same passes, worked out apart from this code from tu_render_pass_gmem_config
+    // (tu_pass.cc:848-877) and tu_tiling_config_update_tile_layout (tu_util.cc:286-343) for each chip's GMEM below the
+    // colour cache: one, two and three BGRA8 attachments at the phone's screen and at 1125 x 2436, the bins and where the
+    // second attachment's begin.
     {
-        auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
-        RenderPass a;
-        a.color0 = t.get();
-        render::GmemPlan p;
-        CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
+        struct Want { uint32_t w, h, attachments, binW, binH, cols, rows, base1; };
+        static_assert(a6xx::kGmemCcuColorOffset == 0x78000, "the Adreno 7c+'s GMEM below the colour cache");
+        const Want wants[] = {{750, 1624, 1, 768, 160, 1, 11, 0},     {750, 1624, 2, 256, 240, 3, 7, 245760},  {750, 1624, 3, 192, 208, 4, 8, 163840},
+                              {1125, 2436, 1, 384, 320, 3, 8, 0},     {1125, 2436, 2, 288, 208, 4, 12, 245760}};
+        for (const Want& q : wants) {
+            std::shared_ptr<Texture> ts[3];
+            RenderPass a;
+            for (uint32_t i = 0; i < q.attachments; i++) {
+                ts[i] = target(r, q.w, q.h, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+                (i == 0 ? a.color0 : a.more[i - 1].texture) = ts[i].get();
+            }
+            render::GmemPlan p;
+            CHECK(render::gmemPlan(a, &p, nullptr));
+            CHECK(p.binW == q.binW && p.binH == q.binH && p.cols == q.cols && p.rows == q.rows && p.gridCols == q.cols && p.gridRows == q.rows);
+            CHECK(p.base[0] == 0 && (q.attachments < 2 || p.base[1] == q.base1));
+            // each attachment's bin inside its own room, the rooms apart and below the colour cache
+            for (uint32_t i = 0; i < q.attachments; i++) {
+                CHECK(uint64_t(p.binW) * p.binH * 4 <= p.room[i] && p.base[i] % 4096 == 0);
+                CHECK(p.base[i] + p.room[i] <= (i + 1 < q.attachments ? p.base[i + 1] : a6xx::kGmemCcuColorOffset));
+            }
+            // (and the layout this had before, for the bisect: one column of bins while the window is no wider than a bin,
+            // never fewer bins than turnip's -- and none at all for three attachments in the Adreno 610's GMEM, where a
+            // 768-pixel bin of 16 rows does not fit a third of it: such a pass went to sysmem)
+            render::GmemPlan old;
+            const bool had = render::gmemPlan(a, &old, nullptr, render::kGmemPlanOld);
+            CHECK(had || (a6xx::kGmemCcuColorOffset == 0x20000 && q.attachments == 3));
+            if (had) CHECK(old.cols == (q.w <= 1024 ? 1u : 2u) && old.tiles() >= p.tiles());
+        }
     }
     // what stays in sysmem: a second colour attachment of another size, an integer target
     {
@@ -5489,7 +5514,14 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
+        // (both attachments' shares the same, the second's bin after the first's)
+        CHECK(p.base[0] == 0 && p.base[1] == a6xx::kGmemCcuColorOffset / 2 && p.room[0] == a6xx::kGmemCcuColorOffset / 2 && p.room[1] == p.room[0]);
+        // drawn into the first alone, the pass's bins are the first's with all of GMEM: the same width, taller
+        if (!both) {
+            const uint32_t binH = p.binH;
+            CHECK_EQ(render::gmemTouched(&p, 1, 1125, 2436), 2u);
+            CHECK(p.room[0] == a6xx::kGmemCcuColorOffset && p.room[1] == 0 && p.base[1] == 0 && p.binH > binH && uint64_t(p.binW) * p.binH * 4 <= p.room[0]);
+        }
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
@@ -6076,6 +6108,149 @@ TEST(bins_laid_from_the_render_areas_corner_are_not_the_vscs) {
             CHECK(s.lastFault.find("the VSC bins from the window's origin") != std::string::npos);
         }
     }
+}
+
+// GMEM for the attachments a pass's draws touch. CoreAnimation's main pass has two screens attached; a pass whose
+// draws write the first alone needs no bin for the second, and its bins are the first's with all of GMEM: the same
+// width (the draws were recorded with it), taller, fewer. Here a stage with two colour slots whose second has no
+// output register: its draws still give the RB an RB_MRT[1], recorded with BASE_GMEM where the second's bin would
+// have been, which is rewritten to 0 -- left as recorded (the twin) it names a bin that runs into the CCU's colour
+// cache. A stage that does name the second slot, with every component masked off, keeps the second's bin.
+TEST(a_pass_gives_gmem_to_the_attachments_its_draws_touch) {
+    Stage gapFs = kernels::tri_mrt_fs_air;
+    gapFs.colorRegid[1] = a6xx::kRegidNone;
+    const Program mrt{kernels::tri_flat_vs_air, gapFs, Linkage{}, "tri_mrt without its second output"};
+    for (int twin = 0; twin < 2; twin++) {
+        for (int binning = 0; binning < 2; binning++) {
+            Rig r;
+            auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+            auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+            fillCoords(*t);
+            fillCoords(*u, 0x80000000u);
+            RenderPass a;
+            a.color0 = t.get();
+            a.more[0].texture = u.get();
+            a.more[0].load = LoadAction::kDontCare;
+            a.more[0].store = StoreAction::kDontCare;
+            render::GmemPlan both, one;
+            CHECK(render::gmemPlan(a, &both, nullptr));
+            one = both;
+            CHECK_EQ(render::gmemTouched(&one, 1, 750, 1624), 2u);
+            CHECK(one.binW == both.binW && one.binH > both.binH && one.tiles() < both.tiles());
+            render::Options o;
+            o.gmemBinning = binning != 0;
+            o.gmemTwin = twin ? 6 : 0;
+            auto cb = r.queue->commandBuffer();
+            CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, o));
+            CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, o));
+            cb->commit();
+            cb->waitUntilCompleted();
+            const auto s = r.fake->stats();
+            if (twin == 0) {
+                CHECK(cb->status() == CommandBuffer::kCompleted);
+                CHECK_EQ(s.faults, 0u);
+                if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+                CHECK(s.tiles == one.tiles() && s.tileLoads == one.tiles() && s.tileStores == one.tiles());
+                CHECK_EQ(cb->counts().tiles, one.tiles());
+                CHECK_EQ(coordsWrong(*t), 0u);
+                CHECK_EQ(coordsWrong(*u, 0x80000000u), 0u);
+            } else {
+                CHECK(cb->status() == CommandBuffer::kError);
+                CHECK(s.lastFault.find("RB_MRT_BASE_GMEM[1]: a bin to") != std::string::npos && s.lastFault.find("into the CCU's colour cache") != std::string::npos);
+            }
+        }
+    }
+    // the second slot named and masked: both bins, the first's draws stored, the second's not
+    {
+        Program masked{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"};
+        masked.moreBlend[0].writeMask = 0;
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->draw(masked, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        CHECK(r.fake->stats().tiles == both.tiles() && r.fake->stats().tileStores == both.tiles());
+    }
+    // a bin for every attachment all the same (kGmemEveryBin): the plan's own bins, the first attachment's loads and stores
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(CommandBuffer::kGmemEveryBin);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted && r.fake->stats().faults == 0);
+        CHECK(r.fake->stats().tiles == both.tiles() && r.fake->stats().tileStores == both.tiles());
+    }
+    // every attachment loaded and stored (kGmemEveryAttachment): every one has its bin, as planned
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan both;
+        CHECK(render::gmemPlan(a, &both, nullptr));
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(CommandBuffer::kGmemEveryAttachment);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted && r.fake->stats().tiles == both.tiles() && r.fake->stats().tileStores == 2 * both.tiles());
+    }
+    // ...and the bins as before turnip's layout (kGmemOldTiles): one column, a bin for both
+    {
+        Rig r;
+        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = t.get();
+        a.more[0].texture = u.get();
+        render::GmemPlan old;
+        CHECK(render::gmemPlan(a, &old, nullptr, render::kGmemPlanOld));
+        CHECK_EQ(old.cols, 1u);
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemOff(CommandBuffer::kGmemOldTiles);
+        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        CHECK_EQ(r.fake->stats().tiles, old.tiles());
+    }
+}
+
+// The VSC's pipes: the bins of a grid grouped as fd's gmem layout groups them, and no binning at all when a pipe would
+// hold more than the 32 bins CP_SET_BIN_DATA5 can name.
+TEST(a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned) {
+    render::GmemPlan p;
+    uint32_t x = 0, y = 0;
+    p.gridCols = 6, p.gridRows = 13;   // the phone's main pass: 13 rows of bins, a pipe a row
+    CHECK(render::gmemPipes(p, &x, &y));
+    CHECK(y == 1 && x * y <= 32 && (p.gridRows + y - 1) / y * ((p.gridCols + x - 1) / x) <= a6xx::kNumVscPipes);
+    p.gridCols = 1, p.gridRows = 102;   // ...and as one column of 102
+    CHECK(render::gmemPipes(p, &x, &y));
+    CHECK(x == 1 && y % 2 == 1 && (p.gridRows + y - 1) / y <= a6xx::kNumVscPipes);
+    p.gridCols = 40, p.gridRows = 40;
+    CHECK(!render::gmemPipes(p, &x, &y));
+    CHECK(x * y > 32);
 }
 
 // drawStates on streams written by hand: a fragment holds every register of its group as it stands at the draw, not

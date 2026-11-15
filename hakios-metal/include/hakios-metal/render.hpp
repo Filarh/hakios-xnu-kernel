@@ -490,7 +490,9 @@ struct Options {
     uint8_t gmemTwin = 0;        // (the fake's twins of a binned pass's draw-state groups, gmem.hpp: 1 each fragment only what the draw
                                  // itself wrote, 2 the loads neither DIRTY nor sent with the program's, 3 CP_SKIP_IB2_ENABLE_LOCAL
                                  // before the tile's CP_SET_BIN_DATA5, which clears it, 4 the groups not let go between tiles,
-                                 // 5 the bins from the render area's corner instead of the window's origin; 0 the stream as it is meant)
+                                 // 5 the bins from the render area's corner instead of the window's origin, 6 an attachment no
+                                 // draw touched left with the RB_MRT_BASE_GMEM its draws were recorded with when the bins grow
+                                 // over it (gmemTouched); 0 the stream as it is meant)
     uint8_t rotate2d = 0;        // encodeBlit's RB_2D_BLIT_CNTL.ROTATE (a6xx_rotation: 0, 90, 180, 270, hflip, vflip as 0..5);
                                  // a quarter turn takes a destination rectangle of the source's sides swapped
 };
@@ -502,9 +504,11 @@ static_assert(alignof(Options) == 1, "render::Options holds bools and bytes only
 // Tiled rendering (GMEM). Sysmem rendering sends every blended pixel of every draw through the colour CCU to memory and
 // back: CoreAnimation's full-screen layers then cost a read and a write of the whole target each (8 blended layers at
 // 1125 x 2436 took the GPU 7.6 ms so, 3.1 ms in GMEM: probe "GMEM cost"). In GMEM the target is loaded tile by tile into the on-chip memory, all of the pass's draws run
-// against the tile there, and the tile is stored once. The tiles: as few columns as the bin width allows
-// (kTileMaxW), as tall as the GMEM below the CCU's colour cache holds (kGmemCcuColorOffset), balanced so the last
-// row and column are not slivers.
+// against the tile there, and the tile is stored once. The tiles are turnip's for the same pass (gmemPlan, gmemBins):
+// the fewest bins that the GMEM below the CCU's colour cache (kGmemCcuColorOffset) holds, the squarest of those.
+// What a tile costs beside its pixels -- its load and store, its wait for idle, the state of the draws that reach
+// it -- is paid once a tile: CoreAnimation's main pass on the Adreno 610 (750 x 1624, two 4-byte attachments) was 102
+// tiles of 768 x 16 as one column of bins, and is 78 of 128 x 128 so.
 struct GmemPlan {
     // Where in GMEM each colour attachment's bin lies (RB_MRT's BASE_GMEM) and how much room it has there: GMEM below
     // the CCU's colour cache shared out by bytes a pixel. Fixed when the pass opens -- the draws are encoded with it --
@@ -523,7 +527,24 @@ struct GmemPlan {
 // bytes a pixel, their rows with room for the event blit's 16 x 4 granules past the edges; no depth or stencil. A bin
 // holds every attachment's pixels (CoreAnimation's main pass draws into two screens at once). False with *why
 // otherwise (the pass then runs in sysmem, as before).
-bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why);
+// (FLAGS: kGmemPlanOld, the shares and the one column of bins this had before turnip's -- for a bisect on the phone)
+enum : uint32_t { kGmemPlanOld = 1 };
+bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t flags = 0);
+// PLAN's bins for a W x H window out of its attachments' rooms: turnip's layout (render.cpp). WIDTH 0, or the one
+// bin width allowed. False when the rooms hold no bin.
+bool gmemBins(GmemPlan* plan, uint32_t W, uint32_t H, uint32_t width);
+// PLAN for the attachments in TOUCHED alone (a mask), once a pass's draws are known: an attachment no draw writes or
+// reads and no tile clears needs no bin, and the GMEM it was given goes to the one before it -- taller bins of the
+// same width, since the draws were recorded with that width (a fetch's descriptor) and with each touched attachment's
+// place. CoreAnimation's main pass has two screens attached; drawing into one of them alone it is 42 tiles of
+// 128 x 240 where both make it 78 of 128 x 128. The attachments whose place moved (to 0, where they are never written),
+// as a mask: their RB_MRT_BASE_GMEM in the recorded draws is to be rewritten. 0 and the plan unchanged when nothing fits.
+uint32_t gmemTouched(GmemPlan* plan, uint32_t touched, uint32_t W, uint32_t H);
+// How PLAN's grid is grouped into VSC pipes, as fd's gmem layout groups bins (freedreno_gmem.c:321-326: rows of bins
+// to a pipe up by 2 until the pipes hold the rows, then columns up by 1): bins a pipe each way. False when a pipe would
+// hold more than 32 bins, which CP_SET_BIN_DATA5 cannot name (fd6 use_hw_binning, turnip is_hw_binning_possible): such
+// a pass is not binned.
+bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY);
 // PLAN's bins over the render area AREA (X0 Y0 X1 Y1 inclusive, inside the window): the bins of the plan's own grid
 // that the area touches. The grid is the window's, from its origin, as both of Mesa's drivers have it on this family
 // (freedreno_gmem.c: "on a6xx, the max-scissor-rect is handled in fd6_gmem, and we just rely on CP_COND_EXEC to skip
