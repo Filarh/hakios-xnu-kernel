@@ -5741,6 +5741,7 @@ TEST(a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone) {
             p.load = load;
             auto cb = r.queue->commandBuffer();
             cb->setGmemMinDraws(16);
+            cb->setProfile(true);
             if (alone) cb->setGmemOff(CommandBuffer::kGmemByDrawsAlone);
             for (int i = 0; i < draws; i++) CHECK(cb->draw(fetch ? fb : flatProgram(), p, wholeDraw(6), Bindings{}, Bindings{}));
             cb->commit();
@@ -5749,6 +5750,16 @@ TEST(a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone) {
             CHECK_EQ(cb->counts().passes, 1u);
             CHECK_EQ(r.fake->stats().faults, 0u);
             if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+            // what a tiled pass's profile says it was tiled for (PassTime::touched's upper bits)
+            const auto times = cb->passTimes();
+            CHECK_EQ(times.size(), size_t(1));
+            if (times.size() == 1 && cb->counts().gmemPasses == 1) {
+                const uint32_t said = times[0].touched & 0xff00u;
+                const uint32_t want = (fetch ? uint32_t(CommandBuffer::kPassReads) : 0u) | (draws < 16 ? uint32_t(CommandBuffer::kPassBelowBar) : 0u) |
+                                      (load == LoadAction::kDontCare ? uint32_t(CommandBuffer::kPassNoLoad) : 0u);
+                CHECK_EQ(said, want);
+                CHECK_EQ(times[0].touched & 0xffu, 1u);
+            }
             return cb->counts().gmemPasses;
         };
         {
