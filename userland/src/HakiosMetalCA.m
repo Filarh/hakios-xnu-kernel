@@ -1201,7 +1201,8 @@ HM_REFUSES_OUT_LOUD
 - (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft;   /* metal_trace=frame: its id, its samp line written the first time */
 @end
 
-#define HM_SPEC_MOST 64   /* the contents of its deciding buffer an uber shader's pipeline is specialised for */
+#define HM_SPEC_MOST 128  /* the contents of its deciding buffer an uber shader's pipeline is specialised for */
+#define HM_SPEC_ALIASES 8 /* ...and the last contents found to be one of them but for bytes that decide nothing */
 
 @interface HakiosMetalComputePipelineState : _MTLComputePipelineState {
 	HakiosMetalDevice *_device;
@@ -1222,7 +1223,10 @@ HM_REFUSES_OUT_LOUD
 	/* an uber shader's specialisations (hakiosProgramFor:): its fragment bitcode and constants, the constant buffer
 	 * whose bytes choose its path, and for each content seen (HM_SPEC_MOST at most) its bytes, their hash and the
 	 * program compiled for it (NULL while it compiles, or when it could not be) -- plain arrays under a lock, because
-	 * every draw of the pipeline asks */
+	 * every draw of the pipeline asks. Once a content's program is compiled, the bytes of it that the compilation
+	 * read are known (_specMasks, hakios_metal_program_known_reads): a content that holds the same in those bytes is
+	 * that content, whatever its other bytes are (padding and the bytes after the structure's last field are whatever
+	 * its buffer held before). */
 	NSData *_fsAir;
 	hakios_metal_constant _fsConstants[64];
 	unsigned _fsConstantCount;
@@ -1233,6 +1237,11 @@ HM_REFUSES_OUT_LOUD
 	uint64_t _specHashes[HM_SPEC_MOST];
 	hakios_metal_program *_specPrograms[HM_SPEC_MOST];
 	uint8_t *_specKeys;                 /* HM_SPEC_MOST x _specLength bytes */
+	uint8_t *_specMasks;                /* the same shape: 0xff where the content's byte decided its program (all, until it is known) */
+	BOOL _specMasked[HM_SPEC_MOST];     /* its mask is known */
+	uint64_t _specAliasHashes[HM_SPEC_ALIASES];   /* contents matched through a mask lately: their hash and the slot */
+	uint8_t _specAliasSlots[HM_SPEC_ALIASES];
+	unsigned _specAliasNext;
 	struct hm_ft_pipe *_ftPipe;         /* metal_trace=frame: how a trace describes it (made with it while the switch is on) */
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
@@ -8767,6 +8776,7 @@ HM_REFUSES_OUT_LOUD
 		if (_specPrograms[i] != NULL) hakios_metal_program_free(_specPrograms[i]);
 	}
 	free(_specKeys);
+	free(_specMasks);
 	[_fsAir release];
 	hm_ft_pipe_free(_ftPipe);
 	if (_program != NULL) {
@@ -8833,10 +8843,12 @@ hm_spec_off(void)
 	}
 	if (_specBinding < 0) return;
 	_specKeys = calloc(HM_SPEC_MOST, _specLength);
-	if (_specKeys == NULL) {
+	_specMasks = malloc((size_t)HM_SPEC_MOST * _specLength);
+	if (_specKeys == NULL || _specMasks == NULL) {
 		_specBinding = -1;
 		return;
 	}
+	memset(_specMasks, 0xff, (size_t)HM_SPEC_MOST * _specLength);
 	_specLock = OS_UNFAIR_LOCK_INIT;
 	_fsAir = [air retain];
 	_fsConstantCount = count < 64 ? count : 64;
@@ -8863,8 +8875,24 @@ hm_hash_bytes(const uint8_t *p, size_t length)
 }
 
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
- * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 s on the host, and a frame
- * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. */
+ * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 to 1.1 s on the phone, and a
+ * frame must not wait for it). HM_SPEC_MOST contents at most a pipeline; past them the pipeline's own. */
+/* boot-arg metal_spec_mask=0 (a bisect's): a content is another's only when all its bytes are the same, as before the
+ * bytes a compilation read were known */
+static BOOL
+hm_spec_exact(void)
+{
+	static int exact = -1;
+
+	if (exact < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		exact = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_spec_mask=0") != NULL;
+	}
+	return exact != 0;
+}
+
 - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
 {
 	static dispatch_queue_t compiling;
@@ -8892,6 +8920,32 @@ hm_hash_bytes(const uint8_t *p, size_t length)
 			break;
 		}
 	}
+	/* not these very bytes: the same as a content already compiled in every byte its compilation read? (the last few
+	 * such contents by their hash first, then the slots whose masks are known) */
+	for (unsigned a = 0; slot < 0 && a < HM_SPEC_ALIASES; a++) {
+		const unsigned i = _specAliasSlots[a];
+
+		if (_specAliasHashes[a] == hash && i < _specCount && _specMasked[i]) {
+			const uint8_t *was = _specKeys + (size_t)i * _specLength, *mask = _specMasks + (size_t)i * _specLength;
+			BOOL same = YES;
+
+			for (unsigned b = 0; same && b < _specLength; b++) same = ((key[b] ^ was[b]) & mask[b]) == 0;
+			if (same) slot = (int)i;
+		}
+	}
+	for (unsigned i = 0; slot < 0 && i < _specCount; i++) {
+		if (!_specMasked[i]) continue;
+		const uint8_t *was = _specKeys + (size_t)i * _specLength, *mask = _specMasks + (size_t)i * _specLength;
+		BOOL same = YES;
+
+		for (unsigned b = 0; same && b < _specLength; b++) same = ((key[b] ^ was[b]) & mask[b]) == 0;
+		if (same) {
+			slot = (int)i;
+			_specAliasHashes[_specAliasNext % HM_SPEC_ALIASES] = hash;
+			_specAliasSlots[_specAliasNext % HM_SPEC_ALIASES] = (uint8_t)i;
+			_specAliasNext++;
+		}
+	}
 	if (slot >= 0) {
 		if (_specPrograms[slot] != NULL) found = _specPrograms[slot];
 	} else if (_specCount < HM_SPEC_MOST) {
@@ -8899,7 +8953,11 @@ hm_hash_bytes(const uint8_t *p, size_t length)
 		_specHashes[slot] = hash;
 		memcpy(_specKeys + (size_t)slot * _specLength, key, _specLength);
 		_specPrograms[slot] = NULL;
+		_specMasked[slot] = NO;
 		start = YES;
+	} else {
+		HM_ONCE("specialise: a pipeline has %d contents of its deciding buffer compiled and is asked for another: its own program, "
+			"unspecialised, draws that one\n", HM_SPEC_MOST);
 	}
 	os_unfair_lock_unlock(&_specLock);
 	if (start) {
@@ -8924,8 +8982,16 @@ hm_hash_bytes(const uint8_t *p, size_t length)
 					 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
 					 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
 			}
+			/* the bytes its compilation read: from now on a content that agrees in them is this one */
+			uint8_t reads[256];
+			const unsigned known = p != NULL ? hakios_metal_program_known_reads(p, reads, _specLength) : 0;
+
 			os_unfair_lock_lock(&_specLock);
 			_specPrograms[slot] = p;   /* (NULL when it could not be compiled: the pipeline's own goes on for this content) */
+			if (known == _specLength && !hm_spec_exact()) {
+				memcpy(_specMasks + (size_t)slot * _specLength, reads, _specLength);
+				_specMasked[slot] = YES;
+			}
 			os_unfair_lock_unlock(&_specLock);
 			[self release];
 		});

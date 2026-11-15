@@ -152,6 +152,7 @@ METAL_GMEM_OFF	arg	metal_gmem_off	User space	u	HakiosMetalCA.m
 METAL_KEEP	arg	metal_keep	User space	u	HakiosMetalCA.m	no draw is taken from what hakios-metal keeps of its program (hakios_metal_draw_states): each is judged and written whole
 METAL_M2V	arg	metal_m2v	User space	u	HakiosMetalCA.m	
 METAL_SKIP	arg	metal_skip	User space	u	HakiosMetalCA.m	
+METAL_SPEC_MASK	arg	metal_spec_mask	User space	u	HakiosMetalCA.m	
 METAL_SWIZZLE	arg	metal_swizzle	User space	u	HakiosMetalCA.m	
 METAL_TRACE	arg	metal_trace	User space	u	HakiosMetalCA.m	the tex line, the first time a recorded command buffer names this texture
 METAL_TRACE_CBS	arg	metal_trace_cbs	User space	u	HakiosMetalCA.m	

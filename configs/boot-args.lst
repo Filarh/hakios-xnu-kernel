@@ -166,6 +166,7 @@ metal_gmem_off	u
 metal_keep	u
 metal_m2v	u
 metal_skip	u
+metal_spec_mask	u
 metal_swizzle	u
 metal_trace	u
 metal_trace_cbs	u
