@@ -9,7 +9,16 @@ dispatch is given -- are taken from Mesa (https://gitlab.freedesktop.org/mesa/me
   src/freedreno/common/freedreno_devices.py                                      (what this chip is to Mesa)
   src/freedreno/computerator/a6xx.cc                                             (the order of a compute dispatch)
 
-Values are facts and carry no licence; where a comment reproduces Mesa's wording it says so. Mesa's notice:
+Values are facts and carry no licence; where a comment reproduces Mesa's wording it says so. Three routines of
+src/render.cpp follow Mesa's closely enough to be called translations, and are under Mesa's notice below:
+
+  src/freedreno/vulkan/tu_pass.cc       tu_render_pass_gmem_config            -> gmemPlan: GMEM shared out among attachments
+  src/freedreno/vulkan/tu_util.cc       tu_tiling_config_update_tile_layout   -> gmemBins: the bin size for a pass
+  src/gallium/drivers/freedreno/freedreno_gmem.c  (the tiles a VSC pipe takes) -> gmemPipes
+
+and two more take Mesa's idea, written here: render::gmemWorth (tu_autotune.cc's choice of GMEM or sysmem by the bytes
+a pass moves) and the draw-state groups of src/gmem.cpp (docs/drivers/freedreno.rst "Draw states", quoted in
+gmem.hpp). Mesa's notice:
 
   Copyright (C) 2013-2026 Rob Clark <robclark@freedesktop.org> and the Mesa contributors
 
