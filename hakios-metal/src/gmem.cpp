@@ -101,6 +101,31 @@ struct Group {
     }
 };
 
+// What drawStates works with, a thread's own and kept from one pass's closing to the next: eight groups' lists, the
+// barrier's packets and the words made so far all grew from nothing at every closing, a doubling at a time -- some
+// 180 requests to the heap a tiled pass.
+struct Work {
+    Group groups[kDsGroups];
+    std::vector<uint32_t> barrier;
+    DrawStates made;
+    void begin() {
+        for (Group& g : groups) {
+            g.regs.clear();
+            g.loads.clear();
+            g.loadsBefore.clear();
+            g.wrote.clear();
+            g.changed = g.invalidates = g.invalidatesBefore = g.set = false;
+            g.invalidate = g.invalidateBefore = g.at = g.words = 0;
+        }
+        barrier.clear();
+        made.prologue.clear();
+        made.blobs.clear();
+        made.list.clear();
+        made.relocs.clear();
+        made.draws = made.entries = made.fragments = made.barriers = 0;
+    }
+};
+
 // registers into a stream as type-4 packets, the runs of consecutive ones together
 void writeRegs(std::vector<uint32_t>& to, const std::vector<std::pair<uint32_t, uint32_t>>& regs, const std::vector<uint32_t>* only) {
     for (size_t i = 0; i < regs.size();) {
@@ -131,9 +156,11 @@ void DrawStates::place(uint64_t blobsAddress) {
 }
 
 bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* out, uint8_t twin, uint32_t fetch) {
-    DrawStates s;
-    Group groups[kDsGroups];
-    std::vector<uint32_t> fragment, barrier;   // (BARRIER: the draw's barrier packets, as recorded)
+    static thread_local Work work;
+    work.begin();
+    DrawStates& s = work.made;
+    Group* const groups = work.groups;
+    std::vector<uint32_t>& barrier = work.barrier;   // (the draw's barrier packets, as recorded)
     bool copies = false, pending = false;   // a copy went to the prologue; state or a barrier waits for its draw
     bool armed = false;                     // the barrier's group is set and not yet let go
     uint32_t barrierAt = 0, barrierWords = 0;   // the barrier's fragment (one for the pass: they are all alike)
@@ -212,7 +239,9 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* 
                 const bool differs = !G.set || G.changed || G.loads != G.loadsBefore || G.invalidates != G.invalidatesBefore ||
                                      (G.invalidates && G.invalidate != G.invalidateBefore);
                 if (differs && (!G.regs.empty() || !G.loads.empty() || G.invalidates)) {
-                    fragment.clear();
+                    // (written where it stays, after the fragments made so far)
+                    std::vector<uint32_t>& fragment = s.blobs;
+                    const size_t from = fragment.size();
                     if (G.invalidates) {
                         fragment.push_back(pm4::type4(REG_A6XX_HLSQ_INVALIDATE_CMD, 1));
                         fragment.push_back(G.invalidate);
@@ -220,11 +249,10 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* 
                     // (twin 1: only what the draw itself wrote -- right until a tile skips the draw that wrote the rest)
                     writeRegs(fragment, G.regs, twin == 1 ? &G.wrote : nullptr);
                     fragment.insert(fragment.end(), G.loads.begin(), G.loads.end());
-                    if (fragment.empty() || fragment.size() > CP_SET_DRAW_STATE__0_COUNT__MASK) return false;
-                    G.at = uint32_t(s.blobs.size());
-                    G.words = uint32_t(fragment.size());
+                    if (fragment.size() == from || fragment.size() - from > CP_SET_DRAW_STATE__0_COUNT__MASK) return false;
+                    G.at = uint32_t(from);
+                    G.words = uint32_t(fragment.size() - from);
                     G.set = true;
-                    s.blobs.insert(s.blobs.end(), fragment.begin(), fragment.end());
                     s.fragments++;
                     sent[count++] = g;
                 }
@@ -283,7 +311,15 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* 
         s.prologue.push_back(pm4::type7(pm4::kWaitMemWrites, 0));
         s.prologue.push_back(pm4::type7(pm4::kWaitForMe, 0));
     }
-    *out = std::move(s);
+    // (the caller's takes the words; this thread keeps the memory they were made in for the next pass)
+    out->prologue.assign(s.prologue.begin(), s.prologue.end());
+    out->blobs.swap(s.blobs);
+    out->list.swap(s.list);
+    out->relocs.swap(s.relocs);
+    out->draws = s.draws;
+    out->entries = s.entries;
+    out->fragments = s.fragments;
+    out->barriers = s.barriers;
     return true;
 }
 
