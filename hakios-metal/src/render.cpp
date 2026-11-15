@@ -4468,7 +4468,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         joins = false;
     }
     if (!joins) {
-        closePass();
+        closePass(&pass);
     }
     render::GmemPlan plan;
     bool gmem = false, dual = false;
@@ -5051,8 +5051,11 @@ bool CommandBuffer::append(CommandBuffer& other) {
     if (!other.error_.empty()) {
         return fail(other.error_);
     }
-    closePass();         // each pass ends in its own stream: nothing of this one's continues into the other's
-    other.closePass();
+    // (each pass ends in its own stream: nothing of this one's continues into the other's -- but what the other's first
+    // pass loads may be what this one's last pass drew, and the other's last what a later one loads: a memoryless
+    // attachment is stored by both)
+    closePass(nullptr, true);
+    other.closePass(nullptr, true);
     appendStream(stream_, other.stream_);
     other.stream_ = pm4::Stream{};
     uses_.insert(uses_.end(), other.uses_.begin(), other.uses_.end());
@@ -5080,7 +5083,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
     return true;
 }
 
-void CommandBuffer::closePass() {
+void CommandBuffer::closePass(const RenderPass* next, bool kept) {
     if (open_ == nullptr) {
         return;
     }
@@ -5089,6 +5092,16 @@ void CommandBuffer::closePass() {
     // it the store would put back what it never loaded into the rows of the next layer or level; CoreAnimation's second
     // screen, DontCare, is 2436 rows, a multiple of 4), or the tiles clear it; stored when written or cleared, unless
     // its store action is DontCare.
+    // A memoryless attachment (Texture::memoryless) has nothing to load but what an earlier half of the same pass
+    // stored for it (its load action Load, which a pass of the caller's cannot begin with), and is stored only for a
+    // later half: when the draw that closes this pass (NEXT) has it attached with Load, or KEPT. Otherwise its tiles
+    // are the whole of its life, as on a GPU that keeps such a texture in tile memory alone.
+    auto keptFor = [&](uint32_t i, const Texture* t) {
+        if (kept) return true;
+        if (next == nullptr) return false;
+        const Texture* n = i == 0 ? next->color0 : next->more[i - 1].texture;
+        return n == t && (i == 0 ? next->load : next->more[i - 1].load) == LoadAction::kLoad;
+    };
     auto loadStore = [&](uint32_t y1, uint32_t H, uint32_t* load, uint32_t* store) {
         // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
         // rows past the bottom may be another layer's or level's)
@@ -5101,6 +5114,11 @@ void CommandBuffer::closePass() {
             if (t == nullptr || (!every && !cleared && (((open_->written | open_->read) >> i) & 1) == 0)) continue;
             const LoadAction la = i == 0 ? open_->pass.load : open_->pass.more[i - 1].load;
             const StoreAction sa = i == 0 ? open_->pass.store : open_->pass.more[i - 1].store;
+            if (t->memoryless() && !every) {
+                if (!cleared && la == LoadAction::kLoad) *load |= 1u << i;
+                if ((cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare && keptFor(i, t)) *store |= 1u << i;
+                continue;
+            }
             if (!cleared && (every || !(la == LoadAction::kDontCare && inside))) *load |= 1u << i;
             if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) *store |= 1u << i;
         }
@@ -5284,6 +5302,8 @@ void CommandBuffer::closePass() {
                                                 (load == 0 ? kPassNoLoad : 0u));
             profiled_.back().wrote = uint8_t(open_->written);
             profiled_.back().read = uint8_t(open_->read);
+            profiled_.back().loaded = uint8_t(load);
+            profiled_.back().stored = uint8_t(store);
         }
     }
     {

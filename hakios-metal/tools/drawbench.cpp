@@ -82,6 +82,7 @@ struct Asked {
     bool gpu = false;    // --gpu: what the fake GPU's command processor and tiles did for the last measured frame
     int gmemOff = 0;     // --gmem-off BITS: metal_gmem_off, as the plug-in passes it on (0, as with no boot-arg)
     int gmemDraws = -1;  // --gmem-draws N: metal_gmem_draws (56 with no boot-arg)
+    bool memoryless = true;   // --no-memoryless: the second attachment an ordinary texture, stored as its pass asks
 } asked;
 
 uint64_t nowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
@@ -354,9 +355,12 @@ void runCore(const Scene& s) {
         pass.color0 = fb.get();
         pass.load = s.clear ? LoadAction::kClear : LoadAction::kLoad;
         if (s.second) {
+            // (CoreAnimation's memoryless texture, with the actions it leaves on it: DontCare and a colour attachment's
+            // default store action, Store)
+            fb2->setMemoryless(asked.memoryless);
             pass.more[0].texture = fb2.get();
             pass.more[0].load = LoadAction::kDontCare;
-            pass.more[0].store = StoreAction::kDontCare;
+            pass.more[0].store = StoreAction::kStore;
         }
         for (uint32_t i = 0; i < s.draws; i++) {
             Draw d;
@@ -558,6 +562,7 @@ struct Common {
         device = hakios_metal_buffer_new(r.device, 64 * 1024);
         fb = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
         fb2 = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
+        hakios_metal_texture_set_memoryless(fb2, asked.memoryless ? 1 : 0);
         wallpaper = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead);
         for (int i = 0; i < 24; i++) icons.push_back(hakios_metal_texture_new(r.device, k2D, kBGRA8, 120, 120, kUsageRead));
         hakios_metal_sampler_desc sd{};
@@ -577,9 +582,9 @@ struct Common {
         p.load_action = 1;
         p.store_action = 1;
         if (second) {
-            p.more[0].texture = fb2;   // CoreAnimation's second screen: DontCare / DontCare
+            p.more[0].texture = fb2;   // CoreAnimation's memoryless texture: DontCare / Store (the default it leaves)
             p.more[0].load_action = 0;
-            p.more[0].store_action = 0;
+            p.more[0].store_action = 1;
         }
         return p;
     }
@@ -1049,8 +1054,9 @@ int main(int argc, char** argv) {
         else if (a == "--gpu") asked.gpu = true;
         else if (a == "--gmem-off") asked.gmemOff = atoi(value());
         else if (a == "--gmem-draws") asked.gmemDraws = atoi(value());
+        else if (a == "--no-memoryless") asked.memoryless = false;
         else {
-            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--gpu] [--gmem-off BITS] [--gmem-draws N] [--verify] [--long]"
+            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--gpu] [--gmem-off BITS] [--gmem-draws N] [--no-memoryless] [--verify] [--long]"
                         " | --golden [--long]\n");
             return 2;
         }
@@ -1067,7 +1073,7 @@ int main(int argc, char** argv) {
         {"D", "the heavy frame with GMEM off (every pass sysmem), 46 of its draws with uniforms", 140, 0, 46, 3, false, false, 1},
         {"E", "the same with 23 framebuffer-fetch draws, GMEM off", 140, 23, 46, 3, false, false, 1},
         {"F", "the heavy frame of C split over 4 command buffers (3 offscreen + main)", 140, 0, 0, 3, false, true, 4},
-        {"P", "the phone's main pass: 108 textured draws into two 750x1624 attachments (the second DontCare), GMEM binned", 108, 0, 0, 0, false, true, 1, true, 0},
+        {"P", "the phone's main pass: 108 textured draws into two 750x1624 attachments (the second memoryless), GMEM binned", 108, 0, 0, 0, false, true, 1, true, 0},
         {"Q", "the same with every 4th draw a framebuffer fetch (27 runs of fetch after no-fetch)", 108, 0, 0, 0, false, true, 1, true, 4},
         {"R", "the main pass of P recorded once, in sysmem (GMEM off)", 108, 0, 0, 0, false, false, 1, true, 0},
         {"G", "one draw alone in a command buffer (the fixed cost of a pass and a submit)", 1, 0, 0, 0, false, true, 1},

@@ -171,7 +171,7 @@ public:
     // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
     // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
@@ -360,7 +360,11 @@ private:
         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
         std::shared_ptr<render::PassCache> cache;
     };
-    void closePass();
+    // NEXT: the pass of the draw that could not join the open one, when it is such a draw that closes it (nullptr for
+    // anything else: a copy, a dispatch, the commit). A memoryless attachment the tiles wrote is stored for it alone:
+    // when NEXT has the same texture attached with Load, the caller's one pass goes on in a second one here.
+    // KEPT: stored whatever follows (a command buffer appended to another: what follows is not known here).
+    void closePass(const RenderPass* next = nullptr, bool kept = false);
     void useAttachments(const RenderPass& pass);
     // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
