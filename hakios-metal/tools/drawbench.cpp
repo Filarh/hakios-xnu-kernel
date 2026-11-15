@@ -841,6 +841,22 @@ void runStageScenes() {
         std::printf("drawbench: no stages in %s\n", asked.stages.c_str());
         return;
     }
+    if (getenv("DRAWBENCH_STAGE_INFO") != nullptr) {
+        // (what each fragment stage of the cache does with the pass's colour attachments: the outputs it has a register
+        // for, whether its second output is a blend's second source, and the attachments it reads through fetch)
+        for (const auto& fs : fss) {
+            uint32_t outputs = 0, fetches = 0;
+            for (uint32_t i = 0; i < kMaxColorOutputs && i < fs->stage.numColorOutputs; i++) {
+                if (fs->stage.colorRegid[i] != a6xx::kRegidNone) outputs |= 1u << i;
+            }
+            for (uint32_t t = 0; t < kMaxTextureSlots && t < fs->stage.k.numTextureSlots; t++) {
+                if (fs->stage.k.textures[t].fbTarget != 0) fetches |= 1u << (fs->stage.k.textures[t].fbTarget - 1u);
+            }
+            std::printf("stage %s %s outputs %#x%s fetches %#x words %u\n", fs->file.substr(0, 8).c_str(), fs->name.c_str(), outputs,
+                        fs->stage.dualSrcBlend ? " (dual source)" : "", fetches, fs->stage.k.numWords);
+        }
+        return;
+    }
     for (const char* letter : {"S", "T", "U"}) {
         if (!wanted(letter)) continue;
         CRig r;
