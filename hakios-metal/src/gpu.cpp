@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <sys/mman.h>
 
 namespace hakios::metal {
 
@@ -91,9 +92,63 @@ std::unique_ptr<Bo> Gpu::surfaceBo(uint32_t surfaceId, SurfaceInfo* out, int* er
     return std::unique_ptr<Bo>(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
 }
 
+bool Gpu::sharesMemory() {
+    int known = sharesMemory_.load(std::memory_order_relaxed);
+    if (known < 0) {
+        // asked by doing: a page of this program's own as a buffer, and let go at once. A kernel without the request
+        // answers kIOReturnUnsupported (ENOSYS); one with it, a handle.
+        known = 0;
+        void* page = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (page != MAP_FAILED) {
+            *static_cast<volatile uint8_t*>(page) = 0;   // (the page there to be held, not a promise of one)
+            UserMemory u{};
+            u.address = uint64_t(uintptr_t(page));
+            u.size = 4096;
+            if (t_->call(kUserMemory, &u, sizeof(u)) == 0) {
+                DrmGemClose c{u.handle, 0};
+                t_->call(kGemClose, &c, sizeof(c));
+                known = 1;
+            }
+            munmap(page, 4096);
+        }
+        sharesMemory_.store(known, std::memory_order_relaxed);
+    }
+    return known == 1;
+}
+
+std::unique_ptr<Bo> Gpu::userBo(void* address, uint64_t size, int* error) {
+    *error = 0;
+    const uint64_t at = uint64_t(uintptr_t(address));
+    if (address == nullptr || at % 4096 != 0 || size == 0 || size % 4096 != 0) {
+        *error = EINVAL;
+        return nullptr;
+    }
+    if (!sharesMemory()) {
+        *error = ENOSYS;
+        return nullptr;
+    }
+    UserMemory u{};
+    u.address = at;
+    u.size = size;
+    if ((*error = t_->call(kUserMemory, &u, sizeof(u))) != 0) {
+        return nullptr;
+    }
+    MsmGemInfo info{};
+    info.handle = u.handle;
+    info.info = kInfoGetIova;
+    if ((*error = t_->call(kGemInfo, &info, sizeof(info))) != 0) {
+        DrmGemClose c{u.handle, 0};
+        t_->call(kGemClose, &c, sizeof(c));
+        return nullptr;
+    }
+    std::unique_ptr<Bo> bo(new Bo(*this, u.handle, size, info.value, address));
+    bo->mapped_ = false;
+    return bo;
+}
+
 void Gpu::disown(std::unique_ptr<Bo> bo) {
     if (bo == nullptr) return;
-    if (bo->cpu_ != nullptr) {
+    if (bo->cpu_ != nullptr && bo->mapped_) {
         t_->unmap(bo->handle_, bo->cpu_);
         bo->cpu_ = nullptr;
     }
@@ -114,7 +169,7 @@ void Gpu::release(Bo& bo) {
         allocated_ -= bo.size_;
         bo.counted_ = false;
     }
-    if (bo.cpu_ != nullptr) {
+    if (bo.cpu_ != nullptr && bo.mapped_) {
         t_->unmap(bo.handle_, bo.cpu_);
     }
     DrmGemClose c{bo.handle_, 0};

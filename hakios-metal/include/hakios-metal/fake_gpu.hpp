@@ -207,6 +207,9 @@ public:
     std::vector<uint8_t> surfaceBytes(uint32_t id);   // the surface's whole memory as it is now
     std::vector<uint8_t> memory(uint64_t iova, uint64_t length);   // LENGTH bytes at a GPU address as they are now; empty outside every buffer
     void writeSurface(uint32_t id, uint64_t at, const void* bytes, uint64_t length);   // what another program drew there
+    // a kernel without kUserMemory (true by default: the request is served): the request refused as one the kernel does
+    // not know (kIOReturnUnsupported, ENOSYS)
+    void setSharesMemory(bool on);
     // stop running submissions until resume(): to see what a program does while the GPU is behind
     void pause();
     void resume();
@@ -242,6 +245,12 @@ private:
     struct Buffer {
         uint64_t iova;
         std::vector<uint8_t> bytes;
+        // kUserMemory's: the program's own memory, which the GPU reads and writes where it lies (the kernel holds the
+        // pages and keeps the caches agreeing with them: nothing of that is modelled, there are no caches here)
+        uint8_t* program = nullptr;
+        uint64_t programSize = 0;
+        uint8_t* data() { return program != nullptr ? program : bytes.data(); }
+        uint64_t size() const { return program != nullptr ? programSize : bytes.size(); }
     };
     struct Job {
         uint32_t fence;
@@ -413,6 +422,7 @@ private:
     // a draw counts one sample per index it submits, times its instances: enough to tell begin from end and the
     // query's arithmetic from a wrong one; how many samples a real draw passes is the phone's (probe 9q)
     uint64_t samples_ = 0;
+    bool sharesMemory_ = true;
     uint32_t nextHandle_ = 1, nextQueue_ = 1;
     uint64_t nextIova_ = 0x100000000ull;
     Stats stats_;

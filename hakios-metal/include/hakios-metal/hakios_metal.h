@@ -89,6 +89,18 @@ void hakios_metal_buffer_free(hakios_metal_buffer *buffer);
 void *hakios_metal_buffer_contents(hakios_metal_buffer *buffer);
 uint64_t hakios_metal_buffer_length(hakios_metal_buffer *buffer);
 uint64_t hakios_metal_buffer_gpu_address(hakios_metal_buffer *buffer);
+/* whether the kernel takes a program's own memory as GPU memory (HakiosGPU's request 0x7d): what a no-copy buffer needs */
+int hakios_metal_device_shares_memory(hakios_metal_device *device);
+/* -newBufferWithBytesNoCopy:: a buffer that IS the caller's memory [BYTES, BYTES + LENGTH), both multiples of 4096. The
+ * GPU reads what the caller wrote there before a command buffer using it was committed, and the caller sees what the
+ * GPU wrote there once that command buffer has completed; contents() is BYTES. RELEASED(CONTEXT), when given, runs once
+ * the buffer has been freed and every command buffer that used it has completed (Metal's deallocator), on the thread
+ * that lets go of it last. NULL with the reason: memory off a page, a kernel without 0x7d (a copy would not be the
+ * caller's memory, so none is made), memory the program does not have. */
+hakios_metal_buffer *hakios_metal_buffer_new_nocopy(hakios_metal_device *device, void *bytes, uint64_t length,
+                                                    void (*released)(void *context), void *context);
+/* whether BUFFER is a program's own memory (hakios_metal_buffer_new_nocopy) rather than the driver's write-combined kind */
+int hakios_metal_buffer_is_program_memory(hakios_metal_buffer *buffer);
 
 /* a .metallib's bytes (thin or universal), copied; NULL when the file does not hold together, with the reason */
 hakios_metal_library *hakios_metal_library_open(const void *data, size_t size);

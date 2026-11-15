@@ -30,6 +30,7 @@ public:
         case kIOReturnBusy: return EBUSY;
         case kIOReturnNotFound: return ENOENT;
         case kIOReturnUnsupported: return ENOSYS;
+        case kIOReturnVMError: return EFAULT;   // (kUserMemory: a range the program does not have, or cannot be held)
         default:
             // the kernel's own answer would be lost in a plain EIO: a code no case names is a failure nobody has
             // looked at yet, so it is printed where it happens

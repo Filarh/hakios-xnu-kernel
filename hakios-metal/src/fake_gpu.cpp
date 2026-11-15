@@ -243,10 +243,15 @@ void FakeGpu::writeSurface(uint32_t id, uint64_t at, const void* bytes, uint64_t
 void* FakeGpu::map(uint32_t handle, uint64_t size) {
     std::lock_guard<std::mutex> g(lock_);
     auto b = buffers_.find(handle);
-    if (b == buffers_.end() || size > b->second.bytes.size()) {
-        return nullptr;
+    if (b == buffers_.end() || b->second.program != nullptr || size > b->second.size()) {
+        return nullptr;   // (the program's own memory is the program's already: the kernel gives no mapping of it)
     }
-    return b->second.bytes.data();
+    return b->second.data();
+}
+
+void FakeGpu::setSharesMemory(bool on) {
+    std::lock_guard<std::mutex> g(lock_);
+    sharesMemory_ = on;
 }
 
 void FakeGpu::unmap(uint32_t, void*) {}
@@ -262,8 +267,8 @@ void* FakeGpu::submitHookContext = nullptr;
 
 uint8_t* FakeGpu::at(uint64_t iova, uint64_t length) {
     for (auto& [handle, b] : buffers_) {
-        if (iova >= b.iova && length <= b.bytes.size() && iova - b.iova <= b.bytes.size() - length) {
-            return b.bytes.data() + (iova - b.iova);
+        if (iova >= b.iova && length <= b.size() && iova - b.iova <= b.size() - length) {
+            return b.data() + (iova - b.iova);
         }
     }
     return nullptr;
@@ -2868,6 +2873,23 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         bufferSurface_[r->handle] = r->surface;
         return 0;
     }
+    case kUserMemory: {
+        // hakios.gpu.cpp userBuffer: the range on whole pages, at most the kernel's largest buffer (256 MB here); then
+        // the pages themselves are the buffer
+        if (!sharesMemory_) return ENOSYS;                 // kIOReturnUnsupported: a request the kernel does not know
+        if (size != sizeof(UserMemory)) return EINVAL;
+        auto* u = static_cast<UserMemory*>(data);
+        if (u->address == 0 || u->address % 4096 != 0 || u->size == 0 || u->size % 4096 != 0 || u->size > (256ull << 20) || u->flags != 0) {
+            return EINVAL;
+        }
+        Buffer b{nextIova_, {}};
+        b.program = reinterpret_cast<uint8_t*>(uintptr_t(u->address));
+        b.programSize = u->size;
+        nextIova_ += (u->size + 0xffff) & ~0xffffull;
+        u->handle = nextHandle_++;
+        buffers_.emplace(u->handle, std::move(b));
+        return 0;
+    }
     case kSubmitQueueNew: {
         if (size != sizeof(MsmSubmitQueue)) return EINVAL;
         auto* q = static_cast<MsmSubmitQueue*>(data);
@@ -2888,7 +2910,7 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
             if (buffers_.count(bos[i].handle) == 0) return ENOENT;   // a buffer the GPU would not know: refused
         }
         Buffer& c = buffers_.at(bos[cmd->submit_idx].handle);
-        if (uint64_t(cmd->submit_offset) + cmd->size > c.bytes.size()) return EINVAL;
+        if (uint64_t(cmd->submit_offset) + cmd->size > c.size()) return EINVAL;
         Job job{++submitted_, c.iova + cmd->submit_offset, cmd->size / 4};
         s->fence = job.fence;
         if (submitHook != nullptr) {

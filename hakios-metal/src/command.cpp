@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <cstring>
@@ -66,6 +67,34 @@ std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why) {
         return nullptr;
     }
     return addressed(new Buffer(std::move(bo), length));
+}
+
+std::atomic<uint32_t> gBuffersShared{0};
+std::atomic<uint64_t> gBytesShared{0};
+
+std::shared_ptr<Buffer> newBufferNoCopy(Gpu& gpu, void* bytes, uint64_t length, std::function<void()> released, std::string* why) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(bytes);
+    if (bytes == nullptr || at % 4096 != 0 || length == 0 || length % 4096 != 0) {
+        char text[200];
+        snprintf(text, sizeof(text), "a no-copy buffer of %llu bytes at %#llx: the memory must start on a page and be whole pages (multiples of 4096 bytes), "
+                 "as Metal asks of the caller", (unsigned long long)length, (unsigned long long)at);
+        *why = text;
+        return nullptr;
+    }
+    if (!gpu.sharesMemory()) {
+        *why = "a no-copy buffer: the kernel does not take a program's own memory as GPU memory (request 0x7d), and a copy would be "
+               "another buffer, not the caller's memory";
+        return nullptr;
+    }
+    int error = 0;
+    std::unique_ptr<Bo> bo = gpu.userBo(bytes, length, &error);
+    if (bo == nullptr) {
+        *why = "the kernel would not take " + std::to_string(length) + " bytes of this program's memory as a GPU buffer: " + strerror(error);
+        return nullptr;
+    }
+    gBuffersShared++;
+    gBytesShared += length;
+    return addressed(new Buffer(std::move(bo), length, std::move(released)));
 }
 
 namespace {

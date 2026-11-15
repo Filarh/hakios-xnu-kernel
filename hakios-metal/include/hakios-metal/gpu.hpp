@@ -31,6 +31,7 @@ enum Request : uint32_t {
     kSubmitQueueNew = 0x4a,
     kSubmitQueueClose = 0x4b,
     kHakiosSurface = 0x7e,   // hakios's own (hakios.gpu.cpp surfaceBuffer): an IOSurface's memory as a buffer, by the surface's ID
+    kUserMemory = 0x7d,      // hakios's own (hakios.gpu.cpp userBuffer): pages of the caller's own as a buffer (Linux's userptr)
 };
 
 struct MsmTimespec { int64_t seconds, nanoseconds; };
@@ -58,11 +59,17 @@ struct DrmGemClose { uint32_t handle, pad; };
 // FourCC, 'BGRA' and so on) and PLANES
 struct HakiosSurface { uint32_t surface, handle; uint64_t size; uint32_t offset, rowBytes, width, height, pixelFormat, planes; };
 constexpr uint32_t kHakiosDescribe = 0xffffffffu;
+// struct hakios_user_memory (hakios.gpu.cpp): ADDRESS and SIZE a range of the calling program's own memory, each a
+// multiple of 4096 (the GPU's page); FLAGS 0 in; back HANDLE, a buffer that is those pages -- wired while it is open,
+// and out of the processor's cache at every submission that names it -- and FLAGS with kBoGpuReadOnly when the pages
+// could be held for reading alone (memory the program may only read: the GPU then only reads it)
+struct UserMemory { uint64_t address, size; uint32_t handle, flags; };
 
 static_assert(sizeof(MsmParam) == 24 && sizeof(MsmGemNew) == 16 && sizeof(MsmGemInfo) == 24, "msm_drm.h layout");
 static_assert(sizeof(MsmSubmitCmd) == 32 && sizeof(MsmSubmitBo) == 16 && sizeof(MsmGemSubmit) == 72, "msm_drm.h layout");
 static_assert(sizeof(MsmWaitFence) == 32, "msm_drm.h layout");
 static_assert(sizeof(HakiosSurface) == 40, "hakios.gpu.cpp layout");
+static_assert(sizeof(UserMemory) == 24 && offsetof(UserMemory, handle) == 16, "hakios.gpu.cpp layout");
 
 // what the kernel says of an IOSurface whose memory became a buffer
 struct SurfaceInfo {
@@ -144,6 +151,7 @@ private:
     void* cpu_;
     bool owned_ = true;   // false: another Bo owns the handle (Gpu::disown)
     bool counted_ = false;   // in Gpu::allocatedBytes: memory this driver asked for (not an IOSurface's)
+    bool mapped_ = true;     // cpu_ is the transport's mapping, undone with the Bo (false: the program's own memory, userBo)
 };
 
 struct BoUse {
@@ -176,6 +184,15 @@ public:
     // a Bo whose handle another Bo already owns (surfaceBo's second answer for a surface): its mapping undone, the
     // handle left open for the owner to close
     void disown(std::unique_ptr<Bo> bo);
+    // whether the kernel takes the program's own memory as a buffer (userBo): asked once, by making a buffer of one page
+    // of the program's and letting it go (a kernel without kUserMemory answers kIOReturnUnsupported, and logs it once)
+    bool sharesMemory();
+    // the program's memory [ADDRESS, ADDRESS + SIZE) as a buffer: the GPU reads and writes those pages themselves, held
+    // in memory by the kernel while the buffer is open. ADDRESS and SIZE multiples of 4096. The Bo's cpu() is ADDRESS:
+    // nothing is mapped for it and nothing unmapped with it, and it is not counted in allocatedBytes (the program
+    // allocated it). nullptr with *error: EINVAL not on a page, ENOSYS a kernel without the request, EFAULT memory the
+    // program does not have, ENOMEM.
+    std::unique_ptr<Bo> userBo(void* address, uint64_t size, int* error);
 
     // a submission queue of its own (the driver keeps an order per queue); 0 is the default one
     int newQueue(uint32_t priority, uint32_t* id);
@@ -198,6 +215,7 @@ public:
 private:
     friend class Bo;
     std::atomic<uint64_t> allocated_{0};
+    std::atomic<int> sharesMemory_{-1};   // -1: not asked yet
     void release(Bo& bo);
     std::unique_ptr<Transport> t_;
 };

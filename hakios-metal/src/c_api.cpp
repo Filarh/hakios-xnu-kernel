@@ -382,6 +382,24 @@ hakios_metal_buffer* hakios_metal_buffer_new(hakios_metal_device* d, uint64_t le
     return r;
 }
 
+int hakios_metal_device_shares_memory(hakios_metal_device* d) { return d != nullptr && d->gpu && d->gpu->sharesMemory() ? 1 : 0; }
+
+hakios_metal_buffer* hakios_metal_buffer_new_nocopy(hakios_metal_device* d, void* bytes, uint64_t length, void (*released)(void*), void* context) {
+    std::string why;
+    std::function<void()> done;
+    if (released != nullptr) done = [released, context] { released(context); };
+    auto b = newBufferNoCopy(*d->gpu, bytes, length, std::move(done), &why);
+    if (b == nullptr) {
+        failed(why);
+        return nullptr;
+    }
+    auto* r = new hakios_metal_buffer;
+    r->buffer = std::move(b);
+    return r;
+}
+
+int hakios_metal_buffer_is_program_memory(hakios_metal_buffer* b) { return b != nullptr && b->buffer->programMemory() ? 1 : 0; }
+
 void hakios_metal_buffer_free(hakios_metal_buffer* b) { delete b; }
 void* hakios_metal_buffer_contents(hakios_metal_buffer* b) { return b->buffer->contents(); }
 uint64_t hakios_metal_buffer_length(hakios_metal_buffer* b) { return b->buffer->length(); }
