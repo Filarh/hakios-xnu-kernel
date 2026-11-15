@@ -685,15 +685,21 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
     uint32_t ctrl0 = reg(REG_A6XX_SP_CS_CTRL_REG0);
     uint32_t spThreads = fieldOf(ctrl0, A6XX_SP_CS_CTRL_REG0_THREADSIZE__MASK, A6XX_SP_CS_CTRL_REG0_THREADSIZE__SHIFT);
     uint32_t hlsqThreads = fieldOf(reg(REG_A6XX_HLSQ_CS_CNTL_1), A6XX_HLSQ_CS_CNTL_1_THREADSIZE__MASK, A6XX_HLSQ_CS_CNTL_1_THREADSIZE__SHIFT);
+    if (!kSupportsDoubleThreadsize && (hlsqThreads != THREAD128 || spThreads != THREAD128)) {
+        // (fd6_compute.cc:96-117 and fd6_program.cc:170-180: both THREAD128 there, the size itself in HLSQ_FS_CNTL_0)
+        fault("HLSQ_CS_CNTL_1 and SP_CS_CTRL_REG0 are not THREAD128 on a chip without double threadsize");
+        return false;
+    }
     if (spThreads != hlsqThreads) {
         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
         return false;
     }
-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+    // (the SP's copies exist on a chip with has_lpac alone: on another they are not written, and not looked at)
+    if (kHasLpac && (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1))) {
         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
         return false;
     }
-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+    if (kHasLpac && reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
         return false;
     }

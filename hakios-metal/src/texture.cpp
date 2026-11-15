@@ -140,6 +140,10 @@ constexpr FormatInfo kFormats[] = {
     {PixelFormat::kPVRTC_RGBA_4BPP_sRGB, FMT6_8_8_8_8_UNORM, 4, WZYX, true, true, kElemFloat, "PVRTC_RGBA_4BPP_sRGB", false, false, false, 1, 1, FMT6_NONE, 4},
     // HDR: the same storage and the same FMT6 as LDR -- A6xx has one ASTC decoder, and probe 9j2h measures what it makes
     // of an HDR block
+#if !defined(HAKIOS_CHIP_A610)
+    // (not on the A610: what its texture unit makes of an HDR block is not measured -- probe 9j2h was run on the A635 --
+    // and Mesa lists no ASTC HDR format for any Adreno, fd6_format_table.c:324-352 being LDR and sRGB alone. The iPhone X
+    // this system believes it is has none either: ASTC HDR is MTLGPUFamilyApple6's.)
     {PixelFormat::kASTC_4x4_HDR, FMT6_ASTC_4x4, 16, WZYX, true, false, kElemFloat, "ASTC_4x4_HDR", false, false, false, 4, 4},
     {PixelFormat::kASTC_5x4_HDR, FMT6_ASTC_5x4, 16, WZYX, true, false, kElemFloat, "ASTC_5x4_HDR", false, false, false, 5, 4},
     {PixelFormat::kASTC_5x5_HDR, FMT6_ASTC_5x5, 16, WZYX, true, false, kElemFloat, "ASTC_5x5_HDR", false, false, false, 5, 5},
@@ -154,6 +158,7 @@ constexpr FormatInfo kFormats[] = {
     {PixelFormat::kASTC_10x10_HDR, FMT6_ASTC_10x10, 16, WZYX, true, false, kElemFloat, "ASTC_10x10_HDR", false, false, false, 10, 10},
     {PixelFormat::kASTC_12x10_HDR, FMT6_ASTC_12x10, 16, WZYX, true, false, kElemFloat, "ASTC_12x10_HDR", false, false, false, 12, 10},
     {PixelFormat::kASTC_12x12_HDR, FMT6_ASTC_12x12, 16, WZYX, true, false, kElemFloat, "ASTC_12x12_HDR", false, false, false, 12, 12},
+#endif
 };
 
 const char* typeName(TextureType t) {
@@ -1280,6 +1285,13 @@ bool makeSampler(const SamplerDesc& d, Sampler* out, std::string* why) {
     }
     // bicubic is the TP's own cubic filter, which this chip has (freedreno_devices.py a6xx_gen4 has_tex_filter_cubic;
     // turnip's VK_FILTER_CUBIC_EXT, tu6_tex_filter)
+#if defined(HAKIOS_CHIP_A610)
+    // (the A610 has no cubic filter: has_tex_filter_cubic is a6xx_gen3's and a6xx_gen4's in freedreno_devices.py:396,419,
+    // and Mesa 25.0.7's row for GPUId(610), __info6, has none; turnip offers VK_EXT_filter_cubic by that fact alone)
+    if (d.minFilter == 2 || d.magFilter == 2) {
+        return refuse(why, "bicubic filtering: the Adreno 610 has no cubic filter (Mesa: no has_tex_filter_cubic for it)");
+    }
+#endif
     auto filter = [](uint32_t m) { return m == 2 ? A6XX_TEX_CUBIC : m == 1 ? A6XX_TEX_LINEAR : A6XX_TEX_NEAREST; };
     f.min = filter(d.minFilter);
     f.mag = filter(d.magFilter);

@@ -506,9 +506,16 @@ TEST(sampler_words_follow_galliums_encoding_of_metals_descriptor) {
         c.minFilter = c.magFilter = 2;
         Sampler cs;
         std::string cwhy;
+#if defined(HAKIOS_CHIP_A610)
+        // (the A610 has no cubic filter -- has_tex_filter_cubic is a6xx_gen3's and gen4's, freedreno_devices.py:396,419 --
+        // and the sampler is refused by name)
+        CHECK(!makeSampler(c, &cs, &cwhy));
+        CHECK(has(cwhy, "bicubic filtering: the Adreno 610 has no cubic filter"));
+#else
         CHECK(makeSampler(c, &cs, &cwhy));
         CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MIN__MASK) >> A6XX_TEX_SAMP_0_XY_MIN__SHIFT, uint32_t(A6XX_TEX_CUBIC));
         CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MAG__MASK) >> A6XX_TEX_SAMP_0_XY_MAG__SHIFT, uint32_t(A6XX_TEX_CUBIC));
+#endif
     }
     d = SamplerDesc{};
     d.mipFilter = 3;

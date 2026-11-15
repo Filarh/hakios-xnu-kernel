@@ -241,6 +241,8 @@ make ios      # out/ios/libhakios-metal.a, for iOS 16.5 (the SDK as hakios lays 
 make check    # the tests, then the Metal plug-in (plugin/) on this Mac, without and with hakios-metal
 make test MESA=1   # with the compiler linked in, against a Mesa host build carrying hakios's AIR front end
 make ios MESA=1    # ... and on the phone, against hakios's iOS build of the same libraries (tools/compiler.mk)
+make ios CHIP=a610                         # for an Adreno 610 instead of the 7c+ Gen 3 (a6xx.hpp: HAKIOS_CHIP_A610)
+make -f tools/dev.mk -j4 CHIP=a610 check   # the tests and golden streams with that chip's constants
 ```
 
 On Linux `make ios` takes hakios's cross compiler from `../workspace/xnu-deps/host/bin` (HAKIOS= another tree) and

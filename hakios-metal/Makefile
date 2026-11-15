@@ -94,6 +94,10 @@ darwin: ios
 # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
 IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
 IOS_LIBS     =
+# another chip than the A635 the constants of a6xx.hpp are written for: CHIP=a610 (-DHAKIOS_CHIP_A610)
+ifeq ($(CHIP),a610)
+IOS_CXXFLAGS += -DHAKIOS_CHIP_A610
+endif
 ifneq ($(strip $(MESA)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
 IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)

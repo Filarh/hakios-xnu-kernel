@@ -1,17 +1,18 @@
-# tools/dev.mk: the host tests and drawbench built object by object and in parallel
+# tools/dev.mk: the host tests and drawbench built object by object and in parallel, for either chip's constants
 # (the Makefile's own `make test` compiles every source in one compiler run, a minute each time).
 #
-#   make -f tools/dev.mk -j4 [CHIP=a635] [OPT="-O2 -g"] tests             out/dev-$(CHIP)/tests
+#   make -f tools/dev.mk -j4 [CHIP=a635|a610] [OPT="-O2 -g"] tests       out/dev-$(CHIP)/tests
 #   make -f tools/dev.mk -j4 [CHIP=...] drawbench                       out/dev-$(CHIP)/drawbench (tools/drawbench.cpp)
 #   make -f tools/dev.mk -j4 [CHIP=...] check                           the tests, then the golden streams (tests/golden/)
 #   make -f tools/dev.mk -j4 [CHIP=...] golden                          write the golden streams again (a change of the stream, said in its commit)
 #
-# CHIP names the chip whose constants (a6xx.hpp) the objects are built with, and the golden files compared.
+# CHIP names the chip whose constants (a6xx.hpp) the objects are built with, and the golden files compared: CHIP=a610
+# builds with -DHAKIOS_CHIP_A610, as make ios CHIP=a610 does.
 CHIP ?= a635
 CXX  ?= c++
 OPT  ?= -O2 -g
 OUT   = out/dev-$(CHIP)
-DEFS  =
+DEFS  = $(if $(filter a610,$(CHIP)),-DHAKIOS_CHIP_A610)
 CXXFLAGS = $(OPT) -std=c++17 -Wall -Wextra -Werror -Iinclude $(DEFS) -MMD -MP
 
 CORE  = pm4 gpu command compute texture render gmem link compiler metallib c_api fake_gpu
