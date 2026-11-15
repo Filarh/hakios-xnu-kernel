@@ -1031,6 +1031,7 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
     struct FourCC { uint32_t code; uint32_t bytes; };
     static const FourCC kFourCCs[] = {
         {0x42475241u, 4},   // 'BGRA'
+        {0x26424741u, 4},   // '&BGA': lossless BGRA; laid out UBWC when the kernel says so (above), BGRA rows otherwise
         {0x52474241u, 4},   // 'RGBA'
         {0x4c413038u, 2},   // 'LA08'
         {0x4c303038u, 1},   // 'L008'
