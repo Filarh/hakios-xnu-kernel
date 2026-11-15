@@ -192,11 +192,12 @@ public:
     // barrier in the draws' stream, run by every tile that walks past it, kGmemAllOrdered has no barrier between
     // draws and every draw of a pass that fetches in raster order (gmem.hpp: DrawStateFetch), kGmemByDrawsAlone
     // chooses tiles or sysmem for a pass recorded both ways by its draws against the bar and nothing else
-    // (render::gmemWorth's criteria off).
+    // (render::gmemWorth's criteria off), kSysmemFetchUnordered leaves the primitives of a sysmem draw that reads its
+    // target unordered among themselves (render::Options::fbReadOverlap off).
     // (8, 16 and 32 are the plug-in's own: metal_gmem_off's untuned choice, no binning, null textures.)
     enum : uint32_t {
         kGmemWholeArea = 1, kGmemEveryAttachment = 2, kGmemFetchBarrier = 4, kGmemPlainBody = 64, kGmemNoLeave = 128, kGmemOldTiles = 256,
-        kGmemEveryBin = 512, kGmemInlineBarriers = 1024, kGmemAllOrdered = 2048, kGmemByDrawsAlone = 4096,
+        kGmemEveryBin = 512, kGmemInlineBarriers = 1024, kGmemAllOrdered = 2048, kGmemByDrawsAlone = 4096, kSysmemFetchUnordered = 8192,
     };
     void setGmemOff(uint32_t bits) { gmemOff_ = bits; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a

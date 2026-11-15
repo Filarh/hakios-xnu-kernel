@@ -139,10 +139,10 @@ a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submit
 a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 17db46b630d582d5 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
 a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 6c62378d52407e41 state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
 a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream e1fb977932e98a2d state 6a704e6fd77244ca names 8 2e72016e06717bd7
-a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43862 draws 288 loads 936 stream 8f43dc9048c32e61 state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
+a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43886 draws 288 loads 936 stream f56ed7507d70c481 state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
 the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        39692 draws taken, 26782 of them from a kept state; 6388 refused
-random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10395798 draws 83260 loads 234586 stream 8490748c75cbce05 state 4eb3bfe1bcb9ac79 names 39812 6b9eca66a105cc5a
+random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10404642 draws 83260 loads 234586 stream ff072de135564fed state 4eb3bfe1bcb9ac79 names 39812 6b9eca66a105cc5a
 more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream 52ca32fc2f9646cd state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
 end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
@@ -232,7 +232,7 @@ a_command_buffer_released_in_flight_gives_its_buffers_back submits 51 words 3718
 draws_take_their_tables_and_programs_from_a_few_buffers_and_upload_changed_words_again submits 4 words 5452 draws 122 loads 244 stream c5d54b4cf4ad1ac1 state aa418883f5481e7d names 20 eb75458ccc05decc
 a_draw_binds_the_queues_null_texture_at_the_reserved_slot_over_anything_bound_there submits 2 words 1398 draws 2 loads 8 stream 00589408667cf061 state d520161e911e7cbd names 10 2624869c431d1bce
 a_draw_writes_two_colour_targets_each_into_its_own_attachment submits 5 words 4336 draws 7 loads 14 stream 28074839119657d9 state 4149d82559294f4e names 25 08baebda66ef2e94
-a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it submits 2 words 1432 draws 4 loads 16 stream d13a09cb5d99444d state fd0786e6f63b8aa9 names 8 30b480cc4d5289d2
+a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it submits 2 words 1432 draws 4 loads 16 stream f670e5da2350b102 state fd0786e6f63b8aa9 names 8 43be6c3033d0892c
 mip_levels_are_drawn_into_copied_and_generated submits 4 words 3456 draws 1 loads 2 stream f60d3abf44cb0353 state cb137a44d958688c names 12 7416efde06a13b92
 a_draw_that_writes_only_color_1_leaves_attachment_0_unwritten submits 1 words 701 draws 1 loads 2 stream a67a85fa83449979 state 8984d8c1e40a1343 names 5 f5de2835a43b4109
 a_stencil_attachment_is_the_s8_plane_and_its_test_the_draws_state submits 1 words 664 draws 1 loads 2 stream e0746650d7dfb3b7 state cb137a44d958688c names 5 f5de2835a43b4109
@@ -267,9 +267,9 @@ a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn submits 2 words 3
 a_gmem_pass_is_tiled_over_its_render_area submits 1 words 1135 draws 4 loads 8 stream b16df80bf4461bc1 state 1b6f8d91e4c1b5b5 names 4 7f77cb45342e0537
 a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has submits 1 words 1133 draws 2 loads 8 stream 6fe70fed2f9f8439 state e8830cf435596cb9 names 4 7f77cb45342e0537
 the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target submits 3 words 1963 draws 3 loads 6 stream 2a2200ea517c691b state 6daed77ff6dca4f4 names 14 5bb689de53ed2224
-gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 4eae8fc58ce2a337 state 44e549e09cea1985 names 25 fa19332ad5a24ef7
+gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 0cfcd478f849ec6f state 44e549e09cea1985 names 25 fa19332ad5a24ef7
 tiles_or_sysmem_by_what_a_pass_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
-a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream 1d9b7f4cf7f6c084 state 287734657552d1c5 names 90 37f5855db810e49c
+a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream 6e5874c177a81d8c state 287734657552d1c5 names 90 37f5855db810e49c
 a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 4aba82bef7c44036 state 179f28010791cba5 names 20 8e8d1b2d6669327e
 a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 41847c8a56cf0cf3 state b2db15d81d80c4dd names 8 05d20adef5c3adcc
 a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 636ff9ea866da3b2 state 29f464ce110bdd85 names 32 17482b7bd70eb730
