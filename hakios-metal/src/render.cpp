@@ -3248,8 +3248,10 @@ struct DrawCache {
         uint32_t keyId = StateCache::kNoKey;
         const ProgramState* state = nullptr;
     };
-    static constexpr uint32_t kSlots = 64;
-    Slot slots[kSlots];
+    // (as many as a frame has programs several times over: two programs in one slot find each other's state gone at
+    // every draw, and ask the queue again under its lock)
+    static constexpr uint32_t kSlotBits = 8;
+    Slot slots[1u << kSlotBits];
     std::vector<std::shared_ptr<const ProgramState>> kept;   // ...alive until the buffer is done
     // a Program made by hand, as it was when its state was made: a draw with the Program at that address is the same
     // draw only while every byte of it, its immediates and its two addresses in this buffer are the same
@@ -3932,7 +3934,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     const render::ProgramState* ps = nullptr;
     render::DrawCache::Hand* hand = nullptr;
     if (keyId != render::StateCache::kNoKey && program.uid != 0) {
-        render::DrawCache::Slot& slot = dc.slots[(program.uid * 0x9e3779b97f4a7c15ull) >> 58];
+        render::DrawCache::Slot& slot = dc.slots[(program.uid * 0x9e3779b97f4a7c15ull) >> (64 - render::DrawCache::kSlotBits)];
         if (slot.uid == program.uid && slot.keyId == keyId) {
             ps = slot.state;
         } else if (std::shared_ptr<const render::ProgramState> found = queue_.states().find(program.uid, keyId)) {
