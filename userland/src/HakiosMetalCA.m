@@ -1,8 +1,8 @@
 /*
  * (hakios) This is vcvkk's plug-in (github.com/vcvkk/darwin-redwood, branch hakios-workspace, userland/src/HakiosMetal.m
  * at eb9fdf5), the one that serves CoreAnimation's window server, with what this tree adds for it: CoreAnimation's
- * shaders chosen by pipeline (hm_bitcode_for()), QuartzCore's pipeline library given a default.metallib, stand-ins for
- * functions the library lacks (hm_stand_ins), and the device shown to the window server alone (metal_all=1: all).
+ * shaders compiled from its pipeline library's variants where the library has them (hm_bitcode_for()), QuartzCore's
+ * pipeline library opened with an empty cache, and the device shown to the window server alone (metal_all=1: all).
  * Built instead of hakios-metal's plug-in with METAL_PLUGIN=ca (userland/build.sh); the library it needs comes from
  * tools/ca-metallib.py.
  */
@@ -1961,7 +1961,7 @@ hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
 	const int n = hakios_metal_cb_pass_time(cb, 0, NULL, NULL, NULL, NULL, NULL);
 
 	for (int i = 0; i < n; i++) {
-		unsigned kind = 0, width = 0, height = 0, draws = 0, attached = 0, touched = 0;
+		unsigned kind = 0, width = 0, height = 0, draws = 0, attached = 0, touched = 0, wrote = 0, read = 0, loaded = 0, stored = 0;
 		double us = 0;
 		char why[300];
 		int tiles;
@@ -1969,9 +1969,12 @@ hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
 		if (hakios_metal_cb_pass_time(cb, (unsigned)i, &kind, &width, &height, &draws, &us) < 0) break;
 		tiles = hakios_metal_cb_pass_tiles(cb, (unsigned)i);
 		(void)hakios_metal_cb_pass_attachments(cb, (unsigned)i, &attached, &touched);
-		hm_ft_line(ft, "gpass i=%d kind=%s w=%u h=%u draws=%u us=%.1f mode=%s tiles=%d attached=0x%x touched=0x%x why=%s\n", i,
+		(void)hakios_metal_cb_pass_access(cb, (unsigned)i, &wrote, &read);
+		(void)hakios_metal_cb_pass_moved(cb, (unsigned)i, &loaded, &stored);
+		hm_ft_line(ft, "gpass i=%d kind=%s w=%u h=%u draws=%u us=%.1f mode=%s tiles=%d attached=0x%x touched=0x%x wrote=0x%x read=0x%x loaded=0x%x "
+			   "stored=0x%x why=%s\n", i,
 			   HM_FT_NAME(kind, "draw", "copy", "clear", "dispatch"), width, height, draws, us,
-			   kind != 0 ? "-" : tiles > 0 ? "gmem" : "sysmem", MAX(tiles, 0), attached, touched,
+			   kind != 0 ? "-" : tiles > 0 ? "gmem" : "sysmem", MAX(tiles, 0), attached, touched, wrote, read, loaded, stored,
 			   hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
 	}
 }
@@ -2501,7 +2504,6 @@ hm_ca_load(void)
 static NSString *
 hm_ca_nearest(NSString *frag)
 {
-	static NSMutableDictionary *told;
 	static NSRegularExpression *form;
 	static NSString *const prefix = @"com.apple.coreanimation.frag.";
 	NSString *best = nil;
@@ -2515,7 +2517,6 @@ hm_ca_nearest(NSString *frag)
 	dispatch_once(&once, ^{
 		form = [[NSRegularExpression alloc] initWithPattern:@"^(T[a-z0-9]{3})?(B[a-z]{3})?(D[a-z]{2})?(A[0-9])(S[0-9])?(L[a-z]{2})?X([a-z]*)((?:_[A-Za-z0-9]+)*)$"
 							    options:0 error:NULL];
-		told = [[NSMutableDictionary alloc] init];
 	});
 	NSString *(^part)(NSTextCheckingResult *, NSUInteger, NSString *) = ^NSString *(NSTextCheckingResult *m, NSUInteger i, NSString *of) {
 		NSRange r = [m rangeAtIndex:i];
@@ -2564,64 +2565,25 @@ hm_ca_nearest(NSString *frag)
 			bestCost = cost;
 		}
 	}
-	@synchronized (told) {
-		if (told[frag] == nil) {
-			told[frag] = @YES;
-			hm_print("CoreAnimation's %s is not in the library: %s stands in for it\n", [want UTF8String],
-				 best != nil ? [[best substringFromIndex:[prefix length]] UTF8String] : "nothing of the same kind");
-		}
-	}
 	return best;
 }
 
-/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE, vertex stage or not): its variant when
- * CoreAnimation's labels name one, else what the function itself has. HOW (when not NULL) says which, for
- * metal_trace=frame: "variant:LABEL", "nearest:LABEL(for WANTED)", "instead:inplace_copy(edr_scale)", "own". */
+/* The module to compile for FUNCTION (of the pipeline labelled PIPELINE, vertex stage or not). A function is compiled
+ * from its own module with its own constants (-bitcodeData and the specialization script: hm_function_constants), which
+ * is what Metal asks of a pipeline's functions. CoreAnimation's uber shaders (fixed_*) have the same code already
+ * specialised in its pipeline library, a module of a few KB a variant where the function's own is the whole shader:
+ * that variant is compiled instead when it is the same function by CoreAnimation's own names -- the function's label
+ * names it (the functions CoreAnimation makes itself are labelled com.apple.coreanimation.frag.<constants>), or the
+ * pipeline's label names a pipeline of the library, whose functions those variants are. A label the library does not
+ * have is a function it does not have: its own module, with the constants CoreAnimation gave it.
+ * HOW (when not NULL) says which, for metal_trace=frame: "variant:LABEL" or "own". */
 static NSData *
 hm_bitcode_for_how(id function, NSString *pipeline, BOOL vertex, char *how, size_t howSize)
 {
 	static unsigned said;
-	NSString *wanted = nil;
 	NSString *name = [function respondsToSelector:@selector(name)] ? [function name] : nil, *label = nil, *chosen = nil;
 	NSData *own = ((NSData *(*)(id, SEL))objc_msgSend)(function, sel_getUid("bitcodeData")), *variant = nil;
 
-	if (name != nil && [name hasPrefix:@"edr_scale_"]) {
-		/* the stand-in at compile time too: the window server gets edr_scale by a road the library hooks do not see,
-		 * and the later CoreAnimation's reads buffers iOS 16.5's never binds (see hm_stand_ins) */
-		static NSData *copies[2];
-		static dispatch_once_t once;
-		const int lpf = [name hasSuffix:@"_lpf"];
-
-		dispatch_once(&once, ^{
-			id<MTLDevice> device = [function respondsToSelector:@selector(device)] ? [function device] : nil;
-
-			if (device == nil) device = MTLCreateSystemDefaultDevice();   /* (the function's own answered nil) */
-			NSError *e = nil;
-			id lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/redwood/share/ca-share/QuartzCore-default.metallib"]
-						     error:&e];
-			hm_print("inplace_copy for edr_scale: device %s, library %s%s\n", device ? "yes" : "nil", lib ? "opened" : "not opened: ",
-				 lib ? "" : [[e description] UTF8String]);
-			for (int i = 0; i < 2 && lib != nil; i++) {
-				id f = [lib newFunctionWithName:i ? @"inplace_copy_lpf" : @"inplace_copy_lph"];
-
-				if (f != nil && [f respondsToSelector:sel_getUid("bitcodeData")]) {
-					copies[i] = [((NSData *(*)(id, SEL))objc_msgSend)(f, sel_getUid("bitcodeData")) retain];
-				}
-				[f release];
-			}
-			[lib release];
-		});
-		static unsigned told;
-		if (told++ < 3 || (told & (told - 1)) == 0) {
-			hm_print("CoreAnimation's %s: %s (%u times)\n", [name UTF8String], copies[lpf] != nil ?
-				 "compiled as inplace_copy, the source as it is" : "no inplace_copy to stand in, its own module", told);
-		}
-		if (how != NULL) snprintf(how, howSize, copies[lpf] != nil ? "instead:inplace_copy(edr_scale)" : "own");
-		if (copies[lpf] != nil) {
-			return copies[lpf];
-		}
-		return own;
-	}
 	if (how != NULL) strlcpy(how, "own", howSize);
 	if (name == nil || ![name hasPrefix:@"fixed_"]) {
 		return own;
@@ -2637,35 +2599,49 @@ hm_bitcode_for_how(id function, NSString *pipeline, BOOL vertex, char *how, size
 
 		chosen = vertex ? pair[0] : ([pair count] > 1 ? pair[1] : nil);
 		variant = chosen != nil ? hm_ca_variants[chosen] : nil;
-	} else if (pipeline != nil && [pipeline hasPrefix:@"com.apple.coreanimation.draw."]) {
-		/* a pipeline CoreAnimation makes at run time, which the library does not name: its fragment function is the
-		 * spec after the first '_' (so in all 986 the library names) and its vertex one the one every pipeline of that
-		 * fragment function has (one each, in all 444) -- picked apart, a pipeline got the wrong vertex variant and
-		 * the link refused it ("reads varying slot 33, which the vertex stage does not write"), and CoreAnimation
-		 * aborted the window server */
-		NSString *spec = [pipeline substringFromIndex:[@"com.apple.coreanimation.draw." length]];
-		NSRange under = [spec rangeOfString:@"_"];
-		NSString *frag = under.location != NSNotFound ?
-			[@"com.apple.coreanimation.frag." stringByAppendingString:[spec substringFromIndex:NSMaxRange(under)]] : nil;
-
-		if (frag != nil && hm_ca_variants[frag] == nil) {
-			wanted = frag;
-			frag = hm_ca_nearest(frag);
-		}
-		chosen = frag == nil ? nil : (vertex ? hm_ca_frag_vert[frag] : frag);
-		variant = chosen != nil ? hm_ca_variants[chosen] : nil;
 	}
 	if (how != NULL) {
 		if (variant == nil) strlcpy(how, "own(no variant)", howSize);
-		else if (wanted != nil) snprintf(how, howSize, "nearest:%s(for %s)", [chosen UTF8String], [wanted UTF8String]);
 		else snprintf(how, howSize, "variant:%s", [chosen UTF8String]);
 	}
 	if (variant == nil || said++ < 40) {
 		hm_print("CoreAnimation's %s (label %s, pipeline %s): %s%s\n", [name UTF8String], label ? [label UTF8String] : "none",
-			 pipeline ? [pipeline UTF8String] : "none", variant ? "the variant " : "no variant: its own module",
+			 pipeline ? [pipeline UTF8String] : "none", variant ? "the variant " : "not in its library: its own module, with its constants",
 			 variant ? [chosen UTF8String] : "");
 	}
 	return variant != nil ? variant : own;
+}
+
+/* The nearest variant of the library to FUNCTION's, for a pipeline the library does not name and whose own module the
+ * compiler refused: nil when the library has FUNCTION's own variant (nothing nearer to try), or nothing of its kind.
+ * The window server aborts on a render pipeline that fails twice, so a pipeline CoreAnimation cannot have as it asked
+ * is given this one, and the console says so (newRenderPipelineStateWithDescriptor:). HOW as hm_bitcode_for_how's:
+ * "nearest:LABEL(for WANTED)". */
+static NSData *
+hm_bitcode_nearest(id function, NSString *pipeline, BOOL vertex, char *how, size_t howSize)
+{
+	NSString *name = [function respondsToSelector:@selector(name)] ? [function name] : nil;
+	NSString *label = [function respondsToSelector:@selector(label)] ? [function label] : nil;
+
+	if (name == nil || ![name hasPrefix:@"fixed_"] || pipeline == nil || ![pipeline hasPrefix:@"com.apple.coreanimation.draw."]) {
+		return nil;
+	}
+	hm_ca_load();
+	if ((label != nil && hm_ca_variants[label] != nil) || hm_ca_pipelines[pipeline] != nil) {
+		return nil;
+	}
+	/* the fragment function is the spec after the pipeline label's first '_' (so in every one the library names), and the
+	 * vertex one the one every pipeline of that fragment function has (one each) */
+	NSString *spec = [pipeline substringFromIndex:[@"com.apple.coreanimation.draw." length]];
+	NSRange under = [spec rangeOfString:@"_"];
+	NSString *wanted = under.location != NSNotFound ?
+		[@"com.apple.coreanimation.frag." stringByAppendingString:[spec substringFromIndex:NSMaxRange(under)]] : nil;
+	NSString *frag = wanted == nil ? nil : (hm_ca_variants[wanted] != nil ? wanted : hm_ca_nearest(wanted));
+	NSString *chosen = frag == nil ? nil : (vertex ? hm_ca_frag_vert[frag] : frag);
+	NSData *variant = chosen != nil ? hm_ca_variants[chosen] : nil;
+
+	if (variant != nil && how != NULL) snprintf(how, howSize, "nearest:%s(for %s)", [chosen UTF8String], [wanted UTF8String]);
+	return variant;
 }
 
 static NSData *
@@ -2694,17 +2670,6 @@ hm_m2v_variant(const char *name, const char *label, const char *pipeline, int ve
 		NSArray *pair = hm_ca_pipelines[plabel];
 
 		chosen = vertex ? pair[0] : ([pair count] > 1 ? pair[1] : nil);
-		variant = chosen != nil ? hm_ca_variants[chosen] : nil;
-	} else if (plabel != nil && [plabel hasPrefix:@"com.apple.coreanimation.draw."]) {
-		NSString *spec = [plabel substringFromIndex:[@"com.apple.coreanimation.draw." length]];
-		NSRange under = [spec rangeOfString:@"_"];
-		NSString *frag = under.location != NSNotFound ?
-			[@"com.apple.coreanimation.frag." stringByAppendingString:[spec substringFromIndex:NSMaxRange(under)]] : nil;
-
-		if (frag != nil && hm_ca_variants[frag] == nil) {
-			frag = hm_ca_nearest(frag);
-		}
-		chosen = frag == nil ? nil : (vertex ? hm_ca_frag_vert[frag] : frag);
 		variant = chosen != nil ? hm_ca_variants[chosen] : nil;
 	}
 	if (said++ < 20) {
@@ -2861,88 +2826,6 @@ hm_functions_encode_from_metadata(void)
 				return hm_function_argument_encoder(self, index);
 			}));
 		}
-	});
-}
-
-/*
- * Functions CoreAnimation of iOS 16.5 asks its library for that the library given it (QuartzCore-default.metallib:
- * this image's uber shaders and a later CoreAnimation's other functions) does not have under that name, each answered
- * with the nearest one it has: luma_boost (a picture's luminance raised) by inplace_copy, the picture as it is -- both
- * read only the source at texture 3 beside std_vert1 (Metal's reflection on a Mac); edr_scale, tried first, reads
- * buffers 5 and 7 that CoreAnimation binds for neither, and its draws were refused. A function asked for that the
- * library has is never touched. (hakios)
- */
-static const char *const hm_stand_ins[][3] = {
-	/* asked for, given instead, "always" when the library's own is the wrong one (not just missing) */
-	{ "luma_boost_lph", "inplace_copy_lph", "" },
-	{ "luma_boost_lpf", "inplace_copy_lpf", "" },
-	/* the later CoreAnimation's edr_scale reads buffers 5 and 7 and texture 9; iOS 16.5's binds three fragment
-	 * buffers and its source at 3, and 3 259 of its draws were refused in one run (logs/163451-run.log) */
-	{ "edr_scale_lph", "inplace_copy_lph", "always" },
-	{ "edr_scale_lpf", "inplace_copy_lpf", "always" },
-};
-static id (*hm_orig_fn_name)(id, SEL, NSString *);
-static id (*hm_orig_fn_constants)(id, SEL, NSString *, MTLFunctionConstantValues *, NSError **);
-
-static NSString *
-hm_stand_in(NSString *name, BOOL found)
-{
-	for (size_t i = 0; name != nil && i < sizeof(hm_stand_ins) / sizeof(hm_stand_ins[0]); i++) {
-		if (strcmp([name UTF8String], hm_stand_ins[i][0]) == 0 && (!found || hm_stand_ins[i][2][0] != 0)) {
-			return [NSString stringWithUTF8String:hm_stand_ins[i][1]];
-		}
-	}
-	return nil;
-}
-
-static id
-hm_fn_name(id self, SEL sel, NSString *name)
-{
-	id f = hm_orig_fn_name(self, sel, name);
-	NSString *other = hm_stand_in(name, f != nil);
-
-	if (other != nil) {
-		[f release];
-		f = hm_orig_fn_name(self, sel, other);
-	}
-	if (other != nil && f != nil) {
-		HM_ONCE("the library has no %s: %s stands in for it\n", [name UTF8String], [other UTF8String]);
-		if (hm_ft_mode()) objc_setAssociatedObject(f, &hm_ft_asked_key, name, OBJC_ASSOCIATION_COPY);   /* (metal_trace=frame's pipe line says so) */
-	}
-	return f;
-}
-
-static id
-hm_fn_constants(id self, SEL sel, NSString *name, MTLFunctionConstantValues *values, NSError **error)
-{
-	id f = hm_orig_fn_constants(self, sel, name, values, error);
-	NSString *other = hm_stand_in(name, f != nil);
-
-	if (other != nil) {
-		[f release];
-		f = hm_orig_fn_constants(self, sel, other, values, error);
-	}
-	if (other != nil && f != nil) {
-		if (error != NULL) *error = nil;
-		HM_ONCE("the library has no %s: %s stands in for it (with constants)\n", [name UTF8String], [other UTF8String]);
-		if (hm_ft_mode()) objc_setAssociatedObject(f, &hm_ft_asked_key, name, OBJC_ASSOCIATION_COPY);
-	}
-	return f;
-}
-
-static void
-hm_library_stand_ins(void)
-{
-	static dispatch_once_t once;
-
-	dispatch_once(&once, ^{
-		Class library = NSClassFromString(@"_MTLLibrary");
-		Method a = library ? class_getInstanceMethod(library, @selector(newFunctionWithName:)) : NULL;
-		Method b = library ? class_getInstanceMethod(library, @selector(newFunctionWithName:constantValues:error:)) : NULL;
-
-		if (a != NULL) hm_orig_fn_name = (id (*)(id, SEL, NSString *))method_setImplementation(a, (IMP)hm_fn_name);
-		if (b != NULL) hm_orig_fn_constants = (id (*)(id, SEL, NSString *, MTLFunctionConstantValues *, NSError **))
-			method_setImplementation(b, (IMP)hm_fn_constants);
 	});
 }
 
@@ -3283,7 +3166,6 @@ hm_boot_arg_set(const char *what)
 		native_bridge_metal_first_problem(problem, sizeof(problem));
 		hm_print("no metal2vulkan device (%s): hakios-metal's instead\n", problem);
 	}
-	hm_library_stand_ins();
 	ca_prof_start();
 	/* (hakios) the window server's compiled stages kept on disk (hakios-metal: compileStage's cache), so that a
 	 * CoreAnimation shader compiled once is not compiled again by the next window server; and no listings.
@@ -4180,8 +4062,18 @@ hm_describe_function(id f)
 		return [self hakiosRefuse:error what:"a render pipeline"
 				      why:@"a function does not answer bitcodeData, so its AIR cannot be read (not an _MTLFunction of this Metal?)"];
 	}
-	vsAir = hm_bitcode_for_how(vs, [descriptor label], YES, ftBegan != 0 ? vsFrom : NULL, sizeof(vsFrom));
-	fsAir = fs != nil ? hm_bitcode_for_how(fs, [descriptor label], NO, ftBegan != 0 ? fsFrom : NULL, sizeof(fsFrom)) : nil;   /* nil: the built-in fragment function */
+	vsAir = hm_bitcode_for_how(vs, [descriptor label], YES, vsFrom, sizeof(vsFrom));
+	fsAir = fs != nil ? hm_bitcode_for_how(fs, [descriptor label], NO, fsFrom, sizeof(fsFrom)) : nil;   /* nil: the built-in fragment function */
+	if (fs != nil && (strncmp(vsFrom, "variant:", 8) == 0) != (strncmp(fsFrom, "variant:", 8) == 0)) {
+		/* the two stages of a pipeline are of one making: where the library has one function's variant and not the
+		 * other's, both are compiled from their own modules, as CoreAnimation specialised them for each other */
+		vsAir = ((NSData *(*)(id, SEL))objc_msgSend)(vs, bitcode);
+		fsAir = ((NSData *(*)(id, SEL))objc_msgSend)(fs, bitcode);
+		strlcpy(vsFrom, "own(a pair)", sizeof(vsFrom));
+		strlcpy(fsFrom, "own(a pair)", sizeof(fsFrom));
+		hm_print("CoreAnimation's %s: both functions from their own modules (its library has a variant of one of them alone)\n",
+			 [[descriptor label] UTF8String]);
+	}
 	if (vsAir == nil || [vsAir length] == 0 || (fs != nil && (fsAir == nil || [fsAir length] == 0))) {
 		return [self hakiosRefuse:error what:"a render pipeline"
 				      why:[NSString stringWithFormat:@"%@ or %@ has no bitcode", [vs name], [fs name]]];
@@ -4194,6 +4086,29 @@ hm_describe_function(id f)
 		program = hakios_metal_program_new_bitcode_constants([vsAir bytes], [vsAir length], vsConstants, vsCount, fsAir != nil ? [fsAir bytes] : NULL,
 								     fsAir != nil ? [fsAir length] : 0,
 								     fsConstants, fsCount, format);
+		if (program == NULL && fs != nil && !hm_strict()) {
+			/* What CoreAnimation asked for did not compile. The window server aborts on a render pipeline that fails
+			 * twice, so the nearest variant its library has is compiled in its place -- another program, said here
+			 * with the compiler's reason every time it happens (metal_strict: the refusal instead). */
+			char vsNear[300], fsNear[300];
+			NSData *vsOther = hm_bitcode_nearest(vs, [descriptor label], YES, vsNear, sizeof(vsNear));
+			NSData *fsOther = hm_bitcode_nearest(fs, [descriptor label], NO, fsNear, sizeof(fsNear));
+
+			if (vsOther != nil && fsOther != nil) {
+				NSString *refusal = [NSString stringWithUTF8String:hakios_metal_error()];
+
+				program = hakios_metal_program_new_bitcode_constants([vsOther bytes], [vsOther length], vsConstants, vsCount, [fsOther bytes],
+										     [fsOther length], fsConstants, fsCount, format);
+				if (program != NULL) {
+					hm_print("refused: %s as CoreAnimation asked for it (%s); %s and %s stand in for it\n",
+						 [[descriptor label] UTF8String], [refusal UTF8String], vsNear, fsNear);
+					vsAir = vsOther;
+					fsAir = fsOther;
+					strlcpy(vsFrom, vsNear, sizeof(vsFrom));
+					strlcpy(fsFrom, fsNear, sizeof(fsFrom));
+				}
+			}
+		}
 		if (program != NULL) {
 			hm_dump_function("vs", vs, "metal_dump=fn", vsConstants, vsCount);
 			if (fs != nil) hm_dump_function("fs", fs, "metal_dump=fn", fsConstants, fsCount);
@@ -4260,7 +4175,7 @@ hm_describe_function(id f)
 		if (hm_tracing()) {
 			/* the module this Metal hands over is the function already specialised (a few KB, not the library's
 			 * 100), so its size and hash, not the library's, say which code a pipeline runs */
-			NSData *air = hm_bitcode_for([descriptor fragmentFunction], [descriptor label], NO);
+			NSData *air = fsAir;   /* (the module compiled, whichever it was) */
 			uint32_t h = 2166136261u;
 			const uint8_t *b = (const uint8_t *)[air bytes];
 
@@ -4588,13 +4503,15 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 			}
 		}
 	}
-	/* Memoryless is a render target an Apple GPU keeps in tile memory alone, its contents undefined past the pass. This GPU
-	 * draws into memory (sysmem), so the texture is given memory like any other: what Metal leaves undefined is kept, which
-	 * is one of the things undefined allows. CoreAnimation asks for these for its blur and backdrop passes, and a refusal
-	 * here was a pass with no texture and a layer drawn from nothing. */
+	/* Memoryless is a render target that lives in tile memory alone, its contents undefined before the pass and after it.
+	 * CoreAnimation attaches one to every pass as its second colour attachment (com.apple.coreanimation.memoryless-texture):
+	 * draws write it and later draws of the same pass read it back by framebuffer fetch, and its store action is left at
+	 * a colour attachment's default, Store. The core is told (hakios_metal_texture_set_memoryless, below): the tiles of a
+	 * GMEM pass keep it in GMEM and neither load nor store it. It is given rows all the same, for the passes this GPU
+	 * draws straight into memory (sysmem). */
 	if ([descriptor storageMode] == MTLStorageModeMemoryless) {
-		HM_ONCE("a texture was asked for with memoryless storage; this GPU has no tile memory to keep it in, so it is given "
-			"memory as any other texture is\n");
+		HM_ONCE("a texture was asked for with memoryless storage: the tiles of a GMEM pass neither load nor store it; it has "
+			"rows of its own for the passes drawn in sysmem\n");
 	}
 	if ([descriptor storageMode] == MTLStorageModePrivate) {
 		HM_ONCE("a texture was asked for with private storage; every texture here is shared memory, and that is what is "
@@ -4649,6 +4566,9 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 		return hm_refuse_texture([NSString stringWithFormat:@"%lux%lu, pixel format %lu, usage %#lx: %s", (unsigned long)[descriptor width],
 							    (unsigned long)[descriptor height], (unsigned long)[descriptor pixelFormat],
 							    (unsigned long)usage, hakios_metal_error()]);
+	}
+	if ([descriptor storageMode] == MTLStorageModeMemoryless) {
+		hakios_metal_texture_set_memoryless(texture, 1);
 	}
 	return [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
 }
@@ -6949,13 +6869,15 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 					hm_print("passes: %d passes, %.2f ms on the GPU\n", n, total / 1e3);
 					for (int i = 0; i < n; i++) {
 						hakios_metal_cb_pass_time(cb, (unsigned)i, &kind, &width, &height, &draws, &us);
-						unsigned attached = 0, touched = 0, wrote = 0, read = 0;
+						unsigned attached = 0, touched = 0, wrote = 0, read = 0, loaded = 0, stored = 0;
 						hakios_metal_cb_pass_attachments(cb, (unsigned)i, &attached, &touched);
 						hakios_metal_cb_pass_access(cb, (unsigned)i, &wrote, &read);
+						hakios_metal_cb_pass_moved(cb, (unsigned)i, &loaded, &stored);
 						/* (a tiled pass's attachments: those set, those its draws write or read -- TOUCHED's low byte, with why
-						 * it was tiled above it -- and the two apart: written by a fragment stage's output, read by a fetch) */
-						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x %.3f ms%s%s\n", i, kind,
-							 width, height, draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, wrote, read, us / 1e3,
+						 * it was tiled above it -- the two apart: written by a fragment stage's output, read by a fetch; and
+						 * those its tiles loaded from memory and stored to it) */
+						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x loaded %#x stored %#x %.3f ms%s%s\n", i, kind,
+							 width, height, draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, wrote, read, loaded, stored, us / 1e3,
 							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)[0] != 0 ? " sysmem: " : "",
 							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i));
 					}
@@ -9581,32 +9503,6 @@ hm_dump_config(const char *program, hakios_metal_buffer *const *buffers, const u
 	}
 }
 
-/*
- * YES for a draw of luma_boost, unless boot-arg metal_luma_boost=1. A library that has its own (an iOS 17
- * QuartzCore's, CA_QC_METALLIB off a Mac: the colour already drawn, by framebuffer fetch, through a LUT) gets it
- * drawn as a full-screen pass at 1.5 ms a draw, 83% of the GPU's timed passes (logs/224205-run.log,
- * metal_fps=draws); its stand-in there, inplace_copy, stores through texture 3 as an image, which a draw cannot
- * (logs/225648-run.log: backboardd aborted). The picture as it is -- what inplace_copy stands for -- is the draw
- * left out.
- */
-static BOOL
-hm_luma_boost_left_out(const char *program)
-{
-	static int keep = -1;
-
-	if (program == NULL || strstr(program, "+luma_boost_l") == NULL) {
-		return NO;
-	}
-	if (keep < 0) {
-		char args[1024] = "";
-		size_t size = sizeof(args) - 1;
-
-		keep = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_luma_boost=1") != NULL;
-		HM_ONCE("luma_boost: %s (metal_luma_boost=1 draws it)\n", keep ? "drawn" : "left out, the picture as it is");
-	}
-	return !keep;
-}
-
 /* YES when the draw is to be left out (metal_skip); prints the kind once when tracing */
 static BOOL
 hm_trace_draw(const void *which, const char *program, const struct hakios_metal_render_pass *pass, hakios_metal_texture *const *textures, unsigned count,
@@ -9885,10 +9781,6 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
 	if (hm_trace_draw([_pipeline hakiosProgram], hakios_metal_program_name([_pipeline hakiosProgram]), &_pass, fsTex, _fsHighestTexture, (unsigned)primitive, 0)) {
 		HM_FT_DRAW("skipped: metal_skip");
-		return;
-	}
-	if (hm_luma_boost_left_out(hakios_metal_program_name([_pipeline hakiosProgram]))) {
-		HM_FT_DRAW("left out: luma_boost (metal_luma_boost=1 draws it)");
 		return;
 	}
 	if (indexBuffer != nil && ![indexBuffer isKindOfClass:[HakiosMetalBuffer class]]) {

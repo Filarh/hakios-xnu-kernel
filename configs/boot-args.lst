@@ -164,7 +164,6 @@ metal_gmem	u
 metal_gmem_draws	u
 metal_gmem_off	u
 metal_keep	u
-metal_luma_boost	u
 metal_m2v	u
 metal_skip	u
 metal_trace	u
