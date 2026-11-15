@@ -359,7 +359,10 @@ private:
     //                                  the mode after it, at the binning pass's start and at each tile's
     //   CP_SET_DRAW_STATE              each group kept by id; at a draw that runs, the pending ones of the mode in
     //                                  force run from the lowest id up. One set again to the address and length it
-    //                                  last RAN with, without DIRTY, does not run again.
+    //                                  last RAN with, without DIRTY, would not run again in the microcode: a fault
+    //                                  here (what the hardware keeps of a run across a disable is not known). A draw
+    //                                  of the stream itself with a group still set that a draws' buffer set is a
+    //                                  fault as well.
     bool visOverride_ = false, skipGlobal_ = false, skipLocal_ = false;
     bool sdsMode_ = false, sdsImmediate_ = false;   // CP_SET_MODE's word; whether a CP_SET_DRAW_STATE runs its groups at once
     bool streamEnded_ = false;      // the tile's streams have no draw left (found at the draw after the last one they name)
@@ -378,6 +381,7 @@ private:
     uint32_t drawOrdinal_ = 0, tileOrdinal_ = ~0u, tilesInSubmission_ = 0;   // (the draw log's)
     struct Group {
         bool enabled = false, pending = false, forced = false;
+        bool fromBuffer = false;    // set by an indirect buffer (a tiled pass's draws), not by the stream itself
         uint64_t address = 0, ranAddress = 0;
         uint32_t words = 0, ranWords = 0, modes = 0;
     };
@@ -399,7 +403,7 @@ private:
     void tileReset();               // what RM6_BIN_RENDER_START and CP_SET_BIN_DATA5* do alike to the above
     int drawRuns(uint32_t word0, int depth);    // CP_DRAW_*'s first word: 1 the draw runs, 0 the streams skip it (and what that sets off), -1 a fault
     bool runGroups();               // the pending groups of the mode in force
-    bool setDrawState(const uint32_t* p, uint32_t count);
+    bool setDrawState(const uint32_t* p, uint32_t count, int depth);
     void invalidate(uint32_t bits);   // HLSQ_INVALIDATE_CMD
     void logDraw(bool binning);
     uint64_t alwaysOn_ = 0;     // CP_ALWAYS_ON_COUNTER as the fake keeps it: one more at each CP_REG_TO_MEM of it
