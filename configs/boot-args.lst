@@ -158,6 +158,7 @@ membench	k
 metal	ku
 metal_align	u
 metal_all	u
+metal_cpuprep	u
 metal_defer	u
 metal_dump	u
 metal_fps	u

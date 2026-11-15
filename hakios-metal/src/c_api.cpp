@@ -389,6 +389,8 @@ hakios_metal_buffer* hakios_metal_buffer_new(hakios_metal_device* d, uint64_t le
     return r;
 }
 
+void hakios_metal_set_cpu_access_announced(int on) { setCpuAccessAnnounced(on != 0); }
+
 int hakios_metal_device_shares_memory(hakios_metal_device* d) { return d != nullptr && d->gpu && d->gpu->sharesMemory() ? 1 : 0; }
 
 hakios_metal_buffer* hakios_metal_buffer_new_nocopy(hakios_metal_device* d, void* bytes, uint64_t length, void (*released)(void*), void* context) {

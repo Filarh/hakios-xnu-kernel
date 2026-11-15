@@ -144,6 +144,7 @@ MEMBENCH	arg	membench	CPU, memory and boot	k	hakios.cpufreq.c
 METAL	arg	metal	GPU and display	ku	HakiosMetal.m,MiniIOMobileFramebuffer.cpp,inject_sb.c	only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
 METAL_ALIGN	arg	metal_align	User space	u	HakiosMetalCA.m	
 METAL_ALL	arg	metal_all	User space	u	HakiosMetalCA.m	
+METAL_CPUPREP	arg	metal_cpuprep	User space	u	HakiosMetalCA.m	not told, as before, for holding their cost against their absence
 METAL_DEFER	arg	metal_defer	User space	u	HakiosMetalCA.m	this queue's command buffers recorded by a thread of hakios-metal's own (deferred recording), so that the window server's render thread does not wait
 METAL_DUMP	arg	metal_dump	User space	u	HakiosMetalCA.m	
 METAL_FPS	arg	metal_fps	User space	u	HakiosMetalCA.m	each draw of a sysmem pass timed alone, by program (only sysmem passes are: without metal_gmem=1)
