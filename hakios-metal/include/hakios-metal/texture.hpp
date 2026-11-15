@@ -298,6 +298,8 @@ public:
     // TextureDesc::compressed: its flag buffer (the compression's metadata) in the GPU's memory, that buffer's pitch and
     // layer size in bytes, and its blocks across and down as log2 (fdl_layout's)
     bool compressed() const { return ubwc_; }
+    static std::shared_ptr<Texture> adoptView(const Texture& p, Texture* t);
+    void ubwcDescriptor(a6xx::TexConst& d) const;   // TILE6_3, WZYX and the flag buffer of a compressed texture, into D   // a view keeps a compressed parent's UBWC layout
     bool overBufferRows() const { return overBuffer_; }
     // MTLStorageModeMemoryless: a render target whose contents exist only while a pass draws into it, undefined before
     // the pass and after it. It has rows like any other texture (a pass drawn in sysmem draws into them); the tiles of a

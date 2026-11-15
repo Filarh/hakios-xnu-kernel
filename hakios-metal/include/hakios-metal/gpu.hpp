@@ -57,7 +57,11 @@ struct DrmGemClose { uint32_t handle, pad; };
 // else back the buffer (the same handle again while this client holds the surface's buffer); SIZE the buffer's bytes
 // (whole pages), OFFSET where the pixels start in it, ROW_BYTES, and the surface's WIDTH, HEIGHT, PIXEL_FORMAT (a
 // FourCC, 'BGRA' and so on) and PLANES
-struct HakiosSurface { uint32_t surface, handle; uint64_t size; uint32_t offset, rowBytes, width, height, pixelFormat, planes; };
+struct HakiosSurface {
+    uint32_t surface, handle; uint64_t size;
+    uint32_t offset, rowBytes, width, height, pixelFormat, planes;
+    uint32_t ubwc, metaOffset, metaStride, metaSize, dataOffset, dataStride;
+};
 constexpr uint32_t kHakiosDescribe = 0xffffffffu;
 // struct msm_user_memory (0380): ADDRESS and SIZE a range of the calling program's own memory, each a multiple of 4096
 // (the GPU's page); FLAGS 0; back HANDLE, a buffer that is those pages -- held in memory while it is open, written
@@ -67,13 +71,15 @@ struct UserMemory { uint64_t address, size; uint32_t flags, handle; };
 static_assert(sizeof(MsmParam) == 24 && sizeof(MsmGemNew) == 16 && sizeof(MsmGemInfo) == 24, "msm_drm.h layout");
 static_assert(sizeof(MsmSubmitCmd) == 32 && sizeof(MsmSubmitBo) == 16 && sizeof(MsmGemSubmit) == 72, "msm_drm.h layout");
 static_assert(sizeof(MsmWaitFence) == 32, "msm_drm.h layout");
-static_assert(sizeof(HakiosSurface) == 40, "hakios.gpu.cpp layout");
+static_assert(sizeof(HakiosSurface) == 64, "hakios.gpu.cpp layout");
 static_assert(sizeof(UserMemory) == 24, "SapphireGpu.cpp layout");
 
 // what the kernel says of an IOSurface whose memory became a buffer
 struct SurfaceInfo {
     uint64_t size = 0;
     uint32_t offset = 0, rowBytes = 0, width = 0, height = 0, pixelFormat = 0, planes = 0;
+    bool ubwc = false;
+    uint32_t metaOffset = 0, metaStride = 0, metaSize = 0, dataOffset = 0, dataStride = 0;
 };
 
 // GET_PARAM's numbers (msm_drm.h's MSM_PARAM_*), the ones the kernel answers. GPU_ID is 0 there: the chip id says

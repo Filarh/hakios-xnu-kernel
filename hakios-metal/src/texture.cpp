@@ -833,21 +833,7 @@ a6xx::TexConst Texture::sampledDescriptor() const {
         d.dword[0] = (d.dword[0] & ~A6XX_TEX_CONST_0_SAMPLES__MASK) |
                      A6XX_TEX_CONST_0_SAMPLES(desc_.samples == 4 ? MSAA_FOUR : MSAA_TWO);
     }
-    if (ubwc_) {
-        // a UBWC texture (fdl6_view_init, fd6_view.c:251-306): TILE6_3, TILE_ALL (fdl6_layout sets it for UBWC on a
-        // chip without has_ubwc_linear_mipmap_fallback), and the flag buffer's address, pitch, layer and blocks
-        // (a tiled layout holds every 8-bit format in WZYX order: fd6_texture_swap gives WZYX for one that is not linear,
-        // and the 2D copy that fills it from the linear rows reorders a BGRA texture's bytes so)
-        d.dword[0] = (d.dword[0] & ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK)) | A6XX_TEX_CONST_0_TILE_MODE(TILE6_3) |
-                     A6XX_TEX_CONST_0_SWAP(WZYX);
-        d.dword[3] |= A6XX_TEX_CONST_3_TILE_ALL | A6XX_TEX_CONST_3_FLAG;
-        const uint64_t flags = flagAddress();
-        d.dword[7] = uint32_t(flags);
-        d.dword[8] = uint32_t(flags >> 32);
-        d.dword[9] |= A6XX_TEX_CONST_9_FLAG_BUFFER_ARRAY_PITCH(ubwcLayerSize_ >> 2);
-        d.dword[10] |= A6XX_TEX_CONST_10_FLAG_BUFFER_PITCH(ubwcPitch_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGW(ubwcLogW_) |
-                       A6XX_TEX_CONST_10_FLAG_BUFFER_LOGH(ubwcLogH_);
-    }
+    ubwcDescriptor(d);
     if (info_->depth) {
         // the depth plane as the TP reads it (fdl6_view_init over a depth layout): TILE6_3, and TILE_ALL since every level
         // of a depth layout is tiled (fd6_layout.c:157-164 "Linear D/S is not supported by HW"); FMT6_32_FLOAT, the depth
@@ -883,10 +869,30 @@ const uint32_t* Texture::sampledWords() const {
     return sampledWords_;
 }
 
+void Texture::ubwcDescriptor(a6xx::TexConst& d) const {
+    using namespace a6xx;
+    if (!ubwc_) return;
+        // a UBWC texture (fdl6_view_init, fd6_view.c:251-306): TILE6_3, TILE_ALL (fdl6_layout sets it for UBWC on a
+    // chip without has_ubwc_linear_mipmap_fallback), and the flag buffer's address, pitch, layer and blocks
+    // (a tiled layout holds every 8-bit format in WZYX order: fd6_texture_swap gives WZYX for one that is not linear,
+    // and the 2D copy that fills it from the linear rows reorders a BGRA texture's bytes so)
+    d.dword[0] = (d.dword[0] & ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK)) | A6XX_TEX_CONST_0_TILE_MODE(TILE6_3) |
+                 A6XX_TEX_CONST_0_SWAP(WZYX);
+    d.dword[3] |= A6XX_TEX_CONST_3_TILE_ALL | A6XX_TEX_CONST_3_FLAG;
+    const uint64_t flags = flagAddress();
+    d.dword[7] = uint32_t(flags);
+    d.dword[8] = uint32_t(flags >> 32);
+    d.dword[9] |= A6XX_TEX_CONST_9_FLAG_BUFFER_ARRAY_PITCH(ubwcLayerSize_ >> 2);
+    d.dword[10] |= A6XX_TEX_CONST_10_FLAG_BUFFER_PITCH(ubwcPitch_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGW(ubwcLogW_) |
+                   A6XX_TEX_CONST_10_FLAG_BUFFER_LOGH(ubwcLogH_);
+}
+
 a6xx::TexConst Texture::levelDescriptor(uint32_t level) const {
     const TextureLevel L = this->level(level);
     a6xx::TexConst d = texture2d(levelAddress(level), L.width, L.height, uint32_t(L.pitch), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),
                                  info_->fmt6, info_->swap, info_->hasAlpha, info_->srgb);
+    // (a compressed texture's level -- the framebuffer fetch's read of its target -- in its UBWC layout, as descriptor() reads it)
+    if (level == 0) ubwcDescriptor(d);
     d.dword[0] = swizzleWord(d.dword[0]);
     return d;
 }
@@ -993,6 +999,26 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         refuse(why, name + " has " + n(s.planes) + " planes: a single-plane surface is what is served");
         return nullptr;
     }
+	if (s.ubwc) {
+		if ((desc.format != PixelFormat::kRGBA8Unorm && desc.format != PixelFormat::kBGRA8Unorm) ||
+		    desc.width != s.width || desc.height != s.height || s.metaOffset != 0 ||
+		    s.metaSize == 0 || (s.metaStride & 63) != 0 || (s.metaSize & 4095) != 0 ||
+		    (s.dataOffset & 4095) != 0 || (s.dataStride & 255) != 0 ||
+		    uint64_t(s.dataOffset) + uint64_t(s.dataStride) * ((s.height + 15) & ~15u) > s.size) {
+			refuse(why, name + " has an unsupported UBWC surface layout");
+			return nullptr;
+		}
+		auto log2ceil = [](uint32_t v) { uint32_t r = 0; while ((1u << r) < v) r++; return r; };
+		// (pitch alignment: the format's own, log2(cpp), as a UBWC texture of the driver's gets it from fdl6, l.pitchalign - 6)
+		Texture* t = new Texture(std::move(buffer), desc, info, s.dataStride, s.dataOffset, ~0u, surfaceId);
+		t->ubwc_ = true;
+		t->ubwcOffset_ = s.metaOffset;
+		t->ubwcPitch_ = s.metaStride;
+		t->ubwcLayerSize_ = s.metaSize;
+		t->ubwcLogW_ = log2ceil((s.width + 15) / 16);
+		t->ubwcLogH_ = log2ceil((s.height + 3) / 4);
+		return adopt(t);
+	}
     if (desc.width == 0 || desc.height == 0 || desc.width > s.width || desc.height > s.height) {
         refuse(why, "a " + n(desc.width) + " x " + n(desc.height) + " texture over the " + n(s.width) + " x " + n(s.height) + " " + name);
         return nullptr;
@@ -1105,6 +1131,20 @@ std::shared_ptr<Texture> Texture::overBuffer(std::shared_ptr<Buffer> buffer, uin
     return adopt(t);
 }
 
+// a view over a compressed texture reads and writes the same UBWC layout: it takes the parent's flag buffer and blocks
+// (without them the RB wrote a surface's colour data linear over its UBWC layout, and the display read noise)
+std::shared_ptr<Texture> Texture::adoptView(const Texture& p, Texture* t) {
+    if (p.ubwc_) {
+        t->ubwc_ = true;
+        t->ubwcOffset_ = p.ubwcOffset_;
+        t->ubwcPitch_ = p.ubwcPitch_;
+        t->ubwcLayerSize_ = p.ubwcLayerSize_;
+        t->ubwcLogW_ = p.ubwcLogW_;
+        t->ubwcLogH_ = p.ubwcLogH_;
+    }
+    return adopt(t);
+}
+
 std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, PixelFormat format, TextureType type, uint32_t baseLevel, uint32_t levels,
                                        uint32_t baseSlice, uint32_t slices, std::string* why) {
     // (a view of a compressed texture is a view of its rows: their layout is the one a view reinterprets)
@@ -1133,7 +1173,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         d.type = type;
         d.depth = 1;
         d.mipLevels = 1;
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.stencilPitch(), p.offset_ + p.stencilOffset(), 1));
+        std::shared_ptr<Texture> t = adoptView(p, new Texture(p.buffer_, d, info, p.stencilPitch(), p.offset_ + p.stencilOffset(), 1));
         t->layerPitch_ = p.stencilPlaneBytes();
         return t;
     }
@@ -1146,7 +1186,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
     }
     if (p.surface() != 0 || p.info().twoPlane || p.samples() != 1) {
         if (format == p.format() && type == p.type() && levels == p.levels() && slices == parentSlices) {
-            std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
+            std::shared_ptr<Texture> t = adoptView(p, new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
             t->chroma_ = p.chroma_;
             return t;
         }
@@ -1156,7 +1196,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
             info->bytesPerPixel == p.info().bytesPerPixel && !info->depth && !info->twoPlane && info->blockW == 1) {
             TextureDesc d = p.desc_;
             d.format = format;
-            return adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
+            return adoptView(p, new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
         }
         refuse(why, asked + ": a view of an IOSurface's, a two-plane or a multisample texture is served only as the whole of it");
         return nullptr;
@@ -1167,7 +1207,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
     // every level from 0, the slices all there, the type the parent's: the same layout, its first LEVELS levels
     if (type == p.type() && baseLevel == 0 && baseSlice == 0 && slices == parentSlices) {
         d.mipLevels = levels;
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_));
+        std::shared_ptr<Texture> t = adoptView(p, new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_));
         t->layerPitch_ = p.layerPitch_ != 0 ? p.layerPitch_ : (layered ? p.sliceBytes() : 0);
         return t;
     }
@@ -1181,7 +1221,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         d.depth = 1;
         uint32_t pitchAlign = 0;
         while (pitchAlign < log2u(info->bytesPerPixel) && L.pitch % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
-        return adopt(new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign));
+        return adoptView(p, new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign));
     }
     // one layer of a one-level depth array as 2D (Resident Evil 4's shadow cascades: 32 layers of Depth32Float, each
     // drawn and then sampled on its own): a depth texture is tiled, so the linear rows the branch above gives a colour
@@ -1191,7 +1231,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         (p.type() == TextureType::k2DArray || p.type() == TextureType::kCube || p.type() == TextureType::kCubeArray)) {
         d.mipLevels = 1;
         d.depth = 1;
-        return adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_ + uint64_t(baseSlice) * p.sliceBytes(), p.pitchAlign_));
+        return adoptView(p, new Texture(p.buffer_, d, info, p.pitch_, p.offset_ + uint64_t(baseSlice) * p.sliceBytes(), p.pitchAlign_));
     }
     // a 2D texture as a 2D array of that one slice, or a 1D one as a 1D array (Resident Evil 4 makes such views of its
     // targets, depth buffers and 1D tables, to bind them where a shader takes an array): its levels from 0 are the one
@@ -1200,7 +1240,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         baseLevel == 0 && slices == 1) {
         d.depth = 1;
         d.mipLevels = levels;
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_));
+        std::shared_ptr<Texture> t = adoptView(p, new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_));
         t->layerPitch_ = textureBytes(p.info(), p.width(), p.height(), p.levels());
         return t;
     }
@@ -1213,7 +1253,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         d.depth = 1;
         uint32_t pitchAlign = 0;
         while (pitchAlign < log2u(info->bytesPerPixel) && L.pitch % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
-        return adopt(new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset, pitchAlign));
+        return adoptView(p, new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset, pitchAlign));
     }
     // a run of a one-level layered texture's slices as a 2D array, six as a cube, or sixes as a cube array: the slices
     // sit sliceBytes apart whichever of them names them, so the run starts BASE_SLICE slices in
@@ -1235,7 +1275,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
             pitchAlign = 0;
             while (pitchAlign < log2u(info->bytesPerPixel) && L.pitch % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
         }
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign));
+        std::shared_ptr<Texture> t = adoptView(p, new Texture(p.buffer_, d, info, pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign));
         t->layerPitch_ = p.sliceBytes();
         return t;
     }

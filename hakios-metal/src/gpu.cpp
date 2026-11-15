@@ -87,7 +87,8 @@ std::unique_ptr<Bo> Gpu::surfaceBo(uint32_t surfaceId, SurfaceInfo* out, int* er
         t_->call(kGemClose, &c, sizeof(c));
         return nullptr;
     }
-    *out = SurfaceInfo{s.size, s.offset, s.rowBytes, s.width, s.height, s.pixelFormat, s.planes};
+    *out = SurfaceInfo{s.size, s.offset, s.rowBytes, s.width, s.height, s.pixelFormat, s.planes,
+                       s.ubwc != 0, s.metaOffset, s.metaStride, s.metaSize, s.dataOffset, s.dataStride};
     std::unique_ptr<Bo> bo(new Bo(*this, s.handle, s.size, info.value, t_->map(s.handle, s.size)));
     bo->surface_ = true;
     return bo;
