@@ -2,8 +2,9 @@
 // meant to leave the command processor's words as they were can be held to that -- word for word.
 //
 //   stream   the words the command processor reads, in the order it reads them: the submission's own and, at each
-//            CP_INDIRECT_BUFFER, the body's (every time it is called). Addresses are words like any other, so a
-//            buffer made earlier, later or at another size shows here.
+//            CP_INDIRECT_BUFFER, the body's (every time it is called), and at each CP_SET_DRAW_STATE the fragment of
+//            every group it sets (once a setting). Addresses are words like any other, so a buffer made earlier,
+//            later or at another size shows here.
 //   state    what the indirect loads name: the bytes at each CP_LOAD_STATE6*'s source, as many as it loads (a stage's
 //            program, its constants, the texture, sampler and IBO descriptors of a draw's table) -- the half of a
 //            draw's state that is not in the stream. A source the stream itself fills by CP_MEMCPY before the load
@@ -104,6 +105,15 @@ private:
                     break;
                 case pm4::kIndirectBuffer:
                     if (h.count == 3 && depth < 3) walk(gpu, uint64_t(p[0]) | uint64_t(p[1]) << 32, p[2], copies, depth + 1);
+                    break;
+                case a6xx::CP_SET_DRAW_STATE:
+                    // (a tiled pass's draws as draw-state groups, gmem.hpp: each group set is its fragment's words, read
+                    // where the packet names them -- once a setting, whichever tiles then run it)
+                    for (uint32_t e = 0; e + 3 <= h.count && depth < 3; e += 3) {
+                        const uint32_t n = p[e] & a6xx::CP_SET_DRAW_STATE__0_COUNT__MASK;
+                        if (n == 0 || (p[e] & (a6xx::CP_SET_DRAW_STATE__0_DISABLE | a6xx::CP_SET_DRAW_STATE__0_DISABLE_ALL_GROUPS)) != 0) continue;
+                        walk(gpu, uint64_t(p[e + 1]) | uint64_t(p[e + 2]) << 32, n, copies, depth + 1);
+                    }
                     break;
                 default:
                     break;

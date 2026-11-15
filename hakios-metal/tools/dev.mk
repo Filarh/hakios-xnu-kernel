@@ -14,7 +14,7 @@ OUT   = out/dev-$(CHIP)
 DEFS  =
 CXXFLAGS = $(OPT) -std=c++17 -Wall -Wextra -Werror -Iinclude $(DEFS) -MMD -MP
 
-CORE  = pm4 gpu command compute texture render link compiler metallib c_api fake_gpu
+CORE  = pm4 gpu command compute texture render gmem link compiler metallib c_api fake_gpu
 TESTS = $(basename $(notdir $(wildcard tests/*_test.cpp))) main
 
 CORE_O = $(CORE:%=$(OUT)/obj/src/%.o)

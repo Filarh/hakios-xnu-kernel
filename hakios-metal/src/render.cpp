@@ -19,6 +19,7 @@
 
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
+#include "hakios-metal/gmem.hpp"
 #include "hakios-metal/texture.hpp"
 
 namespace hakios::metal {
@@ -2540,8 +2541,14 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
 }
 
 void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, uint64_t bodies, uint32_t bodyWords, uint64_t table, const Options& o,
-                uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc) {
+                uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc, uint32_t body) {
     const auto [W, H] = windowOf(pass);
+    // every draw-state group let go: what both batch starts send, and fd6 after its binning pass and after each tile's draws
+    auto letGroupsGo = [&]() {
+        const uint32_t w[3] = {setDrawState0(0, CP_SET_DRAW_STATE__0_DISABLE_ALL_GROUPS, 0), 0, 0};
+        stream.packet(CP_SET_DRAW_STATE, w, 3);
+    };
+    const bool groups = vsc != 0 && (body & kGmemBodyGroups) != 0, leave = vsc != 0 && (body & kGmemBodyLeave) != 0;
     // the colour cache out of the tiles' way (it is not pipelined: after a WFI, as the sysmem value is written)
     stream.waitForIdle();
     reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem());
@@ -2618,6 +2625,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         reg(stream, REG_A6XX_RB_WINDOW_OFFSET, regXY(0, 0));
         reg(stream, REG_A6XX_SP_TP_WINDOW_OFFSET, regXY(0, 0));
         if (o.gmemBinningStage != 1) stream.indirect(bodies, bodyWords);
+        // (the groups the binning pass ran are not the tiles' to find still set: fd6's emit_binning_pass, fd6_gmem.cc:1133-1135)
+        if (groups) letGroupsGo();
         event(stream, UNK_2D);
         // the VSC wrote through the UCHE and the command processor reads the streams uncached: flushed and waited for
         stream.waitForIdle();
@@ -2683,6 +2692,7 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
                 // (by offsets from the VSC registers the binning pass set, as turnip on A6XX; fd6's CP_SET_BIN_DATA5 with the
                 // addresses works as well, stage 7, once RM6_BIN_END_OF_DRAWS lets each tile's streams go)
                 const uint32_t w[4] = {cpSetBinData5_0(pw * ph, n), pipe * kVscDrawPitch, pipe * 4, pipe * kVscPrimPitch};
+                if (leave && o.gmemTwin == 3) command1(stream, CP_SKIP_IB2_ENABLE_LOCAL, 1);   // (the twin: before the bin data, as Mesa has it)
                 if (o.gmemBinningStage == 7) {
                     const uint64_t d = drawStrm + uint64_t(pipe) * kVscDrawPitch, z = drawSizes + pipe * 4ull, q = primStrm + uint64_t(pipe) * kVscPrimPitch;
                     const uint32_t a[7] = {w[0], uint32_t(d), uint32_t(d >> 32), uint32_t(z), uint32_t(z >> 32), uint32_t(q), uint32_t(q >> 32)};
@@ -2692,6 +2702,12 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
                 }
                 command1(stream, CP_SET_VISIBILITY_OVERRIDE, o.gmemBinningStage == 5 ? 1 : 0);
                 if (o.gmemBinningStage != 4) command1(stream, CP_SKIP_IB2_ENABLE_GLOBAL, 1);   // (fd6_emit_tile_prep's, with a binning pass)
+                // GLOBAL and LOCAL both: once the tile's streams name no more draws, the draws' buffer is left where it
+                // is read ("draws will early return from their IB", adreno_pm4.xml). LOCAL is the tile's own -- the
+                // microcode clears it at RM6_BIN_RENDER_START and at CP_SET_BIN_DATA5 -- so it is written here, after
+                // both, and not once a pass before them as turnip and fd6 write theirs (tu_cmd_buffer.cc:3687-3691,
+                // fd6_gmem.cc:1323-1325), where the first tile's marker undoes it
+                if (leave && o.gmemTwin != 3 && o.gmemBinningStage != 4) command1(stream, CP_SKIP_IB2_ENABLE_LOCAL, 1);
                 crumb(0x200 + ty * plan.cols + tx);
             } else {
                 command1(stream, CP_SET_VISIBILITY_OVERRIDE, 1);
@@ -2723,7 +2739,11 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             // under hw binning): without it the third tile's CP_SET_BIN_DATA5 found the queue full and its draws hung
             // in PC, in whichever order the tiles ran (probe --bin-trace)
             if (streams && o.gmemBinningStage != 9) command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_END_OF_DRAWS) | A6XX_CP_SET_MARKER_0_USES_GMEM);
+            // (fd6_emit_tile_gmem2mem, fd6_gmem.cc:2194-2203: the groups let go and LOCAL off before the resolve; turnip's
+            // GLOBAL off, tu_cmd_buffer.cc:3827-3834)
+            if (groups && o.gmemTwin != 4) letGroupsGo();
             command1(stream, CP_SKIP_IB2_ENABLE_GLOBAL, 0);
+            if (leave) command1(stream, CP_SKIP_IB2_ENABLE_LOCAL, 0);
             command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_RESOLVE) | A6XX_CP_SET_MARKER_0_USES_GMEM);
             for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
                 if ((store >> i) & 1) blit(i, BLIT_EVENT_STORE);
@@ -4665,13 +4685,34 @@ void CommandBuffer::closePass() {
         Piece ib;
         std::string why;
         const std::vector<uint32_t>& w = open_->bodies.words();
-        if (!piece(4 * w.size(), &ib, &why)) {
+        // A binned pass's draws as draw-state groups (gmem.hpp): a tile then runs the state of the draws its visibility
+        // streams let through and of no other, and leaves the draws' buffer after the last of them. The draws were
+        // recorded as a plain stream, which is what a pass that is not binned still runs, every draw in every tile --
+        // and what a binned one falls back to when its stream holds something drawStates does not move into a group.
+        const bool binned = (open_->options.gmemBinning || gmemBinning_) && queue_.binningOk();
+        render::DrawStates groups;
+        const bool grouped = binned && !(gmemOff_ & kGmemPlainBody) &&
+                             render::drawStates(w.data(), w.size(), a6xx::CP_SET_DRAW_STATE__0_BINNING | a6xx::CP_SET_DRAW_STATE__0_GMEM, &groups,
+                                                open_->options.gmemTwin);
+        const size_t ibWords = grouped ? groups.blobs.size() + groups.list.size() : w.size();
+        if (!piece(4 * ibWords, &ib, &why)) {
             // (the draws were encoded for tiles: they cannot run in sysmem instead)
             open_.reset();
             fail(std::string("no memory for a GMEM pass's draws: ") + why);
             return;
         }
-        std::memcpy(ib.contents(), w.data(), 4 * w.size());
+        uint64_t bodyAt = ib.gpuAddress();
+        uint32_t bodyWords = uint32_t(w.size());
+        if (grouped) {
+            // (the fragments first, the draws' list after them: one piece, written once)
+            groups.place(ib.gpuAddress());
+            std::memcpy(ib.contents(), groups.blobs.data(), 4 * groups.blobs.size());
+            std::memcpy(ib.contents() + 4 * groups.blobs.size(), groups.list.data(), 4 * groups.list.size());
+            bodyAt = ib.gpuAddress() + 4 * groups.blobs.size();
+            bodyWords = uint32_t(groups.list.size());
+        } else {
+            std::memcpy(ib.contents(), w.data(), 4 * w.size());
+        }
         // The tiles over the render area alone, and of the attachments only those the draws touch: one they neither
         // write nor read keeps its memory as it is. A touched one is loaded unless its load action is DontCare and the
         // area's granules stay above its last row (below it the store would put back what it never loaded into the
@@ -4700,7 +4741,7 @@ void CommandBuffer::closePass() {
             if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) store |= 1u << i;
         }
         uint64_t vsc = 0;
-        if ((open_->options.gmemBinning || gmemBinning_) && queue_.binningOk()) {
+        if (binned) {
             std::shared_ptr<Buffer> v = queue_.vscBuffer(&why);
             if (v == nullptr) {
                 open_.reset();
@@ -4712,8 +4753,17 @@ void CommandBuffer::closePass() {
             vsc = v->gpuAddress();
         }
         pm4::Stream tiles;
-        render::encodeGmem(tiles, open_->pass, plan, ib.gpuAddress(), uint32_t(w.size()), open_->table, open_->options, load, store, open_->read != 0,
-                           open_->clears, open_->clearWords, vsc);
+        // (the copies the draws' loads read, once for every tile and for the binning pass: DrawStates::prologue)
+        if (grouped) {
+            const std::vector<uint32_t>& pro = groups.prologue;
+            for (size_t i = 0; i < pro.size();) {
+                const pm4::Header h = pm4::decode(pro[i]);
+                tiles.packet(h.opcode, h.count ? &pro[i + 1] : nullptr, h.count);
+                i += 1 + h.count;
+            }
+        }
+        render::encodeGmem(tiles, open_->pass, plan, bodyAt, bodyWords, open_->table, open_->options, load, store, open_->read != 0, open_->clears,
+                           open_->clearWords, vsc, grouped ? render::kGmemBodyGroups | (gmemOff_ & kGmemNoLeave ? 0u : render::kGmemBodyLeave) : 0u);
         appendStream(stream_, tiles);
         counts_.gmemPasses++;
         if (vsc != 0) counts_.binnedPasses++;

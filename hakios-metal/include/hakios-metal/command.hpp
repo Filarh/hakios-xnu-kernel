@@ -177,8 +177,11 @@ public:
     // render::Options::gmem for this buffer's draws besides each draw's own (both must allow it): the C API's switch
     void setGmem(bool on) { gmem_ = on; }
     // GMEM's refinements off, for a bisect on the phone: kGmemWholeArea tiles the whole window whatever the draws touch,
-    // kGmemEveryAttachment loads and stores every attachment, kGmemFetchBarrier orders a fetch by the barrier
-    enum : uint32_t { kGmemWholeArea = 1, kGmemEveryAttachment = 2, kGmemFetchBarrier = 4 };
+    // kGmemEveryAttachment loads and stores every attachment, kGmemFetchBarrier orders a fetch by the barrier,
+    // kGmemPlainBody draws a binned pass from its draws' plain stream, every tile running every draw's state (no
+    // draw-state groups), kGmemNoLeave has each tile read its draws to the last (no CP_SKIP_IB2_ENABLE_LOCAL).
+    // (8, 16 and 32 are the plug-in's own: metal_gmem_off's untuned choice, no binning, null textures.)
+    enum : uint32_t { kGmemWholeArea = 1, kGmemEveryAttachment = 2, kGmemFetchBarrier = 4, kGmemPlainBody = 64, kGmemNoLeave = 128 };
     void setGmemOff(uint32_t bits) { gmemOff_ = bits; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
