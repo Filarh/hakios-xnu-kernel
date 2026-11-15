@@ -142,6 +142,7 @@ M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of eve
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
 MEMBENCH	arg	membench	CPU, memory and boot	k	hakios.cpufreq.c	
 METAL	arg	metal	GPU and display	ku	HakiosMetal.m,MiniIOMobileFramebuffer.cpp,inject_sb.c	only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
+METAL_ALIGN	arg	metal_align	User space	u	HakiosMetalCA.m	
 METAL_ALL	arg	metal_all	User space	u	HakiosMetalCA.m	
 METAL_DEFER	arg	metal_defer	User space	u	HakiosMetalCA.m	this queue's command buffers recorded by a thread of hakios-metal's own (deferred recording), so that the window server's render thread does not wait
 METAL_DUMP	arg	metal_dump	User space	u	HakiosMetalCA.m	
@@ -151,6 +152,7 @@ METAL_GMEM_DRAWS	arg	metal_gmem_draws	User space	u	HakiosMetalCA.m	GMEM for a pa
 METAL_GMEM_OFF	arg	metal_gmem_off	User space	u	HakiosMetalCA.m	
 METAL_KEEP	arg	metal_keep	User space	u	HakiosMetalCA.m	no draw is taken from what hakios-metal keeps of its program (hakios_metal_draw_states): each is judged and written whole
 METAL_M2V	arg	metal_m2v	User space	u	HakiosMetalCA.m	
+METAL_NOCOPY	arg	metal_nocopy	User space	u	HakiosMetalCA.m	the deallocator of a no-copy buffer made as a copy, run when the copy goes
 METAL_SKIP	arg	metal_skip	User space	u	HakiosMetalCA.m	
 METAL_SPEC_MASK	arg	metal_spec_mask	User space	u	HakiosMetalCA.m	
 METAL_SWIZZLE	arg	metal_swizzle	User space	u	HakiosMetalCA.m	

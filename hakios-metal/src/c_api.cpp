@@ -206,12 +206,19 @@ void refusedThere(hakios_metal_cb* cb, int r) {
 }
 }  // namespace
 
-namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused; extern std::atomic<uint64_t> gBytesMade; }
+namespace hakios::metal {
+extern std::atomic<uint32_t> gBuffersMade, gBuffersReused, gBuffersShared;
+extern std::atomic<uint64_t> gBytesMade, gBytesShared;
+}
 extern "C" {
 void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long long* bytes) {
     *made = hakios::metal::gBuffersMade.exchange(0);
     *reused = hakios::metal::gBuffersReused.exchange(0);
     *bytes = hakios::metal::gBytesMade.exchange(0);
+}
+void hakios_metal_shared_counts(unsigned* made, unsigned long long* bytes) {
+    *made = hakios::metal::gBuffersShared.exchange(0);
+    *bytes = hakios::metal::gBytesShared.exchange(0);
 }
 
 
@@ -581,6 +588,10 @@ void hakios_metal_texture_set_memoryless(hakios_metal_texture* t, int memoryless
 }
 
 int hakios_metal_texture_memoryless(hakios_metal_texture* t) { return t != nullptr && t->texture->memoryless() ? 1 : 0; }
+
+int hakios_metal_texture_is_program_memory(hakios_metal_texture* t) {
+    return t != nullptr && t->texture->buffer() != nullptr && t->texture->buffer()->programMemory() ? 1 : 0;
+}
 
 unsigned hakios_metal_texture_origin(hakios_metal_texture* t) {
     const Texture& x = *t->texture;

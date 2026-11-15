@@ -156,6 +156,7 @@ m2v_utrace	u
 machine_name	k
 membench	k
 metal	ku
+metal_align	u
 metal_all	u
 metal_defer	u
 metal_dump	u
@@ -165,6 +166,7 @@ metal_gmem_draws	u
 metal_gmem_off	u
 metal_keep	u
 metal_m2v	u
+metal_nocopy	u
 metal_skip	u
 metal_spec_mask	u
 metal_swizzle	u
