@@ -1218,8 +1218,10 @@ bool FakeGpu::eventBlit() {
         memcpy(to, type == BLIT_EVENT_LOAD ? m : g, rowBytes);
         for (uint64_t o = 0; swapBR && o < rowBytes; o += 4) std::swap(to[o], to[o + 2]);
     }
-    if (type == BLIT_EVENT_LOAD) stats_.tileLoads++;
-    else {
+    if (type == BLIT_EVENT_LOAD) {
+        stats_.tileLoads++;
+        stats_.loadedPixels += uint64_t(x2 - x1 + 1) * (y2 - y1 + 1);
+    } else {
         stats_.tileStores++;
         stats_.storedPixels += uint64_t(x2 - x1 + 1) * (y2 - y1 + 1);
     }

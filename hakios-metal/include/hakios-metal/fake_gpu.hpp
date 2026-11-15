@@ -159,6 +159,7 @@ public:
         uint32_t tileClears = 0;    // ...and clears in GMEM
         uint32_t binningPasses = 0, binnedDraws = 0, binData = 0;   // binning passes, the draws in them, tiles told their streams
         uint64_t storedPixels = 0;  // pixels the stores wrote: the whole target once, granule padding included, when the tiles tile it
+        uint64_t loadedPixels = 0;  // pixels the loads read into GMEM
         // What the command processor read and ran, as the CP microcode reads and runs it (the CP's state, below):
         // every word it fetched -- the stream's, an indirect buffer's each time it was entered and as far as it was
         // read, a draw-state group's each time it ran -- and of those the words inside draw-state groups; the draws a
