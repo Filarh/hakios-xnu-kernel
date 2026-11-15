@@ -1543,7 +1543,10 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
                               target != nullptr ? double(target->level(targetLevel).height) : 1.0, 0, 1};
     }
     if (scissor != nullptr) {
+        // (a rectangle of no area is one no fragment passes -- not the core's "width 0: the whole target", which is
+        // what no scissor at all is)
         d.scissor = Scissor{scissor->x, scissor->y, scissor->width, scissor->height};
+        d.scissorEmpty = scissor->width == 0 || scissor->height == 0;
     }
     if (pass != nullptr) {
         for (int i = 0; i < 4; i++) d.blendColor[i] = pass->blend_color[i];

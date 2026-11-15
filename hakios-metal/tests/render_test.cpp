@@ -609,11 +609,79 @@ TEST(render_refuses_what_the_first_draw_does_not_serve_by_name) {
         x = d;
         x.scissor = Scissor{32, 0, 33, 64};
         refused(r, p, pass, x, "scissor (32, 0, 33, 64) lies outside the 64 x 64 target");
-        x = d;
-        x.scissor = Scissor{0, 0, 5, 0};
-        refused(r, p, pass, x, "a scissor of 5 x 0 pixels: an empty scissor draws nothing (width 0 means the whole target)");
+        // (a scissor of no area is no refusal: an_empty_scissor_passes_no_fragment_and_is_no_refusal)
     }
     CHECK_EQ(r.fake->stats().submits, 0u);
+}
+
+// MTLScissorRect of no area -- a width or a height of 0 -- lets no fragment pass. It was taken for no scissor at all
+// when its width was 0 (the layer drawn over the whole target) and refused when its height was. It is a draw like any
+// other, written with the screen scissor turnip writes for an empty one, the top left past the bottom right: (1, 1)-(0,
+// 0) (tu_pipeline.cc:2669-2672). It opens its pass, Clear and all; it touches no pixel (render::drawArea), so the tiles
+// of a pass are laid for the other draws alone, and in a binned pass no tile's visibility stream lets it through.
+TEST(an_empty_scissor_passes_no_fragment_and_is_no_refusal) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    const Program p = flatProgram();
+    const uint32_t tl = regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0);
+    for (int how = 0; how < 2; how++) {
+        Draw d = wholeDraw(3);
+        if (how == 0) d.scissorEmpty = true;            // (the C interface's: a rectangle given, with no width or no height)
+        else d.scissor = Scissor{0, 0, 5, 0};           // (a width and no height)
+        Encoded e(r, p, pass, d);
+        CHECK(e.ok);
+        if (!e.ok) std::printf("       %s\n", e.error.c_str());
+        CHECK_EQ(e.reg(tl), scissorXY(1, 1));
+        CHECK_EQ(e.reg(tl + 1), scissorXY(0, 0));
+        uint32_t area[4];
+        if (how == 0) CHECK(!render::drawArea(pass, d, area));
+    }
+    {
+        Draw whole = wholeDraw(3);
+        Encoded e(r, p, pass, whole);
+        CHECK(e.ok && e.reg(tl) == scissorXY(0, 0) && e.reg(tl + 1) == scissorXY(63, 63));   // (no scissor: the whole target, as ever)
+    }
+    // in a command buffer, first in its pass and after a draw of the same program (from its kept state), in sysmem
+    for (int after = 0; after < 2; after++) {
+        auto cb = r.queue->commandBuffer();
+        Draw d = wholeDraw(3);
+        d.scissorEmpty = true;
+        if (after) CHECK(cb->draw(p, pass, wholeDraw(3), Bindings{}, Bindings{}));
+        CHECK(cb->draw(p, pass, d, Bindings{}, Bindings{}));
+        if (after) CHECK(cb->draw(p, pass, wholeDraw(3), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        CHECK_EQ(r.fake->stats().faults, 0u);
+    }
+    // in a binned pass of tiles: the tiles run the two whole draws and none of them the empty one
+    {
+        Rig big;
+        auto screen = target(big, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a;
+        a.color0 = screen.get();
+        render::Options binned;
+        binned.gmemBinning = true;
+        auto cb = big.queue->commandBuffer();
+        Draw none = wholeDraw(3, 750, 1624);
+        none.scissorEmpty = true;
+        CHECK(cb->draw(p, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
+        CHECK(cb->draw(p, a, none, Bindings{}, Bindings{}, binned));
+        CHECK(cb->draw(p, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto s = big.fake->stats();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), s.lastFault.c_str());
+        CHECK_EQ(s.faults, 0u);
+        CHECK(s.tiles != 0 && s.binnedDraws == 3);
+        CHECK_EQ(s.drawsSkipped, s.tiles);             // the empty one, by every tile
+        CHECK_EQ(s.draws, 2 * s.tiles);                // the two whole ones, a tile (the binning pass's three are binnedDraws)
+    }
 }
 
 // --- the words, against the literals worked out by hand (a6xx-draw.md; tests/a6xx_test.cpp) ---------------------------------
