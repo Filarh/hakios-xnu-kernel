@@ -6517,6 +6517,16 @@ TEST(a_memoryless_attachment_is_neither_loaded_nor_stored_by_the_tiles) {
         CHECK_EQ(times.size(), size_t(1));
         if (times.size() == 1) CHECK(times[0].wrote == 3 && times[0].loaded == 1 && times[0].stored == (memoryless ? 1 : 3));
     }
+    // (read through a swizzle it is the same texture: memoryless still)
+    {
+        Rig r;
+        auto u = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        u->setMemoryless(true);
+        const uint8_t bgra[4] = {4, 3, 2, 5};
+        std::string why;
+        auto v = Texture::swizzled(u, bgra, &why);
+        CHECK(v != nullptr && v->memoryless());
+    }
     // one pass of the caller's in two here: the second draw's options are another's, and it cannot join
     {
         Rig r;
