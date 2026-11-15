@@ -640,6 +640,21 @@ void decodePvrtc(const uint8_t* data, uint32_t w, uint32_t h, uint32_t bpp, uint
     }
 }
 
+namespace {
+// The processor's access to a texture's rows through the driver's mapping, told to the kernel where the memory is one
+// the processor caches -- an IOSurface's (Bo::cpuBegin, cpuEnd): before, the GPU done with it and no line of it left in
+// a cache (GEM_CPU_PREP); after, the next submission that names it cleans what was written (GEM_CPU_FINI). Without it,
+// on a kernel that cleans such memory only around the accesses it is told of, what was written here could stay in a
+// cache while the GPU read memory, and what was read here could be lines older than what the GPU drew.
+struct CpuAccess {
+    const Bo& bo;
+    CpuAccess(const Bo& b, bool write) : bo(b) { bo.cpuBegin(write); }
+    ~CpuAccess() { bo.cpuEnd(); }
+    CpuAccess(const CpuAccess&) = delete;
+    CpuAccess& operator=(const CpuAccess&) = delete;
+};
+}  // namespace
+
 bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const void* bytes, uint64_t bytesPerRow, std::string* why) {
     if (staging_ != nullptr) {
         const bool ok = staging_->replace(level, x, y, w, h, bytes, bytesPerRow, why);
@@ -657,6 +672,7 @@ bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32
         }
         std::vector<uint8_t> rgba(uint64_t(w) * h * 4);
         decodePvrtc(static_cast<const uint8_t*>(bytes), w, h, info_->pvrtcBpp, rgba.data());
+        const CpuAccess access(buffer_->bo(), true);
         auto* dst = static_cast<uint8_t*>(contents()) + L.offset;
         for (uint32_t r = 0; r < h; r++) memcpy(dst + uint64_t(r) * L.pitch, rgba.data() + uint64_t(r) * w * 4, uint64_t(w) * 4);
         (void)bytesPerRow;
@@ -680,6 +696,7 @@ bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32
     const TextureLevel L = this->level(level);
     // (in blocks for a block format: a row is a row of blocks, the caller's bytesPerRow too, as Metal has it)
     uint64_t row = uint64_t(blocksAcross(*info_, w)) * info_->bytesPerPixel;
+    const CpuAccess access(buffer_->bo(), true);
     auto* dst = static_cast<uint8_t*>(contents()) + L.offset + uint64_t(y / info_->blockH) * L.pitch + uint64_t(x / info_->blockW) * info_->bytesPerPixel;
     auto* src = static_cast<const uint8_t*>(bytes);
     // one row at a time, in order: the mapping is write-combined, and a row is the longest run that is contiguous in both
@@ -709,6 +726,7 @@ bool Texture::read(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t 
     }
     const TextureLevel L = this->level(level);
     uint64_t row = uint64_t(blocksAcross(*info_, w)) * info_->bytesPerPixel;
+    const CpuAccess access(buffer_->bo(), false);
     auto* src = static_cast<const uint8_t*>(contents()) + L.offset + uint64_t(y / info_->blockH) * L.pitch + uint64_t(x / info_->blockW) * info_->bytesPerPixel;
     auto* dst = static_cast<uint8_t*>(bytes);
     for (uint32_t r = 0; r < blocksDown(*info_, h); r++) {
@@ -753,6 +771,7 @@ bool Texture::replaceSlices(uint32_t level, uint32_t x, uint32_t y, uint32_t z, 
     if (!slicesFit(*this, x, y, z, w, h, d, bytesPerRow, bytesPerImage, why) || !regionFits(*this, level, x, y, w, h, bytesPerRow, why)) return false;
     const TextureLevel L = this->level(level);
     const uint64_t row = uint64_t(w) * info_->bytesPerPixel;
+    const CpuAccess access(buffer_->bo(), true);
     for (uint32_t s = 0; s < d; s++) {
         auto* dst = static_cast<uint8_t*>(contents()) + L.offset + (uint64_t(z) + s) * sliceBytes() + uint64_t(y) * L.pitch + uint64_t(x) * info_->bytesPerPixel;
         auto* src = static_cast<const uint8_t*>(bytes) + uint64_t(s) * bytesPerImage;
@@ -766,6 +785,7 @@ bool Texture::readSlices(uint32_t level, uint32_t x, uint32_t y, uint32_t z, uin
     if (!slicesFit(*this, x, y, z, w, h, d, bytesPerRow, bytesPerImage, why) || !regionFits(*this, level, x, y, w, h, bytesPerRow, why)) return false;
     const TextureLevel L = this->level(level);
     const uint64_t row = uint64_t(w) * info_->bytesPerPixel;
+    const CpuAccess access(buffer_->bo(), false);
     for (uint32_t s = 0; s < d; s++) {
         const auto* src = static_cast<const uint8_t*>(contents()) + L.offset + (uint64_t(z) + s) * sliceBytes() + uint64_t(y) * L.pitch +
                           uint64_t(x) * info_->bytesPerPixel;

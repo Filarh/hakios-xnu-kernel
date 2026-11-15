@@ -138,7 +138,19 @@ public:
     uint32_t handle() const { return handle_; }
     uint64_t size() const { return size_; }
     uint64_t gpuAddress() const { return iova_; }
-    void* cpu() const { return cpu_; }      // write-combined: write it in order, read it rarely
+    void* cpu() const { return cpu_; }      // write-combined: write it in order, read it rarely (an IOSurface's: cached)
+    // An IOSurface's memory (surfaceBo), which this process maps cacheable, as every process does: the processor's
+    // caches hold its lines, and the GPU reads and writes the memory behind them. The msm interface's contract for such
+    // memory, as freedreno keeps it (fd_bo_cpu_prep / fd_bo_cpu_fini): cpuBegin before the processor reads or writes it
+    // through cpu() -- GEM_CPU_PREP: the GPU done with it (and, on a kernel that keeps such memory cached between
+    // submissions, every line cleaned and invalidated, so that what is read is what the GPU wrote) -- and cpuEnd after
+    // -- GEM_CPU_FINI: the kernel told the processor is done (one that keeps an account of what was written cleans it
+    // at the next submission naming the buffer). HakiosGPU waits for the GPU at the first and takes the second as
+    // read; it cleans a mapped surface at every submission anyway. Nothing for write-combined memory (newBo), which no
+    // cache holds, nor for the program's own (userBo), which the kernel cleans at every submission that names it.
+    bool surface() const { return surface_; }
+    void cpuBegin(bool write) const;
+    void cpuEnd() const;
 
 private:
     friend class Gpu;
@@ -152,6 +164,7 @@ private:
     bool owned_ = true;   // false: another Bo owns the handle (Gpu::disown)
     bool counted_ = false;   // in Gpu::allocatedBytes: memory this driver asked for (not an IOSurface's)
     bool mapped_ = true;     // cpu_ is the transport's mapping, undone with the Bo (false: the program's own memory, userBo)
+    bool surface_ = false;   // surfaceBo's: an IOSurface's memory, cached in this process (cpuBegin, cpuEnd)
 };
 
 struct BoUse {

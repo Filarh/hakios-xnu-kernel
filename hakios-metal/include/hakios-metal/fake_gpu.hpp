@@ -141,6 +141,7 @@ public:
     struct Stats {
         uint32_t submits = 0;
         uint32_t packets = 0;
+        uint32_t cpuPreps = 0, cpuFinis = 0;   // GEM_CPU_PREP and GEM_CPU_FINI: the processor's accesses the driver told of
         uint32_t faults = 0;        // submissions that stopped on a bad packet (each one a hang on the phone)
         uint32_t recoveries = 0;    // ... of which the GPU was reset after (what FAULTS answers)
         std::string lastFault;

@@ -2957,7 +2957,12 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         return 0;
     }
     case kGemCpuPrep:
+        if (size != sizeof(MsmGemCpuPrep) || buffers_.count(static_cast<MsmGemCpuPrep*>(data)->handle) == 0) return EINVAL;
+        stats_.cpuPreps++;
+        return 0;
     case kGemCpuFini:
+        if (size != sizeof(MsmGemCpuFini) || buffers_.count(static_cast<MsmGemCpuFini*>(data)->handle) == 0) return EINVAL;
+        stats_.cpuFinis++;
         return 0;
     default:
         return ENOSYS;
