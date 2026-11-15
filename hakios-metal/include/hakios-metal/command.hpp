@@ -348,9 +348,12 @@ private:
         uint64_t gpuAddress() const { return buffer->gpuAddress() + offset; }
         uint8_t* contents() const { return static_cast<uint8_t*>(buffer->contents()) + offset; }
     };
-    bool piece(uint64_t bytes, Piece* out, std::string* why);
+    // AS_IS: the piece may hold what another command buffer wrote there (a slab the queue had back): for a caller that
+    // writes every byte the GPU is then told to read. Otherwise the piece is zeros, as memory new from the kernel is.
+    bool piece(uint64_t bytes, Piece* out, std::string* why, bool asIs = false);
     std::shared_ptr<Buffer> slab_;
     uint64_t slabUsed_ = 0;
+    bool slabUsedBefore_ = false;   // the slab came back from another command buffer: its pieces are zeroed as they are cut
     std::vector<std::shared_ptr<Buffer>> slabs_;   // every slab this buffer took, given back to the queue when it is done
     // A program's words where they are already in this command buffer, so that every draw with the program does not
     // upload them again. Found by the caller's pointer, but taken only when the words still look the same: the pointer
@@ -423,7 +426,13 @@ public:
     // A slab for draw tables (CommandBuffer::piece): one a completed command buffer gave back, zeroed as a new one comes,
     // or a new one. The kernel's making of a 256 KB buffer, once every 32 draws, was most of a draw's CPU time on the
     // phone (40 us a draw on a fast core, where the same encoding on the host takes 5).
-    std::shared_ptr<Buffer> takeSlab(uint64_t bytes, std::string* why);
+    // (*USED_BEFORE: it is one a command buffer gave back, holding what that one wrote -- not zeroed here, a quarter
+    // of a megabyte for every 32 draws: CommandBuffer::piece zeroes the pieces that need it)
+    std::shared_ptr<Buffer> takeSlab(uint64_t bytes, std::string* why, bool* usedBefore);
+    // (for the tests) a slab that comes back is filled with 0xa5 before it is used again: what a draw leaves unwritten
+    // in its table is then nothing a GPU could take for a descriptor -- and not the same frame's tables from the time
+    // before, which would hide a draw that wrote none
+    static void poisonReused(bool on);
     void giveSlabs(std::vector<std::shared_ptr<Buffer>>* slabs);
     // ...and any other buffer a command buffer makes for itself (a large piece, its counter stamps): BYTES rounded up to
     // a power of two from 4 KB, zeroed; given back the same way, 32 MB of them kept at most

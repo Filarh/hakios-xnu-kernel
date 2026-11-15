@@ -4036,10 +4036,16 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             fast = ps->fast;
         }
     }
+    // (The table is the draw's to write: what the GPU is told to read of it -- the descriptors a load names, as many as
+    // it names, the copies of constants the stream itself makes there -- the draw writes, and its words up to the border
+    // colours, which the stream addresses one by one (a fetch's flush, an occlusion query's snapshots), are zeroed here.
+    // The rest of its 8 KiB is left as the slab had it: zeroing every reused slab whole was a quarter of a megabyte
+    // for every 32 draws.)
     Piece table;
-    if (!piece(render::kTableBytes, &table, &why)) {
+    if (!piece(render::kTableBytes, &table, &why, true)) {
         return fail(std::string("no memory for the draw's table: ") + why);
     }
+    memset(table.contents(), 0, render::kTableBorderColorAt);
     // (the rare kinds of draw go the long way whatever is kept: one whose numbers the GPU reads, one that counts samples)
     if (d.indirect != nullptr || d.visibilityMode != 0) fast = false;
     // GMEM is decided as a pass opens, before its first draw is encoded (a draw in a tile is encoded for the tile:
@@ -4182,9 +4188,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
     }
     if (dual) {
-        if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why)) {
-            gmemClears_ = 0;
-            return fail(std::string("no memory for the draw's table: ") + why);
+        if (program.fs.fbRead) {
+            if (!piece(render::kTableBytes, &sysTable, &why, true)) {
+                gmemClears_ = 0;
+                return fail(std::string("no memory for the draw's table: ") + why);
+            }
+            memset(sysTable.contents(), 0, render::kTableBorderColorAt);
         }
         if (fast && program.fs.fbRead) {
             uint32_t ibos = 0;

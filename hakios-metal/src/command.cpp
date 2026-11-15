@@ -77,7 +77,7 @@ constexpr uint64_t kPieceAlign = 256;
 constexpr uint64_t kPageAlign = 4096;
 }  // namespace
 
-bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why) {
+bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why, bool asIs) {
     bytes = (std::max<uint64_t>(bytes, 1) + kPieceAlign - 1) & ~(kPieceAlign - 1);
     const uint64_t align = bytes >= kPageAlign ? kPageAlign : kPieceAlign;
     if (slab_ != nullptr) {
@@ -90,13 +90,14 @@ bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why) {
         if (out->buffer != nullptr) slabs_.push_back(out->buffer);
     } else {
         if (slab_ == nullptr || kSlabBytes - slabUsed_ < bytes) {
-            slab_ = queue_.takeSlab(kSlabBytes, why);
+            slab_ = queue_.takeSlab(kSlabBytes, why, &slabUsedBefore_);
             slabUsed_ = 0;
             if (slab_ != nullptr) slabs_.push_back(slab_);
         }
         out->buffer = slab_;
         out->offset = slabUsed_;
         if (slab_ != nullptr) {
+            if (slabUsedBefore_ && !asIs) memset(static_cast<uint8_t*>(slab_->contents()) + slabUsed_, 0, bytes);
             slabUsed_ += bytes;
         }
     }
@@ -140,7 +141,18 @@ uint64_t sizeClass(uint64_t bytes) {
 }
 }  // namespace
 
+namespace {
+std::atomic<bool> gPoisonReused{false};
+}  // namespace
+
 std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* why) {
+    bool usedBefore = false;
+    std::shared_ptr<Buffer> b = takeSlab(bytes, why, &usedBefore);
+    if (b != nullptr && usedBefore) memset(b->contents(), 0, b->length());   // (as a new one comes from the kernel)
+    return b;
+}
+
+std::shared_ptr<Buffer> CommandQueue::takeSlab(uint64_t bytes, std::string* why, bool* usedBefore) {
     const uint64_t size = sizeClass(bytes);
     std::shared_ptr<Buffer> b;
     {
@@ -152,11 +164,14 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
             freeBytes_ -= size;
         }
     }
+    *usedBefore = b != nullptr;
     if (b == nullptr) return newBuffer(gpu_, size, why);
     gBuffersReused++;
-    memset(b->contents(), 0, size);   // (as a new one comes from the kernel)
+    if (gPoisonReused.load(std::memory_order_relaxed)) memset(b->contents(), 0xa5, b->length());
     return b;
 }
+
+void CommandQueue::poisonReused(bool on) { gPoisonReused = on; }
 
 void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     // (only one no one else holds, of a size takeBuffer makes: a piece's buffer kept elsewhere is still someone's)
@@ -166,8 +181,6 @@ void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     freeBytes_ += b->length();
     freeBuffers_[b->length()].push_back(std::move(b));
 }
-
-std::shared_ptr<Buffer> CommandQueue::takeSlab(uint64_t bytes, std::string* why) { return takeBuffer(bytes, why); }
 
 void CommandQueue::giveSlabs(std::vector<std::shared_ptr<Buffer>>* slabs) {
     for (auto& b : *slabs) giveBuffer(std::move(b));
