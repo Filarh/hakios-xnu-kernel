@@ -1268,6 +1268,16 @@ hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const St
 
 extern "C" {
 
+void hakios_metal_compile_times(unsigned* stages, unsigned* cached, unsigned* compiled, double* waitedUs, double* loadedUs, double* compiledUs) {
+    const CompileTimes t = takeCompileTimes();
+    if (stages != nullptr) *stages = t.stages;
+    if (cached != nullptr) *cached = t.cached;
+    if (compiled != nullptr) *compiled = t.compiled;
+    if (waitedUs != nullptr) *waitedUs = t.waitedUs;
+    if (loadedUs != nullptr) *loadedUs = t.loadedUs;
+    if (compiledUs != nullptr) *compiledUs = t.compiledUs;
+}
+
 unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
     if (p == nullptr || stage > 1) return 0;
     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;

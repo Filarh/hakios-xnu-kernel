@@ -101,6 +101,7 @@
 #include <mach/mach_time.h>
 #include <os/lock.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1453,7 +1454,43 @@ static struct {
 } hm_ft = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, NULL };
 
 /* a command buffer being recorded: its lines so far, and what its cb line will say */
+/* metal_trace=frame: what the driver's own work cost between a command buffer's making and its commit, by kind -- the
+ * textures made (of their own memory, and over an IOSurface), the buffers made, the uploads (-replaceRegion:), the
+ * render pipelines made, and the copies by this processor of a surface the GPU cannot read where it lies (rows off 64
+ * bytes, two-plane YCbCr). Counted for the whole process while the mode is on (one clock read at each end of a call);
+ * a recorded command buffer says what was added while it was being encoded, on its commit line. */
+enum { HM_FT_W_TEXTURE, HM_FT_W_SURFACE, HM_FT_W_BUFFER, HM_FT_W_UPLOAD, HM_FT_W_PIPELINE, HM_FT_W_COPY, HM_FT_W_KINDS };
+static struct {
+	_Atomic uint64_t n, ns, bytes;
+} hm_ft_work[HM_FT_W_KINDS];
+static BOOL hm_ft_mode(void);
+
+static double
+hm_ft_work_began(void)
+{
+	return hm_ft_mode() ? hm_now() : 0;
+}
+
+static void
+hm_ft_worked(int kind, double began, uint64_t bytes)
+{
+	if (began != 0) {
+		const double seconds = hm_now() - began;
+
+		atomic_fetch_add(&hm_ft_work[kind].n, 1);
+		atomic_fetch_add(&hm_ft_work[kind].ns, (uint64_t)(seconds > 0 ? seconds * 1e9 : 0));
+		atomic_fetch_add(&hm_ft_work[kind].bytes, bytes);
+	}
+}
+
+/* (what the last pipeline made on this thread cost its compiler: hakios_metal_compile_times, for its pipe line) */
+static __thread struct {
+	unsigned stages, cached, compiled;
+	double waitedUs, loadedUs, compiledUs;
+} hm_ft_cc;
+
 struct hm_ft_rec {
+	uint64_t work0[HM_FT_W_KINDS][3];  /* hm_ft_work as it stood when the buffer was made */
 	pthread_mutex_t lock;              /* a parallel encoder's sub-encoders record from several threads */
 	char *buf;
 	size_t len, cap;
@@ -1946,6 +1983,11 @@ hm_ft_take(double created)
 		return NULL;
 	}
 	pthread_mutex_init(&ft->lock, NULL);
+	for (int k = 0; k < HM_FT_W_KINDS; k++) {
+		ft->work0[k][0] = atomic_load(&hm_ft_work[k].n);
+		ft->work0[k][1] = atomic_load(&hm_ft_work[k].ns);
+		ft->work0[k][2] = atomic_load(&hm_ft_work[k].bytes);
+	}
 	ft->capture = c;
 	ft->created = created;
 	ft->cap = 64 * 1024;
@@ -2172,7 +2214,8 @@ hm_ft_pipe_new(MTLRenderPipelineDescriptor *d, id vs, id fs, hakios_metal_progra
 	else strlcpy(fsWhere, fsFrom, sizeof(fsWhere));
 	hm_ft_cat(lines, size, &at, "pipe id=%llu label=%s vs=%s fs=%s vs_label=%s fs_label=%s vs_from=%s fs_from=%s vs_fc=%s fs_fc=%s vs_key=%08x "
 		  "fs_key=%08x prog=%s vs_words=%u fs_words=%u spec_slot=%d spec_len=%u fbfetch=%s discard=%s samples=%lu depth=%s stencil=%s vd=%s "
-		  "created=%.6f compile_ms=%.3f\n", (unsigned long long)id, hm_ft_qs(q[0], sizeof(q[0]), [d label]),
+		  "created=%.6f compile_ms=%.3f stages=%u cached=%u compiled=%u wait_ms=%.3f load_ms=%.3f cc_ms=%.3f\n", (unsigned long long)id,
+		  hm_ft_qs(q[0], sizeof(q[0]), [d label]),
 		  hm_ft_qs(q[1], sizeof(q[1]), [vs name]), hm_ft_qs(q[2], sizeof(q[2]), fs != nil ? [fs name] : nil),
 		  hm_ft_qs(q[3], sizeof(q[3]), [vs respondsToSelector:@selector(label)] ? [vs label] : nil),
 		  hm_ft_qs(q[4], sizeof(q[4]), [fs respondsToSelector:@selector(label)] ? [fs label] : nil), hm_ft_q(q[5], sizeof(q[5]), vsWhere),
@@ -2180,7 +2223,8 @@ hm_ft_pipe_new(MTLRenderPipelineDescriptor *d, id vs, id fs, hakios_metal_progra
 		  hm_ft_q(q[9], sizeof(q[9]), hakios_metal_program_name(program)), hakios_metal_program_stage_words(program, 0),
 		  hakios_metal_program_stage_words(program, 1), specBinding, specLength, fb, discard, (unsigned long)[d rasterSampleCount],
 		  hm_ft_format((unsigned)[d depthAttachmentPixelFormat], tmp, sizeof(tmp)),
-		  hm_ft_format((unsigned)[d stencilAttachmentPixelFormat], tmp2, sizeof(tmp2)), vd, began, (ended - began) * 1e3);
+		  hm_ft_format((unsigned)[d stencilAttachmentPixelFormat], tmp2, sizeof(tmp2)), vd, began, (ended - began) * 1e3, hm_ft_cc.stages,
+		  hm_ft_cc.cached, hm_ft_cc.compiled, hm_ft_cc.waitedUs / 1e3, hm_ft_cc.loadedUs / 1e3, hm_ft_cc.compiledUs / 1e3);
 	for (NSUInteger i = 0; i < 8; i++) {
 		MTLRenderPipelineColorAttachmentDescriptor *c = [[d colorAttachments] objectAtIndexedSubscript:i];
 		char mask[8];
@@ -3466,11 +3510,16 @@ hm_print_callers(const char *what)
  * read for what cannot be given, so that a request for private storage is not silently given something else */
 - (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
+	const double began = hm_ft_work_began();
+	id buffer;
+
 	if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModePrivate) {
 		HM_ONCE("a buffer was asked for with private storage; every buffer here is shared memory, and that is what "
 			"is given (the GPU reads the same pages the processor maps)\n");
 	}
-	return [[HakiosMetalBuffer alloc] initWithHakiosDevice:self length:length];
+	buffer = [[HakiosMetalBuffer alloc] initWithHakiosDevice:self length:length];
+	hm_ft_worked(HM_FT_W_BUFFER, began, buffer != nil ? (uint64_t)length : 0);
+	return buffer;
 }
 
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options
@@ -4048,6 +4097,9 @@ hm_describe_function(id f)
 	hakios_metal_program *program;
 	unsigned format;
 	const double ftBegan = hm_ft_mode() ? hm_now() : 0;   /* metal_trace=frame: how long the pipeline took to make */
+	const double madeBegan = hm_now();                    /* ...and for the console's line, always */
+	unsigned ccStages = 0, ccCached = 0, ccCompiled = 0;
+	double ccWaited = 0, ccLoaded = 0, ccCompiling = 0;
 	char vsFrom[300] = "own", fsFrom[300] = "none";       /* ...and where each stage's code came from */
 
 	hm_describe_function([descriptor fragmentFunction]);
@@ -4201,9 +4253,17 @@ hm_describe_function(id f)
 				}
 			}
 		}
-		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s\n",
+		/* what it took, and why: the stages read from the cache and those compiled, the wait for the compiler while another
+		 * thread had it, the compiling itself (hakios_metal_compile_times: this thread's since it last asked) */
+		hakios_metal_compile_times(&ccStages, &ccCached, &ccCompiled, &ccWaited, &ccLoaded, &ccCompiling);
+		hm_ft_cc.stages = ccStages, hm_ft_cc.cached = ccCached, hm_ft_cc.compiled = ccCompiled;
+		hm_ft_cc.waitedUs = ccWaited, hm_ft_cc.loadedUs = ccLoaded, hm_ft_cc.compiledUs = ccCompiling;
+		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s; "
+			 "made in %.1f ms (%u of %u stages from the cache in %.1f ms, %u compiled in %.1f ms after %.1f ms waiting for the compiler)\n",
 			 hakios_metal_program_name(program), (void *)program, format, hakios_metal_program_resource_count(program, 0),
-			 hakios_metal_program_resource_count(program, 1), [set UTF8String]);
+			 hakios_metal_program_resource_count(program, 1), [set UTF8String], (hm_now() - madeBegan) * 1e3, ccCached, ccStages,
+			 ccLoaded / 1e3, ccCompiled, ccCompiling / 1e3, ccWaited / 1e3);
+		hm_ft_worked(HM_FT_W_PIPELINE, ftBegan, 0);
 	}
 	{
 		HakiosMetalRenderPipelineState *state = [[HakiosMetalRenderPipelineState alloc] initWithHakiosDevice:self program:program descriptor:descriptor];
@@ -4759,12 +4819,20 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
  * swizzle (-hakiosSwizzledBy:). */
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
-	return [[self hakiosNewTextureWithDescriptor:descriptor] hakiosSwizzledBy:[descriptor swizzle]];
+	const double began = hm_ft_work_began();
+	id texture = [[self hakiosNewTextureWithDescriptor:descriptor] hakiosSwizzledBy:[descriptor swizzle]];
+
+	hm_ft_worked(HM_FT_W_TEXTURE, began, texture != nil ? hakios_metal_texture_allocated_bytes([(HakiosMetalTexture *)texture hakiosTexture]) : 0);
+	return texture;
 }
 
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
-	return [[self hakiosNewTextureWithDescriptor:descriptor iosurface:surface plane:plane] hakiosSwizzledBy:[descriptor swizzle]];
+	const double began = hm_ft_work_began();
+	id texture = [[self hakiosNewTextureWithDescriptor:descriptor iosurface:surface plane:plane] hakiosSwizzledBy:[descriptor swizzle]];
+
+	hm_ft_worked(HM_FT_W_SURFACE, began, 0);
+	return texture;
 }
 
 /* The other resource kinds, each refused by name: the base class answers these with nil-stubs that say nothing. */
@@ -5629,7 +5697,10 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
  * 6-argument forms. The same shape here, so that one implementation holds every rule. */
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bytesPerRow
 {
+	const double began = hm_ft_work_began();
+
 	[self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bytesPerRow bytesPerImage:0];
+	hm_ft_worked(HM_FT_W_UPLOAD, began, (uint64_t)bytesPerRow * region.size.height);
 }
 
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
@@ -7158,6 +7229,11 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 static void
 hm_fps_shadow(BOOL in, double seconds)
 {
+	if (hm_ft_mode()) {
+		/* (metal_trace=frame's count of the same copies) */
+		atomic_fetch_add(&hm_ft_work[HM_FT_W_COPY].n, 1);
+		atomic_fetch_add(&hm_ft_work[HM_FT_W_COPY].ns, (uint64_t)(seconds > 0 ? seconds * 1e9 : 0));
+	}
 	if (!hm_fps_on()) {
 		return;
 	}
@@ -7441,7 +7517,19 @@ hm_completed(hakios_metal_cb *cb, void *context)
 		char label[300];
 
 		ft->committed = _committedAt;
-		hm_ft_line(ft, "commit t=%.6f label=%s\n", _committedAt, hm_ft_qs(label, sizeof(label), [self label]));
+		{
+			/* each kind as count/milliseconds/megabytes since the buffer was made */
+			char work[HM_FT_W_KINDS][48];
+
+			for (int k = 0; k < HM_FT_W_KINDS; k++) {
+				snprintf(work[k], sizeof(work[k]), "%llu/%.2f/%.2f", (unsigned long long)(atomic_load(&hm_ft_work[k].n) - ft->work0[k][0]),
+					 (double)(atomic_load(&hm_ft_work[k].ns) - ft->work0[k][1]) / 1e6,
+					 (double)(atomic_load(&hm_ft_work[k].bytes) - ft->work0[k][2]) / 1e6);
+			}
+			hm_ft_line(ft, "commit t=%.6f label=%s textures=%s surfaces=%s buffers=%s uploads=%s pipelines=%s copies=%s\n", _committedAt,
+				   hm_ft_qs(label, sizeof(label), [self label]), work[HM_FT_W_TEXTURE], work[HM_FT_W_SURFACE], work[HM_FT_W_BUFFER],
+				   work[HM_FT_W_UPLOAD], work[HM_FT_W_PIPELINE], work[HM_FT_W_COPY]);
+		}
 	}
 	/* each turned framebuffer drawn into, laid into its surface by the 2D engine after everything that drew it */
 	for (HakiosMetalTexture *t in _turned) {
