@@ -218,6 +218,9 @@ public:
     // allocated it). nullptr with *error: EINVAL not on a page, ENOSYS a kernel without the request, EFAULT memory the
     // program does not have, ENOMEM.
     std::unique_ptr<Bo> userBo(void* address, uint64_t size, int* error);
+    // the same, for a Bo a live object still holds (a surface handle taken over from a Buffer being destroyed): its
+    // mapping undone and ownership dropped in place, so its ~Bo closes nothing
+    void disown(Bo& bo);
 
     // a submission queue of its own (the driver keeps an order per queue); 0 is the default one
     int newQueue(uint32_t priority, uint32_t* id);

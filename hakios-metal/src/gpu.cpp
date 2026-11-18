@@ -165,17 +165,20 @@ std::unique_ptr<Bo> Gpu::userBo(void* address, uint64_t size, int* error) {
     return bo;
 }
 
+void Gpu::disown(Bo& bo) {
+    if (bo.cpu_ != nullptr && bo.mapped_) {
+        t_->unmap(bo.handle_, bo.cpu_);
+        bo.cpu_ = nullptr;
+    }
+    bo.owned_ = false;
+    if (bo.counted_) {
+        allocated_ -= bo.size_;
+        bo.counted_ = false;
+    }
+}
+
 void Gpu::disown(std::unique_ptr<Bo> bo) {
-    if (bo == nullptr) return;
-    if (bo->cpu_ != nullptr && bo->mapped_) {
-        t_->unmap(bo->handle_, bo->cpu_);
-        bo->cpu_ = nullptr;
-    }
-    bo->owned_ = false;
-    if (bo->counted_) {
-        allocated_ -= bo->size_;
-        bo->counted_ = false;
-    }
+    if (bo != nullptr) disown(*bo);
 }
 
 Bo::~Bo() { gpu_.release(*this); }

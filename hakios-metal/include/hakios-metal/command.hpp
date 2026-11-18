@@ -63,6 +63,7 @@ public:
     const Bo& bo() const { return *bo_; }
     // the program's memory (newBufferNoCopy), cached by the processor; every other buffer is the driver's, write-combined
     bool programMemory() const { return programMemory_; }
+    Bo& bo() { return *bo_; }
 
 private:
     std::unique_ptr<Bo> bo_;
