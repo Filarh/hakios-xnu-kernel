@@ -211,6 +211,11 @@ void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     freeBuffers_[b->length()].push_back(std::move(b));
 }
 
+size_t CommandQueue::quarantinedCount() {
+    std::lock_guard<std::mutex> g(lock_);
+    return quarantined_.size();
+}
+
 void CommandQueue::giveSlabs(std::vector<std::shared_ptr<Buffer>>* slabs) {
     for (auto& b : *slabs) giveBuffer(std::move(b));
     slabs->clear();
@@ -593,7 +598,7 @@ CommandBuffer::~CommandBuffer() {
     }
 }
 
-void CommandBuffer::finish(Status s) {
+void CommandBuffer::finish(Status s, bool recycle) {
     status_ = s;
     if (s == kCompleted && counts_.binnedPasses != 0) queue_.checkVsc();
     if (s == kCompleted && tuning_) {
@@ -605,20 +610,25 @@ void CommandBuffer::finish(Status s) {
         h(*this);
     }
     handlers_.clear();
-    kept_.clear();
-    slab_.reset();
-    queue_.giveSlabs(&slabs_);   // (done with: the GPU has finished with this buffer, or never had it)
-    keptAny_.clear();
-    // (and what its stream and lists grew to, and the programs it had at hand, to the queue's next command buffer)
-    streamWords_ = stream_.size();
-    stream_.clear();
-    uses_.clear();
-    queue_.giveSpare(CommandQueue::Spare{std::move(stream_), std::move(uses_), std::move(kept_), std::move(keptAny_), std::move(drawCache_)});
-    stream_ = pm4::Stream{};
-    uses_.clear();
-    kept_.clear();
-    keptAny_.clear();
-    drawCache_.reset();
+    if (recycle) {
+        kept_.clear();
+        slab_.reset();
+        queue_.giveSlabs(&slabs_);   // (done with: the GPU has finished with this buffer, or never had it)
+        keptAny_.clear();
+        // (and what its stream and lists grew to, and the programs it had at hand, to the queue's next command buffer)
+        streamWords_ = stream_.size();
+        stream_.clear();
+        uses_.clear();
+        queue_.giveSpare(CommandQueue::Spare{std::move(stream_), std::move(uses_), std::move(kept_), std::move(keptAny_), std::move(drawCache_)});
+        stream_ = pm4::Stream{};
+        uses_.clear();
+        kept_.clear();
+        keptAny_.clear();
+        drawCache_.reset();
+    }
+    // (when !recycle -- a wait that timed out with no reset -- kept_, slab_, slabs_, keptAny_ and the stream stay
+    // referenced so none of their memory is freed or pooled while the GPU may still be reading it; the queue
+    // quarantines the whole buffer)
     {
         std::lock_guard<std::mutex> g(lock_);
         finished_ = true;
@@ -919,10 +929,15 @@ void CommandQueue::waiter() {
         } else if (e != 0) {
             cb->error_ = std::string("waiting for it failed: ") + strerror(e);
         }
-        cb->finish(e == 0 ? CommandBuffer::kCompleted : CommandBuffer::kError);
+        // a timeout with no reset means the GPU is still able to be running this submission: its command BO, slabs and
+        // stamp buffers must not be reused or freed under it
+        const bool poisoned = (e == ETIMEDOUT && !givenUp);
+        cb->finish(e == 0 ? CommandBuffer::kCompleted : CommandBuffer::kError, !poisoned);
         g.lock();
         inFlight_.pop_front();
-        if (cb->commands_ != nullptr) {
+        if (poisoned) {
+            quarantined_.push_back(cb);   // held for the queue's life; its commands_ and buffers are never touched again
+        } else if (cb->commands_ != nullptr) {
             idle_.push_back(std::move(cb->commands_));
         }
     }
