@@ -1688,7 +1688,8 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
     const bool indirect = draw.indirect != nullptr;
     if (indirect) {
         const uint64_t words = draw.indexBuffer != nullptr ? 5 : 4;
-        if (draw.indirectOffset % 4 != 0 || draw.indirectOffset + 4 * words > draw.indirect->length()) {
+        if (draw.indirectOffset % 4 != 0 || draw.indirectOffset > draw.indirect->length() ||
+            4 * words > draw.indirect->length() - draw.indirectOffset) {
             return refuse(why, "an indirect draw's arguments at " + n(draw.indirectOffset) + " of a " + n(draw.indirect->length()) + "-byte buffer: " + n(words) +
                                    " words inside it, at a multiple of 4");
         }
@@ -1709,7 +1710,8 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
         if (draw.visibility == nullptr) {
             return refuse(why, "a visibility result mode and no visibility result buffer in the pass");
         }
-        if (draw.visibilityOffset % 8 != 0 || draw.visibilityOffset + 8 > draw.visibility->length()) {
+        if (draw.visibilityOffset % 8 != 0 || draw.visibilityOffset > draw.visibility->length() ||
+            8 > draw.visibility->length() - draw.visibilityOffset) {
             return refuse(why, "a visibility result at offset " + n(draw.visibilityOffset) + ": a multiple of 8 with its 8 bytes inside the " +
                                    n(draw.visibility->length()) + "-byte buffer");
         }
