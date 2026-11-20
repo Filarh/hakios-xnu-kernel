@@ -404,6 +404,37 @@ private:
     // stale reads what was there before -- on the phone a widget's text cut by a band, a blur in blocks (render.cpp:
     // encodeDraw's note) -- and is a fault here.
     bool gmemCachesStale_ = false, drawReadsGmem_ = false;
+    // The order between what writes memory and what reads it, by byte ranges [LO, HI) (the light passes' rules,
+    // CommandBuffer::setLightPasses; turnip's barriers, tu_flush_for_access and tu6_emit_flushes, as the witness):
+    //   B1  a draw or a 2D copy that samples memory a draw or the 2D engine wrote through the colour CCU, with no
+    //       PC_CCU_FLUSH_COLOR_TS after that write, a CACHE_INVALIDATE after the flush and a CP_WAIT_FOR_IDLE after the
+    //       flush, reads what was there before (the texture caches hold the old lines, or the CCU the new ones): a fault
+    //   B2  PC_CCU_INVALIDATE_COLOR while the CCU holds writes no flush followed ("invalidating CCU while it still has
+    //       data in it doesn't work", tu_cmd_buffer.cc:374-377), a sysmem draw of another pass than the one the CCU was
+    //       last used for (or the 2D engine) since it was last invalidated ("the CCU needs to be flushed and possibly
+    //       invalidated when accessing memory with a different attachment state", tu_cmd_buffer.h:108-124; turnip
+    //       invalidates it for every render pass's access, DST_INCOHERENT_FLUSH),
+    //       or the 2D engine on a CCU holding a draw's writes not flushed: faults
+    //   B3  a draw or the 2D engine writing memory that a draw or a 2D copy of an earlier pass (CP_SET_MARKER
+    //       RM6_DIRECT_RENDER to the next) read since the last CP_WAIT_FOR_IDLE: the write may land before the read --
+    //       a fault
+    // Within a submission: what the kernel does between two of them is not modelled. Not tracked: depth, writes by the
+    // tiles' stores and by dispatches, reads by dispatches and by the vertex fetch.
+    struct Span { uint64_t lo, hi; };
+    struct CcuWrite { Span span; bool flushed = false, invalidated = false, waited = false; };
+    std::vector<CcuWrite> ccuWrites_;
+    struct Read { Span span; uint64_t pass; };
+    uint64_t passSerial_ = 0;          // sysmem passes begun (RM6_DIRECT_RENDER), the pass a read is of
+    std::vector<Read> readsSinceWfi_;
+    std::vector<Span> drawReads_;      // the memory the draw being checked samples
+    bool ccuDirty_ = false;
+    uint64_t ccuKey_ = 0;              // 0: invalidated; kCcuTransfer: the 2D engine; else a draw's pass (2 * passSerial_ + 2)
+    static constexpr uint64_t kCcuTransfer = 1;
+    bool hazardRead(Span s, const char* what);
+    bool hazardWrite(Span s, const char* what);
+    bool ccuUse(uint64_t key, const char* what);
+    bool hazardEvent(uint32_t event);
+    void hazardWfi();
     bool logDraws_ = false, logState_ = false;
     // (the registers the binning pass's draws wrote, in the order each was first written, and how many of them had
     // been by each of its draws: what the digest of a tile's draw leaves out, above)

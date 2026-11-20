@@ -1043,6 +1043,9 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     } else {
         for (uint32_t i = 0; i < bpp / 4; i++) memcpy(pixel + 4 * i, &c[i], 4);
     }
+    if (!ccuUse(kCcuTransfer, "a 2D fill") || !hazardWrite(Span{base + y0 * pitch, base + uint64_t(y1) * pitch + uint64_t(x1 + 1) * bpp}, "a 2D fill")) {
+        return false;
+    }
     for (uint32_t y = y0; y <= y1; y++) {
         for (uint32_t x = x0; x <= x1; x++) memcpy(d + (y - y0) * pitch + uint64_t(x) * bpp, pixel, bpp);
     }
@@ -1096,6 +1099,12 @@ bool FakeGpu::execCopy(uint32_t fmt, uint32_t bpp, uint32_t ifmt, uint32_t x0, u
     const bool filter = (info & A6XX_SP_PS_2D_SRC_INFO_FILTER) != 0;
     if (ns > 1 && (srw != dw || srh != dh || filter || (average && ifmt != R2D_UNORM8))) {
         fault("a resolve that scales, filters, or averages a format other than 8-bit unorm: not modelled");
+        return false;
+    }
+    // (the order with what wrote the source and what read the destination: B1, B2, B3)
+    const Span from{sbase + uint64_t(sy0) * spitch, sbase + uint64_t(sy1 + 1) * spitch};
+    if (!hazardRead(from, "a 2D copy") || !ccuUse(kCcuTransfer, "a 2D copy") ||
+        !hazardWrite(Span{base + uint64_t(y0) * pitch, base + uint64_t(y1) * pitch + uint64_t(x1 + 1) * bpp}, "a 2D copy")) {
         return false;
     }
     // the source read whole first: a copy within one buffer reads what was there before it
@@ -1260,9 +1269,94 @@ bool FakeGpu::eventBlit() {
 // CP_DRAW_INDX_OFFSET: the draw itself. As with CP_EXEC_CS, everything the registers and the loads say about it must hold
 // together (fake_gpu.hpp's file comment lists what); what the GPU does with state that does not is hang or write
 // nothing, and a fault here stands for either. Nothing is rasterized.
+// --- B1-B3 (fake_gpu.hpp): the order between what writes memory and what reads it ---
+namespace {
+bool overlaps(uint64_t alo, uint64_t ahi, uint64_t blo, uint64_t bhi) { return alo < bhi && blo < ahi; }
+}  // namespace
+
+// B1: S sampled by WHAT, and noted as read by the pass since the last WFI (B3)
+bool FakeGpu::hazardRead(Span s, const char* what) {
+    for (const CcuWrite& w : ccuWrites_) {
+        if (!overlaps(s.lo, s.hi, w.span.lo, w.span.hi)) continue;
+        fault(std::string(what) + text(" samples memory at %#llx", s.lo) +
+              text(" that the colour CCU was given to write (%#llx)", w.span.lo) + " with " +
+              (!w.flushed ? "no PC_CCU_FLUSH_COLOR_TS after it" : !w.invalidated ? "no CACHE_INVALIDATE after its flush" : "no CP_WAIT_FOR_IDLE after its flush") +
+              ": it may read what was there before (B1)");
+        return false;
+    }
+    if (inTile_) return true;   // (a tile's draws are replayed tile by tile: what they read stays read till the tiles end)
+    for (const Read& r : readsSinceWfi_) {
+        if (r.pass == passSerial_ && r.span.lo == s.lo && r.span.hi == s.hi) return true;
+    }
+    readsSinceWfi_.push_back(Read{s, passSerial_});
+    return true;
+}
+
+// B3: S written through the colour CCU by WHAT, and noted as such (B1). (What a pass's own draws read of what it
+// writes is the rasterizer's to order: a fetch, FLUSH_PER_OVERLAP_AND_OVERWRITE.)
+bool FakeGpu::hazardWrite(Span s, const char* what) {
+    for (const Read& r : readsSinceWfi_) {
+        if (r.pass == passSerial_ || !overlaps(s.lo, s.hi, r.span.lo, r.span.hi)) continue;
+        fault(std::string(what) + text(" writes memory at %#llx that an earlier pass", s.lo) +
+              " read with no CP_WAIT_FOR_IDLE since: the write may land before the read (B3)");
+        return false;
+    }
+    for (const CcuWrite& w : ccuWrites_) {
+        if (!w.flushed && w.span.lo == s.lo && w.span.hi == s.hi) return true;
+    }
+    ccuWrites_.push_back(CcuWrite{s});
+    return true;
+}
+
+// B2: the colour CCU used by a draw with targets KEY, or by the 2D engine (kCcuTransfer)
+bool FakeGpu::ccuUse(uint64_t key, const char* what) {
+    if (key == kCcuTransfer && ccuDirty_ && ccuKey_ != kCcuTransfer) {
+        fault(std::string(what) + " through a colour CCU that holds a draw's writes no PC_CCU_FLUSH_COLOR_TS followed (B2)");
+        return false;
+    }
+    if (key != kCcuTransfer && ccuKey_ != 0 && ccuKey_ != key) {
+        fault(std::string(what) + (ccuKey_ == kCcuTransfer ? " after the 2D engine" : " of another pass than the colour CCU was last used for") +
+              ", the CCU not flushed and invalidated since (PC_CCU_FLUSH_COLOR_TS, PC_CCU_INVALIDATE_COLOR) (B2)");
+        return false;
+    }
+    ccuKey_ = key;
+    ccuDirty_ = true;
+    return true;
+}
+
+bool FakeGpu::hazardEvent(uint32_t event) {
+    using namespace a6xx;
+    auto settle = [&]() {
+        ccuWrites_.erase(std::remove_if(ccuWrites_.begin(), ccuWrites_.end(), [](const CcuWrite& w) { return w.flushed && w.invalidated && w.waited; }),
+                         ccuWrites_.end());
+    };
+    if (event == PC_CCU_FLUSH_COLOR_TS) {
+        ccuDirty_ = false;
+        for (CcuWrite& w : ccuWrites_) w.flushed = true;
+    } else if (event == CACHE_INVALIDATE) {
+        for (CcuWrite& w : ccuWrites_) w.invalidated = w.invalidated || w.flushed;
+        settle();
+    } else if (event == PC_CCU_INVALIDATE_COLOR) {
+        if (ccuDirty_) {
+            fault("PC_CCU_INVALIDATE_COLOR while the colour CCU holds writes no PC_CCU_FLUSH_COLOR_TS followed: they are lost (B2)");
+            return false;
+        }
+        ccuKey_ = 0;
+    }
+    return true;
+}
+
+void FakeGpu::hazardWfi() {
+    for (CcuWrite& w : ccuWrites_) w.waited = w.waited || w.flushed;
+    ccuWrites_.erase(std::remove_if(ccuWrites_.begin(), ccuWrites_.end(), [](const CcuWrite& w) { return w.flushed && w.invalidated && w.waited; }),
+                     ccuWrites_.end());
+    readsSinceWfi_.clear();
+}
+
 bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     using namespace a6xx;
     drawReadsGmem_ = false;
+    drawReads_.clear();
     if (count != 3 && count != 7) {
         fault(text("CP_DRAW_INDX_OFFSET of %llu words: the 3-word auto-indexed form and the 7-word indexed one are what this GPU model runs", count));
         return false;
@@ -1609,6 +1703,17 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             }
             if (!check2d(t, (L + " texture").c_str(), i, true)) {
                 return false;
+            }
+            // (what it samples of memory, for the order with what wrote it: B1, B3)
+            if (fieldOf(t[0], A6XX_TEX_CONST_0_TILE_MODE__MASK, A6XX_TEX_CONST_0_TILE_MODE__SHIFT) != TILE6_2) {
+                const uint64_t base = t[4] | uint64_t(fieldOf(t[5], A6XX_TEX_CONST_5_BASE_HI__MASK, A6XX_TEX_CONST_5_BASE_HI__SHIFT)) << 32;
+                const uint64_t pitch = fieldOf(t[2], A6XX_TEX_CONST_2_PITCH__MASK, A6XX_TEX_CONST_2_PITCH__SHIFT);
+                const uint64_t h = fieldOf(t[1], A6XX_TEX_CONST_1_HEIGHT__MASK, A6XX_TEX_CONST_1_HEIGHT__SHIFT);
+                uint64_t layers = fieldOf(t[5], A6XX_TEX_CONST_5_DEPTH__MASK, A6XX_TEX_CONST_5_DEPTH__SHIFT);
+                if (fieldOf(t[2], A6XX_TEX_CONST_2_TYPE__MASK, A6XX_TEX_CONST_2_TYPE__SHIFT) == A6XX_TEX_CUBE) layers *= 6;
+                const uint64_t layer = uint64_t(fieldOf(t[3], A6XX_TEX_CONST_3_ARRAY_PITCH__MASK, A6XX_TEX_CONST_3_ARRAY_PITCH__SHIFT)) << A6XX_TEX_CONST_3_ARRAY_PITCH__SCALE;
+                const uint64_t one = ((h + 15) & ~uint64_t(15)) * pitch;
+                drawReads_.push_back(Span{base, base + (layers > 1 ? (layers - 1) * std::max(layer, one) : 0) + one});
             }
         }
         for (uint32_t i = 0; i < xs.sampUnits; i++) {
@@ -1970,6 +2075,25 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             gmemCachesStale_ = true;
         }
     }
+    // the order with what wrote what it samples, and with what read what it writes (B1-B3; a tile's draws write GMEM
+    // and read memory: B1 alone)
+    if (!binning_) {
+        // (the CCU's attachment state: the pass's, every pass another -- turnip takes a render pass's access as
+        // "incoherent" and invalidates the colour CCU for each, tu_cmd_buffer.cc:5852-5860; never 0 nor kCcuTransfer)
+        const uint64_t key = 2 * passSerial_ + 2;
+        for (const Span& r : drawReads_) {
+            if (!hazardRead(r, "a draw")) return false;
+        }
+        if (!inTile_ && d.mrtCount != 0) {
+            const uint64_t winRows = uint64_t(fieldOf(reg(REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR), A6XX_GRAS_SC_WINDOW_SCISSOR_BR_Y__MASK, A6XX_GRAS_SC_WINDOW_SCISSOR_BR_Y__SHIFT)) + 1;
+            for (uint32_t t = 0; t < d.mrtCount; t++) {
+                const uint64_t pitch = uint64_t(fieldOf(reg(regRbMrt(REG_A6XX_RB_MRT_PITCH, t)), A6XX_RB_MRT_PITCH__MASK, A6XX_RB_MRT_PITCH__SHIFT)) << A6XX_RB_MRT_PITCH__SCALE;
+                const uint64_t base = reg64(regRbMrt(REG_A6XX_RB_MRT_BASE, t));
+                if (!hazardWrite(Span{base, base + winRows * pitch}, "a draw")) return false;
+            }
+            if (!ccuUse(key, "a draw")) return false;
+        }
+    }
     stats_.draws++;
     drawsInSubmission_++;
     drawsWithoutCcuFlush_++;
@@ -2229,6 +2353,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 break;
             case pm4::kWaitForIdle:
                 stats_.cpWaits++;
+                hazardWfi();
                 break;
             case pm4::kMemWrite: {
                 if (h.count < 2) {
@@ -2308,6 +2433,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     tileOrdinal_ = ~0u;
                     drawOrdinal_ = 0;
                     stats_.passes++;
+                    passSerial_++;
                 }
                 // the binning pass: within a pass begun, before its tiles
                 if (fieldOf(p[0], A6XX_CP_SET_MARKER_0_MODE__MASK, A6XX_CP_SET_MARKER_0_MODE__SHIFT) == RM6_BIN_VISIBILITY) {
@@ -2513,6 +2639,9 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 // ZPASS_DONE: the running sample count, 64 bits, where RB_SAMPLE_COUNT_ADDR points, when
                 // RB_SAMPLE_COUNT_CONTROL.COPY asks for it (turnip's occlusion query, A6XX path)
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == BLIT && !eventBlit()) {
+                    return false;
+                }
+                if (!hazardEvent(fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT))) {
                     return false;
                 }
                 // (the texture caches dropped once everything before has landed: what a fetch reads of its bin is the bin)
@@ -2761,6 +2890,10 @@ void FakeGpu::run(const Job& job) {
     tileOrdinal_ = ~0u;
     drawsInSubmission_ = drawsWithoutCcuFlush_ = drawsWithoutCacheFlush_ = drawsWithoutDepthFlush_ = 0;
     written_.clear();
+    ccuWrites_.clear();
+    readsSinceWfi_.clear();
+    ccuDirty_ = false;
+    ccuKey_ = 0;
     bool ok = execute(job.address, job.words, 0);
     if (ok && drawsInSubmission_ != 0) {
         // the colour a draw wrote sits in the CCU until PC_CCU_FLUSH_COLOR_TS (the kernel's own end-of-submit fence

@@ -9,7 +9,9 @@
 // `make -f tools/dev.mk check`. With --long no draw is taken from a program's kept state (CommandBuffer::keepStates):
 // the sums are the same, which check holds them to (the tests that count the draws so taken fail then, as they should).
 // With --unchecked the draws taken from kept states are not each checked against the long way (CommandBuffer::
-// verifyDraws): the driver as a device runs it, with the tests' own verdicts and the same sums.
+// verifyDraws): the driver as a device runs it, with the tests' own verdicts and the same sums. With --light every
+// command buffer has light passes (CommandBuffer::setLightPasses) from the start: the fake's order rules (B1-B3) over
+// every test's streams -- the tests that count words, waits or stamps fail then, as they should.
 int main(int argc, char** argv) {
     int ran = 0;
     bool sums = false, checked = true;
@@ -18,6 +20,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--golden") == 0) sums = true;
         else if (strcmp(argv[i], "--long") == 0) hakios::metal::CommandBuffer::keepStates(false);
         else if (strcmp(argv[i], "--unchecked") == 0) checked = false;
+        else if (strcmp(argv[i], "--light") == 0) hakios::metal::CommandBuffer::lightPassesByDefault(true);
         else only = argv[i];
     }
     golden::Sums s;
