@@ -2626,6 +2626,21 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 }
                 const uint32_t reg = p[0] & CP_REG_TO_MEM_0_REG__MASK;
                 const uint64_t to = p[1] | uint64_t(p[2]) << 32;
+                // ...or the performance counters a command buffer with setPerf reads beside it, 32 bits each: the GBIF's four
+                // (0x3cc4-0x3cc7) and the RBBM's UCHE, TP, CCU and RB counters (0x400-0x4ff). The fake counts nothing:
+                // they read as zero, the reads judged for their place and size
+                const uint32_t cnt = (p[0] & CP_REG_TO_MEM_0_CNT__MASK) >> CP_REG_TO_MEM_0_CNT__SHIFT;
+                const bool perfCtr = !(p[0] & CP_REG_TO_MEM_0_64B) && cnt >= 1 && cnt <= 4 &&
+                                     ((reg >= 0x3cc4 && reg + cnt <= 0x3cc8) || (reg >= 0x400 && reg + cnt <= 0x500));
+                if (perfCtr) {
+                    uint8_t* w = at(to, 4ull * cnt);
+                    if (w == nullptr || to % 4 != 0) {
+                        fault(text("CP_REG_TO_MEM of counter %#x to %#llx: outside every buffer or not 4-byte aligned", reg, to));
+                        return false;
+                    }
+                    memset(w, 0, 4ull * cnt);
+                    break;
+                }
                 uint8_t* d = at(to, 8);
                 if (reg != 0x0980 || !(p[0] & CP_REG_TO_MEM_0_64B) || d == nullptr || to % 8 != 0) {
                     fault(text("CP_REG_TO_MEM of register %#x to %#llx: the fake serves CP_ALWAYS_ON_COUNTER, 64-bit, into a buffer", reg, to));

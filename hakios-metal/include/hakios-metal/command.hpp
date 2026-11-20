@@ -193,7 +193,14 @@ public:
     // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
     // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted
+    // With profiling and setPerf on, the GPU's own counters of memory traffic and of its caches are read beside each
+    // stamp, and PassTime::ctr holds what each counted over the pass (end minus start, 32 bits): kPerfCounters of them,
+    // named by perfCounterName. They are selected once in the command buffer, from its stream after a wait for idle, as
+    // turnip's VK_KHR_performance_query and KGSL select them (tu_query_pool.cc; KGSL adreno_a6xx_perfcounter.c), and
+    // read by CP_REG_TO_MEM where the time stamps are read.
+    static constexpr uint32_t kPerfCounters = 13;
+    static const char* perfCounterName(uint32_t i);
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; uint32_t ctr[kPerfCounters] = {}; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted; CTR: setPerf's counters over the pass
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and the samples each pass's draws passed: the RB's running count copied out by ZPASS_DONE at the pass's start
@@ -202,6 +209,7 @@ public:
     // of the choice between tiles and sysmem (dev-notes/investigacion/13 §10.4). Off by default: three packets at each
     // end of a pass.
     void setProfileSamples(bool on) { profileSamples_ = on; }
+    void setPerf(bool on) { perf_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
     // the counter at both (so the draws no longer overlap: what each costs alone), with its program's name. Which
     // draws of a heavy frame are heavy is read off these (metal_fps=draws).
@@ -286,6 +294,9 @@ private:
     bool profileSamples_ = false;
     std::shared_ptr<Buffer> sampleStamps_;   // setProfileSamples's: the sample count at each pass's start and end
     void sampleStamp(uint32_t slot);
+    bool perf_ = false, perfSelected_ = false;
+    std::shared_ptr<Buffer> perfStamps_;   // kPerfCounters words a stamp slot
+    void perfStamp(uint32_t slot);
     // the counter into stamp slot SLOT (two a pass: start, end), when profiling and there is room
     void stamp(uint32_t slot);
     void stampStart(PassKind kind, uint32_t width, uint32_t height);
