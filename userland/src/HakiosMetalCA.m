@@ -4982,7 +4982,7 @@ hm_compress_ok(void)
  * PixelFormatView (the conditions Metal's own lossy compression asks of a texture, MTLTexture.h), 2D, one level, one
  * sample, RGBA8 or BGRA8 (or their sRGB pair; UBWC: the two unorm ones), at least 16 wide, not memoryless. A texture
  * over an IOSurface or a buffer never comes here. An experiment (dev-notes 22, 25, 25-blur/03 §2). A pass into a
- * compressed target runs in sysmem; a tiled one may have GMEM as a linear one.
+ * compressed target runs in sysmem unless metal_gmemubwc=1 (hm_gmem_ubwc); a tiled one may have GMEM as a linear one.
  */
 static int
 hm_tile_mode(void)
@@ -5007,6 +5007,30 @@ hm_tile_mode(void)
 		}
 	}
 	return mode;
+}
+
+/*
+ * metal_gmemubwc=1 (/var/tmp/metal.args or a boot-arg; off by default): a pass whose colour attachment is compressed
+ * (UBWC: the window server's framebuffers in the kernel's scanout pool, and with metal_tile=2 CoreAnimation's private
+ * render targets) may run in GMEM, its tiles loading and storing the attachment in its layout with its flag buffer
+ * (hakios_metal_cb_set_gmem_compressed). Without it such a pass runs in sysmem whatever its draws ("compressed, whose
+ * tiles' loads and stores are served behind a switch" in the trace's why=). An A/B: dev-notes 25-blur/04.
+ */
+static BOOL
+hm_gmem_ubwc(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_gmemubwc=1") != NULL;
+		if (on) {
+			hm_print("metal_gmemubwc=1: a pass into a compressed (UBWC) target may run in GMEM\n");
+		}
+	}
+	return on == 1;
 }
 
 static int
@@ -6869,6 +6893,7 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_gmem_binning(_cb, (hm_gmem_off() & 16) == 0);   /* metal_gmem_off's 16: every draw in every tile */
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
+		hakios_metal_cb_set_gmem_compressed(_cb, hm_gmem_ubwc());   /* metal_gmemubwc=1 */
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
 		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
 	}

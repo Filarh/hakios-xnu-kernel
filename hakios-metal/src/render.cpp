@@ -1769,6 +1769,12 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
         mrts[i] = a.texture != nullptr ? mrtWords(*named, a.level, a.slice)
                                        : mrtWords(*named, named == attachmentOf(pass, 0).texture ? attachmentOf(pass, 0).level : 0,
                                                   named == attachmentOf(pass, 0).texture ? attachmentOf(pass, 0).slice : 0);
+        // (a compressed attachment drawn in tiles is told WZYX, the order its tiles' event blits load and store it in --
+        // turnip's RB_MRT_BUF_INFO and RB_BLIT_DST_INFO of a UBWC view, fdl6_view_init, fd6_view.c:408-436; drawn in
+        // sysmem it keeps the format's swap, which the CCU ignores in a tiled layout, fd6_format_table.c:370-375)
+        if (gmem != nullptr && named->compressed()) {
+            mrts[i].bufInfo = rbMrtBufInfo(colorFmt(named->info()), TILE6_3, WZYX);
+        }
         if (mrts[i].srgb && colorRegid[i] != kRegidNone) srgbMask |= 1u << i;
     }
     // each attachment's bin in a pass drawn in tiles
@@ -2419,7 +2425,9 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t
             return refuse(why, which + ": GMEM takes single-sampled 4- and 8-byte float formats");
         }
         if (a.level >= t.levels()) return refuse(why, which + ": no such level");
-        if (t.compressed()) return refuse(why, which + ": compressed, which the tiles' loads and stores do not serve yet");
+        if (t.compressed() && !(flags & kGmemPlanCompressed)) {
+            return refuse(why, which + ": compressed, whose tiles' loads and stores are served behind a switch (CommandBuffer::setGmemCompressed)");
+        }
         const TextureLevel L = t.level(a.level);
         if (L.width != W || L.height != H) return refuse(why, which + ": not the window's size, " + n(W) + "x" + n(H));
         // The event blit moves whole 16 x 4 granules: past the right edge it reads and writes the row's padding, past
@@ -4557,7 +4565,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         dual = open_->dual;
         plan = open_->plan;
     } else if (options.gmem && gmem_) {
-        gmem = render::gmemPlan(pass, &plan, &gmemWhy_, gmemOff_ & kGmemOldTiles ? render::kGmemPlanOld : 0u) && tileable;
+        gmem = render::gmemPlan(pass, &plan, &gmemWhy_, (gmemOff_ & kGmemOldTiles ? render::kGmemPlanOld : 0u) |
+                                                          (gmemCompressed_ ? render::kGmemPlanCompressed : 0u)) && tileable;
         if (!tileable) gmemWhy_ = whyNotTiled();
         if (gmem && gmemMinDraws_ != 0) {
             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so

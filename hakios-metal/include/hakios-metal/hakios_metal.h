@@ -154,7 +154,7 @@ hakios_metal_texture *hakios_metal_texture_new(hakios_metal_device *device, unsi
 /* a 2D, one-level RGBA8Unorm (70) or BGRA8Unorm (80) texture the GPU reads compressed (UBWC). Without render-target
  * usage, what replace and read see are its rows, copied in by the GPU before a draw or a dispatch samples it after they
  * changed. With it (USAGE holds 4), a render target in the compressed layout alone, the GPU's: no rows, replace and read
- * refuse it, and a pass into it runs in sysmem. Never for a texture a kernel
+ * refuse it, and a pass into it runs in sysmem unless hakios_metal_cb_set_gmem_compressed. Never for a texture a kernel
  * writes. NULL with the reason. */
 hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
     unsigned usage);
@@ -537,6 +537,9 @@ void hakios_metal_cb_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *dra
 void hakios_metal_cb_set_gmem(hakios_metal_cb *cb, int on);
 /* GMEM's refinements turned off (CommandBuffer::setGmemOff's bits: 1 whole area, 2 every attachment, 4 fetch barrier) */
 void hakios_metal_cb_set_gmem_off(hakios_metal_cb *cb, unsigned bits);
+/* a pass with a compressed (UBWC) colour attachment in GMEM too, loaded and stored in its layout (CommandBuffer::
+ * setGmemCompressed); off by default, when such a pass runs in sysmem */
+void hakios_metal_cb_set_gmem_compressed(hakios_metal_cb *cb, int on);
 /* GMEM or sysmem for each of CB's passes by what such passes cost the queue before (CommandBuffer::setGmemTuned) */
 void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb *cb, int on);
 /* GMEM only for a pass whose like had at least DRAWS draws the last time (CommandBuffer::setGmemMinDraws); 0: off */

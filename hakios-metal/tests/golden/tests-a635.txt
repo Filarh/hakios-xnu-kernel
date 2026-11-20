@@ -299,6 +299,8 @@ draw_states_keep_each_groups_registers_whole submits 0 words 0 draws 0 loads 0 s
 the_fake_runs_draw_state_groups_as_the_microcode_does submits 6 words 3597 draws 8 loads 12 stream cd8e2ac64cc7fac5 state 54e81470edcf5a2d names 0 0000000000000000
 perf_counters_are_selected_once_and_read_around_each_pass submits 2 words 2786 draws 6 loads 12 stream dd4c3336cd7753e2 state 54e81470edcf5a2d names 13 77f575b2759bd8f0
 a_tiled_target_is_drawn_cleared_copied_sampled_loaded_and_stored_in_its_layout submits 4 words 6712 draws 24 loads 50 stream 698996ebc81ea5d9 state 72ddd0f820d49ced names 16 8adfb327e8218504
+       (no Mesa in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none; the compressed target did not run)
+a_compressed_target_is_tiled_only_behind_its_switch submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_make_lays_the_memory_out_and_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_replace_and_read_convert_the_callers_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

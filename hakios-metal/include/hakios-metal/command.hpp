@@ -236,6 +236,10 @@ public:
         kGmemEveryBin = 512, kGmemInlineBarriers = 1024, kGmemAllOrdered = 2048, kGmemByDrawsAlone = 4096, kSysmemFetchUnordered = 8192,
     };
     void setGmemOff(uint32_t bits) { gmemOff_ = bits; }
+    // A pass with a compressed (UBWC) colour attachment in GMEM too, its tiles loaded and stored in the UBWC layout with
+    // the flag buffer (render::kGmemPlanCompressed); off by default, when such a pass runs in sysmem: the plug-in's
+    // metal_gmemubwc=1, an A/B on the phone (dev-notes 25-blur/04)
+    void setGmemCompressed(bool on) { gmemCompressed_ = on; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
     void setGmemTuned(bool on) { tuning_ = on; }
@@ -283,6 +287,7 @@ private:
     void drawStamp(uint32_t slot);
     bool gmem_ = true;
     uint32_t gmemOff_ = 0;
+    bool gmemCompressed_ = false;
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;

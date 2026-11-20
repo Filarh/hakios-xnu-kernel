@@ -7032,3 +7032,58 @@ TEST(a_tiled_target_is_drawn_cleared_copied_sampled_loaded_and_stored_in_its_lay
     CHECK(after.tileLoads - before.tileLoads == after.tiles - before.tiles && after.tileStores - before.tileStores == after.tiles - before.tiles);
     CHECK_EQ(after.faults, 0u);
 }
+
+// A compressed render target (TextureDesc::compressed with render-target usage: UBWC, no rows) as a pass's target: by
+// default the pass runs in sysmem, the reason naming the switch (render::gmemPlan refuses it); with setGmemCompressed
+// its tiles load and store it by the event blit in its layout (TILE6_3, FLAGS and its flag buffer in RB_BLIT_FLAG_DST,
+// as turnip's tu_emit_blit with tu_cs_image_flag_ref); the twin, the same pass on the same target without the
+// switch, has no tile. Needs Mesa's layout (a build with MESA=1).
+TEST(a_compressed_target_is_tiled_only_behind_its_switch) {
+    using namespace a6xx;
+    Rig r;
+    TextureDesc cd;
+    cd.format = PixelFormat::kBGRA8Unorm;
+    cd.width = 752;
+    cd.height = 1626;
+    cd.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    cd.compressed = true;
+    std::string why;
+    auto ct = Texture::make(*r.gpu, cd, &why);
+    if (ct == nullptr && why.find("this build has none") != std::string::npos) {
+        std::printf("       (no Mesa in this build: %s; the compressed target did not run)\n", why.c_str());
+        return;
+    }
+    CHECK(ct != nullptr);
+    if (ct == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    CHECK(ct->compressed() && ct->contents() == nullptr && ct->staging() == nullptr);
+    RenderPass gp;
+    gp.color0 = ct.get();
+    render::GmemPlan plan;
+    CHECK(!render::gmemPlan(gp, &plan, &why) && has(why, "setGmemCompressed"));
+    CHECK(render::gmemPlan(gp, &plan, &why, render::kGmemPlanCompressed));
+    for (int on = 0; on < 2; on++) {
+        const auto before = r.fake->stats();
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemCompressed(on != 0);
+        cb->setProfile(true);
+        Draw d1 = wholeDraw(3, 752, 1626), d2 = wholeDraw(3, 752, 1626);
+        CHECK(cb->draw(flatProgram(), gp, d1, Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), gp, d2, Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        const auto after = r.fake->stats();
+        const auto t = cb->passTimes();
+        CHECK_EQ(t.size(), size_t(1));
+        if (on == 0) {
+            CHECK(after.tiles == before.tiles);
+            CHECK(!t.empty() && t[0].tiles == 0 && has(t[0].sysmemWhy, "compressed"));
+        } else {
+            CHECK(after.tiles > before.tiles);
+            CHECK(after.tileLoads - before.tileLoads == after.tiles - before.tiles && after.tileStores - before.tileStores == after.tiles - before.tiles);
+            CHECK(!t.empty() && t[0].tiles != 0);
+        }
+        CHECK_EQ(after.faults, 0u);
+    }
+}

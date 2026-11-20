@@ -534,8 +534,10 @@ struct GmemPlan {
 // bytes a pixel, their rows with room for the event blit's 16 x 4 granules past the edges; no depth or stencil. A bin
 // holds every attachment's pixels (CoreAnimation's main pass draws into two screens at once). False with *why
 // otherwise (the pass then runs in sysmem, as before).
-// (FLAGS: kGmemPlanOld, the shares and the one column of bins this had before turnip's -- for a bisect on the phone)
-enum : uint32_t { kGmemPlanOld = 1 };
+// (FLAGS: kGmemPlanOld, the shares and the one column of bins this had before turnip's -- for a bisect on the phone;
+// kGmemPlanCompressed, a compressed (UBWC) attachment too, its tiles loaded and stored by the event blit in its layout
+// with its flag buffer as turnip's tu_emit_blit does -- refused without it)
+enum : uint32_t { kGmemPlanOld = 1, kGmemPlanCompressed = 2 };
 bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t flags = 0);
 // PLAN's bins for a W x H window out of its attachments' rooms: turnip's layout (render.cpp). WIDTH 0, or the one
 // bin width allowed. False when the rooms hold no bin.
