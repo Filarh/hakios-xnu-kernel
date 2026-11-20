@@ -7673,6 +7673,43 @@ TEST(hsr_depth_is_cleared_once_and_its_levels_run_on_in_the_queues_order) {
     }
 }
 
+// The HSR depth persists from pass to pass in the sysmem shape of the CCU; a pass in GMEM between two of them moves the
+// CCU to the GMEM shape and back. What the fake checks of it (FakeGpu's note on ccuStale_): the sysmem passes' colour
+// and depth out of the CCU before the tiles, and the CCU invalidated before the next sysmem pass draws or tests depth.
+// One buffer, HSR pass into A, a GMEM pass into B, HSR pass into A again: complete, no fault, one clear.
+TEST(hsr_depth_kept_across_a_gmem_pass_in_the_same_buffer) {
+    Rig r;
+    auto t = target(r, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto u = target(r, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    fillCoords(*u);
+    RenderPass a, b;
+    a.color0 = t.get();
+    b.color0 = u.get();
+    Program flat = flatProgram();
+    flat.ssboWrites = 0;
+    render::Options sys, tiles;
+    sys.gmem = false;
+    tiles.gmem = true;
+    auto cb = r.queue->commandBuffer();
+    cb->setHsr(true);
+    cb->setHsrTest(0, CommandBuffer::kHsrMaxDraws, true);
+    for (int i = 0; i < 2; i++) CHECK(cb->draw(flat, a, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, sys));
+    cb->setHsr(false);   // (a pass with HSR is a sysmem one)
+    CHECK(cb->draw(flatProgram(), b, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, tiles));
+    cb->setHsr(true);
+    for (int i = 0; i < 2; i++) CHECK(cb->draw(flat, a, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, sys));
+    cb->commit();
+    cb->waitUntilCompleted();
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK_EQ(cb->counts().gmemPasses, 1u);
+    CHECK(r.fake->stats().tiles > 0);
+    CHECK_EQ(cb->counts().hsrPasses, 2u);
+    CHECK_EQ(cb->counts().hsrClears, 1u);
+    CHECK_EQ(coordsWrong(*u), 0u);
+}
+
 // The prepass's draws are written from the facts the pass's draw is written from: taken from the programs' kept states
 // or judged the long way, the GPU runs every draw of the scene in the same state.
 TEST(hsr_kept_states_and_whole_draws_give_the_same_draws) {

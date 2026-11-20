@@ -1,5 +1,6 @@
 #include "hakios-metal/fake_gpu.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <chrono>
@@ -979,6 +980,15 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
         fault(text("a fill of (%llu, %llu) to ", x0, y0) + text("(%llu, %llu) with a pitch of ", x1, y1) + text("%llu bytes at %#llx: an empty rectangle, rows wider than the pitch or a base not 64-aligned", pitch, base));
         return false;
     }
+    // (through the colour CCU in the sysmem shape: FakeGpu's note on ccuStale_)
+    if (!inTile_) {
+        if ((ccuStale_ & 1) != 0) {
+            fault("a 2D fill or copy through a colour CCU that a tile left stale: no PC_CCU_INVALIDATE_COLOR since");
+            return false;
+        }
+        throughColour_.push_back(ThroughColour{base, uint64_t(y1 + 1) * pitch, false});
+        sysmemUnflushed_ |= 1;
+    }
     if (copy && ubwc) {
         // Its bytes and flags are in an order this model does not reproduce: the copy is judged (the source linear and
         // in reach, a flag buffer in reach) and the image counted as written, which a sample of it then requires
@@ -1078,6 +1088,24 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     drawsInSubmission_++;   // the fill sits in the CCU as a draw's colour does: the same two flushes must follow it
     drawsWithoutCcuFlush_++;
     drawsWithoutCacheFlush_++;
+    return true;
+}
+
+// A draw that tests depth or stencil at [base, base + bytes) in the sysmem shape reads it through the depth CCU: what a
+// 2D write left there must be out of the colour CCU and the depth CCU's lines of it dropped (FakeGpu's note on ccuStale_)
+bool FakeGpu::depthCcuReads(uint64_t base, uint64_t bytes, const char* what) {
+    if ((ccuStale_ & 2) != 0) {
+        fault(std::string("a sysmem draw tests ") + what + " through a depth CCU that a tile left stale: no PC_CCU_INVALIDATE_DEPTH since");
+        return false;
+    }
+    for (const ThroughColour& t : throughColour_) {
+        if (t.base < base + bytes && base < t.base + t.bytes) {
+            fault(std::string("a draw tests ") + what + text(" at %#llx, which a 2D write left ", base) +
+                  (t.flushed ? "out of the colour CCU but not invalidated in the depth CCU (PC_CCU_INVALIDATE_DEPTH)"
+                             : "in the colour CCU (no PC_CCU_FLUSH_COLOR_TS since)"));
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1774,7 +1802,9 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                       text("%llu rows: not 4096-aligned, not a multiple of 128, narrower than the window, or outside every buffer", rows));
                 return false;
             }
+            if (stencilTest && !inTile_ && !depthCcuReads(sbase, rows * spitch, "stencil")) return false;
             if (stencilTest) drawsWithoutDepthFlush_++;
+            if (stencilTest && !inTile_) sysmemUnflushed_ |= 2;
         }
         if (depthFormat == DEPTH6_NONE) {
             if (test || write) {
@@ -1812,7 +1842,9 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                            reg(REG_A6XX_GRAS_SU_DEPTH_CNTL)));
                 return false;
             }
+            if (test && !inTile_ && !depthCcuReads(base, rows * pitch, "depth")) return false;
             if (write) drawsWithoutDepthFlush_++;
+            if (write && !inTile_) sysmemUnflushed_ |= 2;
             d.depthBase = base;
         }
         d.depthCntl = depthCntl;
@@ -2066,6 +2098,11 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             gmemCachesStale_ = true;
         }
     }
+    if (!inTile_ && (ccuStale_ & 1) != 0) {
+        fault("a sysmem draw through a colour CCU that a tile left stale: no PC_CCU_INVALIDATE_COLOR since");
+        return false;
+    }
+    if (!inTile_) sysmemUnflushed_ |= 1;
     stats_.draws++;
     drawsInSubmission_++;
     drawsWithoutCcuFlush_++;
@@ -2438,6 +2475,14 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                             return false;
                         }
                     }
+                    // (the CCU's sysmem contents out to memory before the bins take the GMEM, and stale after them:
+                    // FakeGpu's note on ccuStale_)
+                    if (sysmemUnflushed_ != 0) {
+                        fault((sysmemUnflushed_ & 1) ? "a tile begun with the colour CCU still holding sysmem writes: no PC_CCU_FLUSH_COLOR_TS since; the bins overwrite them"
+                                                    : "a tile begun with the depth CCU still holding sysmem writes: no PC_CCU_FLUSH_DEPTH_TS since; the bins overwrite them");
+                        return false;
+                    }
+                    ccuStale_ = 3;
                     inTile_ = true;
                     binning_ = false;
                     tileReset();
@@ -2623,6 +2668,14 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == CACHE_INVALIDATE && (lrzFillPending_ & 1) == 0) {
                     lrzFillPending_ = 0;
                 }
+                if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == PC_CCU_INVALIDATE_COLOR) {
+                    ccuStale_ &= ~1u;
+                }
+                if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == PC_CCU_INVALIDATE_DEPTH) {
+                    ccuStale_ &= ~2u;
+                    throughColour_.erase(std::remove_if(throughColour_.begin(), throughColour_.end(), [](const ThroughColour& t) { return t.flushed; }),
+                                         throughColour_.end());
+                }
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == ZPASS_DONE) {
                     if ((reg(REG_A6XX_RB_SAMPLE_COUNT_CONTROL) & A6XX_RB_SAMPLE_COUNT_CONTROL_COPY) == 0) {
                         fault("ZPASS_DONE without RB_SAMPLE_COUNT_CONTROL.COPY: no count is written");
@@ -2659,6 +2712,11 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     if (ev == PC_CCU_FLUSH_COLOR_TS) drawsWithoutCcuFlush_ = 0;
                     if (ev == PC_CCU_FLUSH_COLOR_TS) lrzFillPending_ &= ~1u;
                     if (ev == PC_CCU_FLUSH_DEPTH_TS) drawsWithoutDepthFlush_ = 0;
+                    if (ev == PC_CCU_FLUSH_COLOR_TS) {
+                        sysmemUnflushed_ &= ~1u;
+                        for (ThroughColour& t : throughColour_) t.flushed = true;
+                    }
+                    if (ev == PC_CCU_FLUSH_DEPTH_TS) sysmemUnflushed_ &= ~2u;
                     if (ev == CACHE_FLUSH_TS) drawsWithoutCacheFlush_ = 0;
                 }
                 break;
@@ -2856,6 +2914,8 @@ void FakeGpu::run(const Job& job) {
     gfxIbosFrom_ = 0;
     gfxIboUnits_ = 0;
     passBegun_ = ccuCntlWritten_ = ccuCntlAfterWfi_ = lastWasWfi_ = inTile_ = binning_ = false;
+    // (the CCU's shape is the stream's to set in each submission; what 2D writes left in it is not: throughColour_ stays)
+    sysmemUnflushed_ = ccuStale_ = 0;
     // (the command processor's own state: what the kernel's ring leaves a submission to start from is not modelled
     // beyond this -- no group, no skip, no streams)
     visOverride_ = skipGlobal_ = skipLocal_ = skipActive_ = sdsMode_ = sdsImmediate_ = streamEnded_ = leaveIb_ = binned_ = tileStreams_ = inGroup_ = false;

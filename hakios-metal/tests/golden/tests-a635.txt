@@ -316,6 +316,7 @@ hsr_draws_each_scene_as_the_draws_without_it_by_the_rules submits 116 words 1620
 hsr_rules_catch_each_twin submits 48 words 66194 draws 200 loads 517 stream e407551e0ecfc431 state 6a30a6b6ef38613a names 447 ee956281ec61b17e
 hsr_past_its_draw_limit_draws_the_rest_as_barriers submits 4 words 6839 draws 24 loads 58 stream aa45fede36cf7259 state ec98a4b3be275dc5 names 34 2fc550648417576d
 hsr_depth_is_cleared_once_and_its_levels_run_on_in_the_queues_order submits 7 words 15660 draws 26 loads 96 stream 369a2e864559780a state 981f7e27aa5a8765 names 49 13b297512358d132
+hsr_depth_kept_across_a_gmem_pass_in_the_same_buffer submits 1 words 3300 draws 5 loads 18 stream aebc02b679b15706 state 3819d717c8bda6ac names 8 04f760a4f87724a6
 hsr_kept_states_and_whole_draws_give_the_same_draws submits 20 words 24754 draws 90 loads 258 stream 941084a7a34147c1 state e915a7ec4dbd0861 names 196 c20aca60c69cad60
        (no Mesa in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none; no compressed target to draw)
 hsr_serves_the_passes_into_a_compressed_target_alone submits 1 words 1857 draws 3 loads 6 stream b0a9b168c3fe542a state 6daed77ff6dca4f4 names 6 cdd4ee2570085dc3

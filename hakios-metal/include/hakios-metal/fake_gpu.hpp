@@ -407,6 +407,27 @@ private:
     // stale reads what was there before -- on the phone a widget's text cut by a band, a blur in blocks (render.cpp:
     // encodeDraw's note) -- and is a fault here.
     bool gmemCachesStale_ = false, drawReadsGmem_ = false;
+    // The CCU (the colour and depth caches of the RB) lives in the GMEM on the A6xx, and RB_CCU_CNTL moves it between a
+    // sysmem shape and a GMEM one. turnip's rule for every change of shape (tu_emit_cache_flush_ccu,
+    // tu_cmd_buffer.cc:376-399): "Changing CCU state must involve invalidating the CCU. In sysmem mode, the CCU may
+    // also contain data that we haven't flushed out yet, so we also need to flush." What this models of it, inside a
+    // submission (where the stream sets the shape; what the kernel and other contexts leave between submissions is
+    // turnip's assumption too, tu6_init_hw writing the sysmem shape with no CCU event):
+    // - sysmemUnflushed_: what sysmem draws and 2D writes left in the colour CCU (bit 0, until PC_CCU_FLUSH_COLOR_TS)
+    //   and the depth CCU (bit 1, until PC_CCU_FLUSH_DEPTH_TS). A tile begun with either set overwrites it with bins.
+    // - ccuStale_: since a tile, the colour (bit 0) and depth (bit 1) CCU hold lines of the GMEM shape until
+    //   PC_CCU_INVALIDATE_COLOR / PC_CCU_INVALIDATE_DEPTH. A sysmem draw or 2D write through a stale one is a fault.
+    // - throughColour_: what a 2D fill or copy wrote, through the colour CCU, as {base, bytes, flushed}; a draw that tests
+    //   depth or stencil there reads it through the depth CCU, so it needs PC_CCU_FLUSH_COLOR_TS (flushed) and then
+    //   PC_CCU_INVALIDATE_DEPTH (dropped) first -- tu_clear_sysmem_attachment's clean colour, clean and invalidate depth
+    //   (tu_clear_blit.cc:4480-4496).
+    struct ThroughColour {
+        uint64_t base, bytes;
+        bool flushed;
+    };
+    uint32_t sysmemUnflushed_ = 0, ccuStale_ = 0;
+    std::vector<ThroughColour> throughColour_;
+    bool depthCcuReads(uint64_t base, uint64_t bytes, const char* what);
     bool logDraws_ = false, logState_ = false;
     std::set<uint32_t> sinceDraw_;   // (with logState_: the registers written since the last draw logged)
     // (the registers the binning pass's draws wrote, in the order each was first written, and how many of them had
