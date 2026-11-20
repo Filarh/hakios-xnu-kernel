@@ -1426,6 +1426,7 @@ HM_REFUSES_OUT_LOUD
 	dispatch_semaphore_t _sent;              /* a held commit: signalled once it has reached the GPU */
 	NSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */
 	struct hm_ft_rec *_ftrace;               /* metal_trace=frame: this buffer being recorded, else NULL */
+	BOOL _hsr;                               /* metal_hsr: drawn with hidden surface removal by depth */
 }
 - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue;
 - (void)hakiosTurnAtCommit:(id)texture;
@@ -6998,6 +6999,9 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
 		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
+		const int hsrMode = hm_hsr_switch();
+		_hsr = hsrMode == 1 || (hsrMode == 2 && __atomic_fetch_add(&hm_hsr_buffers, 1, __ATOMIC_RELAXED) % 2 == 0);
+		hakios_metal_cb_set_hsr(_cb, _hsr);
 	}
 	_owesSlot = YES;
 	return self;
@@ -7068,10 +7072,12 @@ HM_REFUSES_OUT_LOUD
 	unsigned passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, skipped = 0;
 	const char *last = "";
 	char label[300], queue[300], error[600], skip[600], refusal[600], *head = NULL, *record;
+	unsigned hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0;
 	int n;
 
 	_ftrace = NULL;
 	if (_cb != NULL) {
+		hakios_metal_cb_hsr_counts(_cb, &hsrPasses, &hsrOpaque, &hsrHidden, &hsrBarriers);
 		hakios_metal_cb_counts(_cb, &passes, &draws, &dispatches, &copies, &clears);
 		hakios_metal_cb_gmem_counts(_cb, &gmemPasses, &tiles);
 		skipped = hakios_metal_cb_skipped(_cb, &last);
@@ -7080,13 +7086,15 @@ HM_REFUSES_OUT_LOUD
 	hm_ft_line(ft, "endcb seq=%u\n", ft->seq);
 	n = asprintf(&head, "cb seq=%u capture=%u serial=%u label=%s queue=%s qid=%p created=%.6f committed=%.6f scheduled=%.6f completed=%.6f "
 		     "gpu_us=%.1f status=%s error=%s held=%d encoders=%u draws=%u ops=%u core_passes=%u core_draws=%u core_dispatches=%u "
-		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s\n", ft->seq, ft->capture->number,
+		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s hsr=%d hsr_passes=%u hsr_opaque=%u "
+		     "hsr_hidden=%u hsr_barriers=%u\n", ft->seq, ft->capture->number,
 		     ft->serial, hm_ft_qs(label, sizeof(label), [self label]), hm_ft_qs(queue, sizeof(queue), [_queue label]), (void *)_queue,
 		     ft->created, ft->committed, ft->scheduled, ft->completed, _cb != NULL ? (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e3 : 0.0,
 		     _cb != NULL ? HM_FT_STATUS(hakios_metal_cb_status(_cb)) : "nocb",
 		     hm_ft_q(error, sizeof(error), _cb != NULL ? hakios_metal_cb_error(_cb) : "no command buffer"), ft->held ? 1 : 0, ft->encoders,
 		     ft->draws, ft->ops, passes, draws, dispatches, copies, clears, gmemPasses, tiles, skipped,
-		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""));
+		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""),
+		     _hsr ? 1 : 0, hsrPasses, hsrOpaque, hsrHidden, hsrBarriers);
 	record = n > 0 ? malloc((size_t)n + ft->len) : NULL;
 	if (record != NULL) {
 		memcpy(record, head, (size_t)n);
@@ -7565,6 +7573,31 @@ static struct {
 	struct { unsigned w, h, origin; double bytes; } bySize[16];
 	unsigned ycbcrGpu, ycbcrCopies;   /* metal_ycbcrgpu=1: YCbCr textures drawn from their surfaces, and through their copies */
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}}, 0, 0 };
+
+/* boot-arg metal_hsr=1: hidden surface removal by depth (hakios_metal_cb_set_hsr; dev-notes/investigacion/anexos/
+ * 32-interfaz-telegram/02-hsr-por-profundidad.md): in a pass into a compressed target (the screen), the draws a later
+ * opaque draw of the pass covers are not shaded where it covers them, the picture the same. metal_hsr=2: in the command
+ * buffers of even number among this process's alone (hm_hsr_buffers, counted as they are made), for an A/B interleaved
+ * in one run; a recorded buffer's cb line says hsr=1 or hsr=0. Off by default. */
+static unsigned long hm_hsr_buffers;
+static int
+hm_hsr_switch(void)
+{
+	static dispatch_once_t once;
+	static int mode;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		if (hm_bootargs(args, &size) == 0) {
+			mode = strstr(args, "metal_hsr=1") != NULL ? 1 : strstr(args, "metal_hsr=2") != NULL ? 2 : 0;
+		}
+		if (mode == 1) hm_print("metal_hsr=1: hidden surface removal by depth in the passes into compressed targets\n");
+		if (mode == 2) hm_print("metal_hsr=2: as 1, in the command buffers of even number alone (an A/B within one run)\n");
+	});
+	return mode;
+}
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
  * what each cost such passes before (hakios_metal_cb_set_gmem_tuned). Off by default: for CoreAnimation it won nothing

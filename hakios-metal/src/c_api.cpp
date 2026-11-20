@@ -1013,6 +1013,15 @@ void hakios_metal_cb_set_hsr(hakios_metal_cb* cb, int on) {
     cb->cb->setHsr(on != 0);
 }
 
+void hakios_metal_cb_hsr_counts(hakios_metal_cb* cb, unsigned* passes, unsigned* opaque, unsigned* hidden, unsigned* barriers) {
+    syncOne(cb);
+    const CommandBuffer::Counts& c = cb->cb->counts();
+    if (passes != nullptr) *passes = c.hsrPasses;
+    if (opaque != nullptr) *opaque = c.hsrOpaque;
+    if (hidden != nullptr) *hidden = c.hsrHidden;
+    if (barriers != nullptr) *barriers = c.hsrBarriers;
+}
+
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setNullFsTextures(on != 0); });
     cb->cb->setNullFsTextures(on != 0);
