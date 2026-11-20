@@ -1808,7 +1808,7 @@ hm_ft_name(unsigned i, const char *const *names, unsigned count)
 #define HM_FT_FILTER(f)  HM_FT_NAME(f, "nearest", "linear")
 #define HM_FT_MIP(f)     HM_FT_NAME(f, "none", "nearest", "linear")
 #define HM_FT_ADDRESS(a) HM_FT_NAME(a, "clamp", "mirrorclamp", "repeat", "mirror", "zero", "border")
-#define HM_FT_ORIGIN(o)  HM_FT_NAME(o, "own", "surface", "buffer", "compressed")
+#define HM_FT_ORIGIN(o)  HM_FT_NAME(o, "own", "surface", "buffer", "compressed", "tiled")
 #define HM_FT_STATUS(s)  HM_FT_NAME(s, "notenqueued", "enqueued", "committed", "scheduled", "completed", "error")
 
 /* a colour write mask (MTLColorWriteMask: red 8, green 4, blue 2, alpha 1) as its letters */
@@ -4973,6 +4973,63 @@ hm_compress_ok(void)
 	return !off;
 }
 
+/*
+ * metal_tile=N (/var/tmp/metal.args or a boot-arg; off by default): CoreAnimation's own render targets -- its captures,
+ * the blur's intermediates and its pool -- laid out for the GPU instead of in linear rows. 1: TILE6_3 (hakios_metal_
+ * texture_new_tiled); 2: TILE6_3 compressed (UBWC, hakios_metal_texture_new_compressed with render-target usage).
+ * Only a texture no processor may read or write and no view may reinterpret: private storage ("never accessed by the
+ * CPU directly", MTLResource.h), allowGPUOptimizedContents left on, render-target usage, no ShaderWrite and no
+ * PixelFormatView (the conditions Metal's own lossy compression asks of a texture, MTLTexture.h), 2D, one level, one
+ * sample, RGBA8 or BGRA8 (or their sRGB pair; UBWC: the two unorm ones), at least 16 wide, not memoryless. A texture
+ * over an IOSurface or a buffer never comes here. An experiment (dev-notes 22, 25, 25-blur/03 §2). A pass into a
+ * compressed target runs in sysmem; a tiled one may have GMEM as a linear one.
+ */
+static int
+hm_tile_mode(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		mode = 0;
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_tile=")) != NULL) {
+			mode = atoi(at + strlen("metal_tile="));
+		}
+		if (mode < 0 || mode > 2) {
+			mode = 0;
+		}
+		if (mode != 0) {
+			hm_print("metal_tile=%d: CoreAnimation's private render targets are laid out %s\n", mode,
+				 mode == 1 ? "TILE6_3 (tiled, no compression)" : "TILE6_3 with UBWC compression");
+		}
+	}
+	return mode;
+}
+
+static int
+hm_tile_for(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
+{
+	const MTLPixelFormat f = [descriptor pixelFormat];
+	int mode = hm_tile_mode();
+
+	if (mode == 0 || [descriptor storageMode] != MTLStorageModePrivate || ![descriptor allowGPUOptimizedContents] ||
+	    [descriptor textureType] != MTLTextureType2D || [descriptor mipmapLevelCount] != 1 || [descriptor sampleCount] != 1 ||
+	    ([descriptor usage] & MTLTextureUsagePixelFormatView) != 0 || (usage & MTLTextureUsageShaderWrite) != 0 ||
+	    (usage & MTLTextureUsageRenderTarget) == 0 || [descriptor width] < 16) {
+		return 0;
+	}
+	if (mode == 2 && (f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatBGRA8Unorm)) {
+		return 2;
+	}
+	if (f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB) {
+		return 1;
+	}
+	return 0;
+}
+
 static BOOL
 hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 {
@@ -5100,6 +5157,23 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 	} else if ([descriptor textureType] == MTLTextureType3D) {
 		texture = hakios_metal_texture_new_3d(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width], (unsigned)[descriptor height],
 						      (unsigned)[descriptor depth], (unsigned)usage);
+	} else if ([descriptor storageMode] != MTLStorageModeMemoryless && hm_tile_for(descriptor, usage) != 0) {
+		/* metal_tile: one of CoreAnimation's private render targets in the GPU's own layout (hm_tile_mode) */
+		const int how = hm_tile_for(descriptor, usage);
+
+		texture = how == 2 ? hakios_metal_texture_new_compressed(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
+									 (unsigned)[descriptor height], (unsigned)usage)
+				   : hakios_metal_texture_new_tiled(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
+								    (unsigned)[descriptor height], (unsigned)usage);
+		if (texture == NULL) {
+			/* (the core's sentence, once: the texture is made linear as before) */
+			HM_ONCE("metal_tile: a texture the switch would lay out for the GPU was refused by the core and is made linear\n");
+			hm_print("metal_tile: %lux%lu, format %lu: %s\n", (unsigned long)[descriptor width], (unsigned long)[descriptor height],
+				 (unsigned long)[descriptor pixelFormat], hakios_metal_error());
+			texture = hakios_metal_texture_new_levels(_gpu, (unsigned)[descriptor textureType], (unsigned)[descriptor pixelFormat],
+								  (unsigned)[descriptor width], (unsigned)[descriptor height],
+								  (unsigned)[descriptor mipmapLevelCount], (unsigned)usage);
+		}
 	} else if (hm_compress(descriptor, usage)) {
 		texture = hakios_metal_texture_new_compressed(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
 							      (unsigned)[descriptor height], (unsigned)usage);

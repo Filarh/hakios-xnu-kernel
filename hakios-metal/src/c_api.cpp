@@ -597,7 +597,25 @@ int hakios_metal_texture_is_program_memory(hakios_metal_texture* t) {
 
 unsigned hakios_metal_texture_origin(hakios_metal_texture* t) {
     const Texture& x = *t->texture;
-    return x.compressed() ? 3 : x.overBufferRows() ? 2 : x.surface() != 0 ? 1 : 0;
+    return x.compressed() ? 3 : x.tiled() ? 4 : x.overBufferRows() ? 2 : x.surface() != 0 ? 1 : 0;
+}
+
+hakios_metal_texture* hakios_metal_texture_new_tiled(hakios_metal_device* d, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage) {
+    TextureDesc desc;
+    desc.format = PixelFormat(pixelFormat);
+    desc.width = width;
+    desc.height = height;
+    desc.usage = usage;
+    desc.tiled = true;
+    std::string why;
+    std::shared_ptr<Texture> t = Texture::make(*d->gpu, desc, &why);
+    if (t == nullptr) {
+        failed(why);
+        return nullptr;
+    }
+    auto* r = new hakios_metal_texture;
+    r->texture = std::move(t);
+    return r;
 }
 
 hakios_metal_texture* hakios_metal_texture_new_compressed(hakios_metal_device* d, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage) {

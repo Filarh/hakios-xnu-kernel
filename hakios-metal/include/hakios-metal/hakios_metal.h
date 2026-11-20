@@ -151,9 +151,11 @@ unsigned hakios_metal_kernel_threadgroup_memory(hakios_metal_kernel *kernel);   
  * buffer the command buffers keep alive while they use it) */
 hakios_metal_texture *hakios_metal_texture_new(hakios_metal_device *device, unsigned type, unsigned pixel_format,
     unsigned width, unsigned height, unsigned usage);
-/* a 2D, one-level RGBA8Unorm (70) or BGRA8Unorm (80) texture the GPU reads compressed (UBWC): what replace and read see
- * are its rows, copied in by the GPU before a draw or a dispatch samples it after they changed. For a texture that is
- * sampled and never drawn into or written by a kernel. NULL with the reason. */
+/* a 2D, one-level RGBA8Unorm (70) or BGRA8Unorm (80) texture the GPU reads compressed (UBWC). Without render-target
+ * usage, what replace and read see are its rows, copied in by the GPU before a draw or a dispatch samples it after they
+ * changed. With it (USAGE holds 4), a render target in the compressed layout alone, the GPU's: no rows, replace and read
+ * refuse it, and a pass into it runs in sysmem. Never for a texture a kernel
+ * writes. NULL with the reason. */
 hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
     unsigned usage);
 /* MTLStorageModeMemoryless: TEXTURE's contents exist only while a render pass draws into it. It keeps its rows (a pass
@@ -161,7 +163,13 @@ hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *d
  * the pass names for it. Set before the texture is first attached. */
 void hakios_metal_texture_set_memoryless(hakios_metal_texture *texture, int memoryless);
 int hakios_metal_texture_memoryless(hakios_metal_texture *texture);
-/* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own) */
+/* A 2D, one-level, single-sample render target of a 4-byte colour format, at least 16 wide, laid out TILE6_3 without
+ * compression (texture.hpp: TextureDesc::tiled): the GPU's alone -- no rows for the processor, replace and read refuse it.
+ * NULL with the reason in hakios_metal_error otherwise. */
+hakios_metal_texture *hakios_metal_texture_new_tiled(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
+                                                     unsigned usage);
+/* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own,
+ * or none for a render target), 4 tiled (TILE6_3, the GPU's alone) */
 unsigned hakios_metal_texture_origin(hakios_metal_texture *texture);
 /* whether TEXTURE's rows are a program's own memory (a texture over a no-copy buffer) */
 int hakios_metal_texture_is_program_memory(hakios_metal_texture *texture);

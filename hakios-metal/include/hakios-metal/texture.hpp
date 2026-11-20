@@ -223,6 +223,11 @@ struct TextureDesc {
     // laid out for the GPU alone, tiled and compressed (UBWC, Mesa's fdl6_layout): no rows a CPU can address, its bytes
     // what the GPU reads compressed. A 2D, one-level, single-sample RGBA8 texture, in a build with Mesa
     bool compressed = false;
+    // laid out for the GPU alone in TILE6_3 without the compression: fdl6_layout with the tile mode and no UBWC (what
+    // turnip lays an optimal image out as when UBWC is off; fd6_layout.c:86-111, 172-201). The same macrotiles of 2 KB
+    // the compressed layout has, no flag buffer, no rows a CPU can address. A 2D, one-level, single-sample texture of a
+    // 4-byte colour format at least 16 pixels wide (narrower, fdl6 lays it linear: FDL_MIN_UBWC_WIDTH)
+    bool tiled = false;
 };
 
 class Texture {
@@ -292,14 +297,26 @@ public:
     uint64_t bytesPerRow() const { return pitch_; }                  // the GPU's pitch
     const std::shared_ptr<Buffer>& buffer() const { return buffer_; }
     uint64_t gpuAddress() const { return buffer_->gpuAddress() + offset_; }
-    void* contents() const {                                          // the rows, write-combined (nullptr for a surface the driver maps nowhere, or a compressed texture)
-        return buffer_->contents() != nullptr && !ubwc_ ? static_cast<uint8_t*>(buffer_->contents()) + offset_ : nullptr;
+    void* contents() const {                                          // the rows, write-combined (nullptr for a surface the driver maps nowhere, or a compressed or tiled texture)
+        return buffer_->contents() != nullptr && !ubwc_ && !tiled_ ? static_cast<uint8_t*>(buffer_->contents()) + offset_ : nullptr;
     }
     // TextureDesc::compressed: its flag buffer (the compression's metadata) in the GPU's memory, that buffer's pitch and
     // layer size in bytes, and its blocks across and down as log2 (fdl_layout's)
     bool compressed() const { return ubwc_; }
     static std::shared_ptr<Texture> adoptView(const Texture& p, Texture* t);
     void ubwcDescriptor(a6xx::TexConst& d) const;   // TILE6_3, WZYX and the flag buffer of a compressed texture, into D   // a view keeps a compressed parent's UBWC layout
+    bool tiled() const { return tiled_; }                             // TextureDesc::tiled: TILE6_3 without a flag buffer
+    // The layout a colour texture's memory is in, as the RB (RB_MRT_BUF_INFO), the 2D engine (RB_2D_DST_INFO,
+    // SP_PS_2D_SRC_INFO), the event blit (RB_BLIT_DST_INFO) and the TP (TEX_CONST_0) are told it: TILE6_3 for a tiled or a
+    // compressed one, linear otherwise; and the swap they are told with it. A tiled layout holds every format in WZYX
+    // order: "It seems CCU ignores swap and always uses WZYX when tiled. TP, on the other hand, always respects swap. We
+    // should return WZYX such that CCU and TP agree each other" (Mesa 25.0.7 fd6_format_table.c:370-375, fd6_pipe2swap).
+    a6xx::a6xx_tile_mode colorTile() const { return ubwc_ || tiled_ ? a6xx::TILE6_3 : a6xx::TILE6_LINEAR; }
+    a6xx::a3xx_color_swap colorSwap() const { return ubwc_ || tiled_ ? a6xx::WZYX : info_->swap; }
+    // a compressed texture's flag buffer pitch as RB_MRT_FLAG_BUFFER_PITCH, RB_2D_DST_FLAGS, SP_PS_2D_SRC_FLAGS and
+    // RB_BLIT_FLAG_DST all take it: fdl6_view_init's FLAG_BUFFER_PITCH, "these have same encoding for MRT and 2D"
+    // (fd6_view.c:338-341; turnip's tu_cs_image_flag_ref writes this one word after the address for all four)
+    uint32_t flagPitchWord() const;
     bool overBufferRows() const { return overBuffer_; }
     // MTLStorageModeMemoryless: a render target whose contents exist only while a pass draws into it, undefined before
     // the pass and after it. It has rows like any other texture (a pass drawn in sysmem draws into them); the tiles of a
@@ -375,6 +392,19 @@ private:
     bool overBuffer_ = false;     // made by overBuffer: its rows a Buffer's, which the CPU writes as it likes
     bool memoryless_ = false;     // setMemoryless
     bool ubwc_ = false;           // TextureDesc::compressed: TILE6_3 and a flag buffer
+    bool tiled_ = false;          // TextureDesc::tiled: TILE6_3 alone
+    // what the layout adds to a descriptor of its memory (sampledDescriptor, levelDescriptor, storageDescriptor): for a
+    // tiled or compressed texture TILE_MODE 3 and SWAP WZYX, and for a compressed one the flag buffer (fdl6_view_init)
+    void layoutInto(a6xx::TexConst& d) const;
+    void copyLayout(const Texture& p) {   // a view's or a swizzle's: the parent's layout fields
+        tiled_ = p.tiled_;
+        ubwc_ = p.ubwc_;
+        ubwcOffset_ = p.ubwcOffset_;
+        ubwcPitch_ = p.ubwcPitch_;
+        ubwcLayerSize_ = p.ubwcLayerSize_;
+        ubwcLogW_ = p.ubwcLogW_;
+        ubwcLogH_ = p.ubwcLogH_;
+    }
     // ...and the linear rows this processor writes and reads (replace, read): copied into the compressed layout by the
     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
     std::shared_ptr<Texture> staging_;
