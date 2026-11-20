@@ -4304,13 +4304,14 @@ void CommandBuffer::PassReturn::operator()(OpenPass* p) const {
         delete p;
         return;
     }
-    RegShadow regs = std::move(p->regs), bodyRegs = std::move(p->bodyRegs);
+    RegShadow regs = std::move(p->regs), bodyRegs = std::move(p->bodyRegs), hsrShadow = std::move(p->hsrShadow);
     pm4::Stream bodies = std::move(p->bodies), sysStream = std::move(p->sysStream), headGmem = std::move(p->headGmem), hsrPrepass = std::move(p->hsrPrepass);
     std::vector<uint8_t> staticKey = std::move(p->staticKey);
     std::shared_ptr<render::PassCache> cache = std::move(p->cache);
     *p = OpenPass{};
     regs.clear();
     bodyRegs.clear();
+    hsrShadow.clear();
     bodies.clear();
     sysStream.clear();
     headGmem.clear();
@@ -4318,6 +4319,7 @@ void CommandBuffer::PassReturn::operator()(OpenPass* p) const {
     staticKey.clear();
     p->regs = std::move(regs);
     p->bodyRegs = std::move(bodyRegs);
+    p->hsrShadow = std::move(hsrShadow);
     p->bodies = std::move(bodies);
     p->sysStream = std::move(sysStream);
     p->headGmem = std::move(headGmem);
@@ -4836,13 +4838,23 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
             hsrOpenSegment();
         }
         if (hsrClass == render::kHsrOpaque) {
-            // its whole words for the prepass (LessEqual and a depth write; 5, the twin: Less), from the facts the pass's
-            // draw is written from; past what an IB holds it is a barrier instead, the segment ending before it
+            // its whole words for the prepass (LessEqual and a depth write; 5, the twin: Less), made as the pass's draw is:
+            // from its program's kept state through a shadow and cursors that know nothing (the kept groups' words are
+            // the state's, and the facts of a draw taken so hold the draw's own numbers alone), or the long way; past what
+            // an IB holds it is a barrier instead, the segment ending before it
             Draw whole = hsrDraw;
             whole.depth = DepthState{hsrTwin_ == 5 ? 1u : 3u, true};
             const size_t at = open_->hsrPrepass.size();
-            render::emitDraw(open_->hsrPrepass, f, program, pass, whole, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), wholeOptions, nullptr, false,
-                             render::kGAll);
+            if (fast && options.dedupRegs) {
+                RegShadow& none = open_->hsrShadow;
+                none.clear();
+                render::Cursor nothing;
+                render::emitFast(open_->hsrPrepass, none, nothing, *ps, *open_->cache, f, program, pass, whole, vsBindings, fsBindings, table.gpuAddress(),
+                                 wholeOptions, nullptr, false, dc.scratch);
+            } else {
+                render::emitDraw(open_->hsrPrepass, f, program, pass, whole, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), wholeOptions, nullptr,
+                                 false, render::kGAll);
+            }
             if (open_->hsrPrepass.size() > render::kHsrPrepassMaxWords) {
                 open_->hsrPrepass.truncate(at);
                 hsrClass = render::kHsrBarrier;

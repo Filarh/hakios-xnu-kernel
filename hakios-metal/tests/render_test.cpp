@@ -7349,6 +7349,8 @@ const HsrScene kHsrScenes[] = {
      {{kHsrBlendC1, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 60, 40}, {kHsrFlat, 0, 0, 96, 64}},
      false,
      true},
+    // (the second opaque draw of one program in the pass is taken from its kept state: its prepass words too)
+    {"an opaque draw of vertex attributes twice", {{kHsrOverlap, 0, 0, 96, 64}, {kHsrBlend, 20, 20, 40, 30}, {kHsrOverlap, 10, 0, 60, 64}}},
 };
 
 uint32_t hsrCount(const HsrScene& s, HsrKind a, HsrKind b = HsrKind(0xff), HsrKind c = HsrKind(0xff)) {
@@ -7426,7 +7428,7 @@ TEST(hsr_past_its_draw_limit_draws_the_rest_as_barriers) {
 // The prepass's draws are written from the facts the pass's draw is written from: taken from the programs' kept states
 // or judged the long way, the GPU runs every draw of the scene in the same state.
 TEST(hsr_kept_states_and_whole_draws_give_the_same_draws) {
-    for (size_t k : {size_t(0), size_t(1), size_t(8), size_t(12)}) {
+    for (size_t k : {size_t(0), size_t(1), size_t(8), size_t(12), size_t(13)}) {
         const bool was = CommandBuffer::keepStates(false);
         const HsrRun whole = runHsr(kHsrScenes[k], true);
         CommandBuffer::keepStates(true);

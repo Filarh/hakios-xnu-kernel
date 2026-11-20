@@ -310,10 +310,10 @@ a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned submits 0 words 0 
 a_fetchs_barrier_runs_where_a_tile_draws_the_fetch submits 5 words 32124 draws 140 loads 364 stream 3b2c7b9d0ceef757 state fb1d6719dced4b65 names 30 7b3e8fd04d1dff98
 draw_states_keep_each_groups_registers_whole submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_fake_runs_draw_state_groups_as_the_microcode_does submits 6 words 3597 draws 8 loads 12 stream cd8e2ac64cc7fac5 state 54e81470edcf5a2d names 0 0000000000000000
-hsr_draws_each_scene_as_the_draws_without_it_by_the_rules submits 56 words 78715 draws 243 loads 638 stream b543f9898d10ba6a state 08f53ced6742cf95 names 509 d7c82ea006a2ebbf
+hsr_draws_each_scene_as_the_draws_without_it_by_the_rules submits 60 words 84221 draws 259 loads 680 stream 66357bd34c967cc0 state 1482e2d6b0984dc9 names 549 29441b0376984c0a
 hsr_rules_catch_each_twin submits 48 words 66363 draws 200 loads 517 stream 27ddd69ffca0f5c8 state 6a30a6b6ef38613a names 447 ee956281ec61b17e
 hsr_past_its_draw_limit_draws_the_rest_as_barriers submits 4 words 6853 draws 24 loads 58 stream dca72301ee890786 state ec98a4b3be275dc5 names 34 2fc550648417576d
-hsr_kept_states_and_whole_draws_give_the_same_draws submits 16 words 20256 draws 74 loads 212 stream 7a060b3c88eaf78d state 6d1b084b1fb82f99 names 154 c211b60488b097ac
+hsr_kept_states_and_whole_draws_give_the_same_draws submits 20 words 24894 draws 90 loads 258 stream 8aaee50392eea99d state e915a7ec4dbd0861 names 196 c20aca60c69cad60
        (no Mesa in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none; no compressed target to draw)
 hsr_serves_the_passes_into_a_compressed_target_alone submits 1 words 1857 draws 3 loads 6 stream b0a9b168c3fe542a state 6daed77ff6dca4f4 names 6 cdd4ee2570085dc3
 texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

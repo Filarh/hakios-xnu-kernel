@@ -458,6 +458,7 @@ private:
         size_t hsrHole = 0;
         pm4::Stream hsrPrepass;
         std::vector<size_t> hsrStarts;
+        RegShadow hsrShadow;   // (an empty shadow, for an opaque draw's whole words taken from its program's kept state)
     };
     // NEXT: the pass of the draw that could not join the open one, when it is such a draw that closes it (nullptr for
     // anything else: a copy, a dispatch, the commit). A memoryless attachment the tiles wrote is stored for it alone:
