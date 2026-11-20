@@ -7377,6 +7377,8 @@ TEST(hsr_draws_each_scene_as_the_draws_without_it_by_the_rules) {
         for (const auto& l : on.stats.drawLog) indirect += l.indirect;
         CHECK_EQ(indirect, on.counts.hsrOpaque);   // (each opaque draw in a prepass, and only there)
         CHECK_EQ(on.stats.draws, off.stats.draws);
+        CHECK_EQ(on.stats.tiledFills, 1u);   // (the depth cleared as the pass opens: a fill into a TILE6_3 depth texture)
+        CHECK_EQ(off.stats.tiledFills, 0u);
     }
     // the scenes' prepasses: one a segment with an opaque draw
     const HsrRun two = runHsr(kHsrScenes[8], true);
