@@ -560,6 +560,7 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 @interface HakiosMetalBuffer : _MTLResource {
 	HakiosMetalDevice *_device;
 	hakios_metal_buffer *_buffer;
+	BOOL _noCopy;                   /* the caller's own pages (-newBufferWithBytesNoCopy:...) */
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device length:(NSUInteger)length;
 /* the caller's own pages [BYTES, BYTES + LENGTH) as the buffer (-newBufferWithBytesNoCopy:...): nil when the kernel
@@ -618,6 +619,8 @@ hm_nocopy_released(void *context)
 }
 @end
 
+static __thread const char *hm_nocopy_why;     /* why hm_nocopy_buffer refused, when it was the plug-in and not the core */
+
 /* A buffer of the program's own memory, for -newBufferWithBytesNoCopy: and for a no-copy texture's rows. ARMED_OUT,
  * when given, is the context of its deallocator, for a caller that may yet give the memory back without the call. */
 static hakios_metal_buffer *
@@ -634,6 +637,37 @@ hm_nocopy_buffer(HakiosMetalDevice *device, void *bytes, NSUInteger length, void
 	n->bytes = bytes;
 	n->length = length;
 	n->armed = YES;
+	hm_nocopy_why = NULL;
+	/* boot-arg metal_nocopyro=1: memory this program may only read is taken too (xnu 0435 wires it for reading and maps
+	 * it read-only for the GPU); without it such memory is refused here, as kernels before 0435 refused it, and
+	 * QuartzCore uploads the image. The switch is for measuring the two ways in one boot. */
+	{
+		static int takeReadOnly = -1;
+
+		if (takeReadOnly < 0) {
+			char args[4096];
+			size_t size = sizeof(args);
+
+			takeReadOnly = hm_bootargs(args, &size) == 0 && strstr(args, "metal_nocopyro=1") != NULL;
+		}
+		if (!takeReadOnly) {
+			vm_address_t at = (vm_address_t)bytes;
+			vm_size_t size = 0;
+			natural_t depth = 0;
+			struct vm_region_submap_info_64 info;
+			mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+			if (vm_region_recurse_64(mach_task_self(), &at, &size, &depth, (vm_region_recurse_info_64_t)&info, &count) == KERN_SUCCESS &&
+			    at <= (vm_address_t)bytes && (info.protection & VM_PROT_WRITE) == 0) {
+				if (n->deallocator != nil) {
+					Block_release(n->deallocator);
+				}
+				free(n);
+				hm_nocopy_why = "memory the program may only read (metal_nocopyro=1 takes it)";
+				return NULL;
+			}
+		}
+	}
 	b = hakios_metal_buffer_new_nocopy([device hakiosDevice], bytes, (uint64_t)length, hm_nocopy_released, n);
 	if (b == NULL) {
 		/* not made: the core never had the context, and the memory stays the caller's without a call */
@@ -5740,6 +5774,7 @@ HM_REFUSES_OUT_LOUD
 		return nil;
 	}
 	_buffer = hm_nocopy_buffer(device, bytes, length, deallocator, NULL);
+	_noCopy = YES;
 	if (_buffer == NULL) {
 		/* the first eight by their reason; after that one line in a hundred, with the count */
 		static _Atomic unsigned refused;
@@ -5762,7 +5797,7 @@ HM_REFUSES_OUT_LOUD
 					 info.is_submap ? " submap" : "");
 			}
 			hm_print("refused: a no-copy buffer of %lu bytes at %p (%u so far; %s): %s; nil (QuartzCore then uploads the image)\n",
-				 (unsigned long)length, bytes, n, region, hakios_metal_error());
+				 (unsigned long)length, bytes, n, region, hm_nocopy_why != NULL ? hm_nocopy_why : hakios_metal_error());
 		}
 		[self release];
 		return nil;
@@ -5853,6 +5888,19 @@ HM_REFUSES_OUT_LOUD
 								    (uint64_t)bytesPerRow) != 0) {
 			hakios_metal_texture_free(texture);
 			texture = NULL;
+		}
+	}
+	{
+		/* each pixel format met over a buffer, once, with how it was served: what QuartzCore hands this way is learned */
+		static uint64_t seen[8];
+		const unsigned f = (unsigned)[descriptor pixelFormat] & 511;
+		const BOOL view = texture != NULL && bytesPerRow % 64 == 0 && offset % 64 == 0;
+
+		if ((__atomic_fetch_or(&seen[f >> 6], 1ull << (f & 63), __ATOMIC_RELAXED) & (1ull << (f & 63))) == 0) {
+			hm_print("a texture over a buffer: pixel format %u, %lux%lu, rows of %lu bytes from %lu, %s; buffer %s\n", f,
+				 (unsigned long)[descriptor width], (unsigned long)[descriptor height], (unsigned long)bytesPerRow,
+				 (unsigned long)offset, texture == NULL ? "refused" : view ? "a view of its rows" : "a copy",
+				 _noCopy ? "of the program's memory" : "of the GPU's");
 		}
 	}
 	if (texture == NULL) {
