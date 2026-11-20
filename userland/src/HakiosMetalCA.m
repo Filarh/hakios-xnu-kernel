@@ -660,15 +660,22 @@ hm_nocopy_buffer(HakiosMetalDevice *device, void *bytes, NSUInteger length, void
 	BOOL _swizzled;                     /* a swizzled view: _texture is the core's, read through _swizzle */
 	MTLTextureSwizzleChannels _swizzle;
 	void (^_deallocator)(void *, NSUInteger);   /* a no-copy texture's: its caller's bytes are given back at dealloc */
-	int _ycbcr;                         /* a two-plane surface read as RGBA8 converted from it: 0 not, 1 BT.601, 2 BT.709 */
+	int _ycbcr;                         /* a two-plane surface read as RGBA8 converted from it: 0 not, 1 BT.601, 2 BT.709, 3 BT.2020 */
 	BOOL _ycbcrFull;                    /* ... '420f' (full range) rather than '420v' (video range) */
 	MTLPixelFormat _ycbcrFormat;        /* ... and the private format it was asked as (500, 540), which it answers */
+	hakios_metal_texture *_ycbcrDirect; /* metal_ycbcrgpu=1: the surface itself, read by the GPU as (Cr, Y, Cb, 1)
+	                                     * (hakios_metal_texture_new_ycbcr), which a draw samples in the copy's place;
+	                                     * _texture stays the RGBA8 copy, made from the surface only where a draw or
+	                                     * another use cannot take the surface (hm_ycbcr_gpu) */
+	unsigned _ycbcrCode;                /* ... the conversion a fragment stage compiled for it applies (HAKIOS_METAL_YCBCR_CODE),
+	                                     * 0 for 540, which is the planes as they are */
 	void *_deallocBytes;
 	NSUInteger _deallocLength;
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device texture:(hakios_metal_texture *)texture
 			  descriptor:(MTLTextureDescriptor *)descriptor usage:(MTLTextureUsage)usage;
 - (hakios_metal_texture *)hakiosTexture;
+- (hakios_metal_texture *)hakiosTextureAsIs;   /* (no refresh of a YCbCr copy: hakiosTexture) */
 - (void)hakiosSetIOSurface:(IOSurfaceRef)surface plane:(NSUInteger)plane;
 - (void)hakiosShadow:(IOSurfaceRef)surface;
 - (BOOL)hakiosIsShadow;
@@ -686,7 +693,9 @@ static BOOL hm_fps_on(void);                          /* metal_fps: command buff
 #define HM_CACHE_DIR  "/private/var/db/hakios-metal-cache"     /* compiled stages, kept across boots by var_store */
 #define HM_CACHE_SEED "/redwood/share/hakios-metal-cache"     /* the same, baked into the image (read-only) */
 static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled rendering where a pass allows it */
-- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
+- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format direct:(hakios_metal_texture *)direct;
+- (hakios_metal_texture *)hakiosYcbcrDirect;   /* metal_ycbcrgpu=1: the surface as the GPU reads it, NULL otherwise */
+- (unsigned)hakiosYcbcrCode;
 - (void)hakiosRefreshShadow;
 - (instancetype)hakiosSwizzledBy:(MTLTextureSwizzleChannels)swizzle;
 - (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length;
@@ -1321,6 +1330,7 @@ HM_REFUSES_OUT_LOUD
 
 #define HM_SPEC_MOST 128  /* the contents of its deciding buffer an uber shader's pipeline is specialised for */
 #define HM_SPEC_ALIASES 8 /* ...and the last contents found to be one of them but for bytes that decide nothing */
+#define HM_YCBCR_MOST 16  /* the programs a pipeline is compiled for the YCbCr slots its draws bind (metal_ycbcrgpu=1) */
 
 @interface HakiosMetalComputePipelineState : _MTLComputePipelineState {
 	HakiosMetalDevice *_device;
@@ -1361,12 +1371,24 @@ HM_REFUSES_OUT_LOUD
 	uint8_t _specAliasSlots[HM_SPEC_ALIASES];
 	unsigned _specAliasNext;
 	struct hm_ft_pipe *_ftPipe;         /* metal_trace=frame: how a trace describes it (made with it while the switch is on) */
+	/* metal_ycbcrgpu=1: its fragment stage compiled again for the YCbCr slots a draw binds (hakiosYcbcrProgramFor:),
+	 * by the slots' word and the specialisation it was made over (-1: the pipeline's own program); NULL while it
+	 * compiles or when it could not be, under _specLock as the specialisations are */
+	unsigned _ycbcrCount;
+	uint64_t _ycbcrWords[HM_YCBCR_MOST];
+	int _ycbcrSpecs[HM_YCBCR_MOST];
+	hakios_metal_program *_ycbcrPrograms[HM_YCBCR_MOST];
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
 			  descriptor:(MTLRenderPipelineDescriptor *)descriptor;
 - (hakios_metal_program *)hakiosProgram;
 - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count;
 - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count;
+/* the program for a draw that binds YCbCr surfaces at the slots WORD names (3 bits a slot, HAKIOS_METAL_YCBCR_CODE), compiled
+ * to convert their samples; NULL while it compiles, when it could not be, or when the pipeline keeps no fragment
+ * function: the draw then samples the surfaces' copies with hakiosProgramFor:'s program */
+- (hakios_metal_program *)hakiosYcbcrProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
+					   word:(uint64_t)word;
 - (int)hakiosSpecBinding;              /* the uber shader's deciding [[buffer(n)]], -1 when it is not specialised */
 - (unsigned)hakiosSpecLength;          /* ...and the bytes of it that decide */
 - (void)hakiosSetFtPipe:(struct hm_ft_pipe *)pipe;
@@ -1586,7 +1608,9 @@ static struct {
  * render pipelines made, and the copies by this processor of a surface the GPU cannot read where it lies (rows off 64
  * bytes, two-plane YCbCr). Counted for the whole process while the mode is on (one clock read at each end of a call);
  * a recorded command buffer says what was added while it was being encoded, on its commit line. */
-enum { HM_FT_W_TEXTURE, HM_FT_W_SURFACE, HM_FT_W_BUFFER, HM_FT_W_UPLOAD, HM_FT_W_PIPELINE, HM_FT_W_COPY, HM_FT_W_KINDS };
+/* (and with metal_ycbcrgpu=1 the YCbCr textures a draw sampled where they lie, and those it sampled through their copies) */
+enum { HM_FT_W_TEXTURE, HM_FT_W_SURFACE, HM_FT_W_BUFFER, HM_FT_W_UPLOAD, HM_FT_W_PIPELINE, HM_FT_W_COPY, HM_FT_W_YCBCR_GPU, HM_FT_W_YCBCR_COPY,
+       HM_FT_W_KINDS };
 static struct {
 	_Atomic uint64_t n, ns, bytes;
 } hm_ft_work[HM_FT_W_KINDS];
@@ -4968,6 +4992,104 @@ hm_compress_ok(void)
 	return !off;
 }
 
+/*
+ * metal_ycbcrgpu=1: a two-plane '420f'/'420v' surface sampled as Metal's private 500 or 540 is read by the GPU from the
+ * surface itself, at the time the draw runs, rather than through an RGBA8 copy this processor converts when the
+ * texture is bound (26 ms for an app's 750x1624 snapshot). The texture unit reads both planes as one texture
+ * (R8_G8B8_2PLANE_420_UNORM) swizzled to (Cr, Y, Cb, 1): that is 540 as it is. For 500 the fragment stage that samples
+ * it is compiled again with the slot's matrix after each sample (hakios_metal_program_specialize_ycbcr), on the
+ * pipeline's compiling queue; until that program is there -- and wherever the surface cannot go (a vertex stage, a
+ * compute kernel, an argument buffer, a blit, a view of the texture, a pipeline whose fragment function is not kept,
+ * a slot past 16) -- the draw samples the RGBA8 copy, made and refreshed as before. Off by default.
+ */
+static BOOL
+hm_ycbcr_gpu(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_ycbcrgpu=1") != NULL;
+		if (on) hm_print("metal_ycbcrgpu=1: two-plane YCbCr surfaces (500, 540) are sampled by the GPU from the surface\n");
+	}
+	return on != 0;
+}
+
+/* where the surface's chroma samples lie, as hakios_metal_texture_new_ycbcr's SITING: bit 0 halfway between two luma
+ * columns, bit 1 between two rows. Read off the attachment CoreVideo's names give (kCVImageBufferChromaLocation_*:
+ * Left, Center, TopLeft, Top, BottomLeft, Bottom); none, or one the texture unit has no siting for, is cosited (the
+ * copy's own, which takes the chroma at (i/2, j/2)). NAME gets what the surface said, for the layout line. */
+static unsigned
+hm_ycbcr_siting(IOSurfaceRef surface, char *name, size_t size)
+{
+	static const CFStringRef keys[2] = {CFSTR("IOSurfaceChromaLocation"), CFSTR("CVImageBufferChromaLocationTopField")};
+	unsigned siting = 0;
+
+	snprintf(name, size, "none");
+	for (int k = 0; k < 2; k++) {
+		CFTypeRef v = IOSurfaceCopyValue(surface, keys[k]);
+
+		if (v == NULL) continue;
+		if (CFGetTypeID(v) == CFStringGetTypeID()) {
+			char text[32] = "";
+
+			CFStringGetCString((CFStringRef)v, text, sizeof(text), kCFStringEncodingUTF8);
+			snprintf(name, size, "%s", text);
+			siting = strcmp(text, "Center") == 0 ? 3 : strcmp(text, "Left") == 0 ? 2 : strcmp(text, "Top") == 0 || strcmp(text, "Bottom") == 0 ? 1 : 0;
+		} else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+			int n = 0;
+
+			CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &n);
+			snprintf(name, size, "number %d", n);
+		}
+		CFRelease(v);
+		break;
+	}
+	return siting;
+}
+
+/* the surface itself as the GPU reads it (hakios_metal_texture_new_ycbcr), or NULL with the reason in WHY (planes whose
+ * rows or starts are off 64 bytes, most often); and for the first two-plane surfaces of the process, one line with
+ * their planes' layout, matrix and siting, whatever the switch says (what the design needs to know of them) */
+static hakios_metal_texture *
+hm_ycbcr_direct(hakios_metal_device *gpu, IOSurfaceRef surface, MTLPixelFormat format, NSUInteger width, NSUInteger height)
+{
+	static _Atomic unsigned shown;
+	const uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surface), plane0 = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface, 0),
+			chroma = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface, 1);
+	char siting[40], matrix[40] = "none", why[300] = "";
+	const unsigned where = hm_ycbcr_siting(surface, siting, sizeof(siting));
+	hakios_metal_texture *t = NULL;
+	CFTypeRef m = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceYCbCrMatrix"));
+
+	if (m != NULL) {
+		if (CFGetTypeID(m) == CFStringGetTypeID()) CFStringGetCString((CFStringRef)m, matrix, sizeof(matrix), kCFStringEncodingUTF8);
+		CFRelease(m);
+	}
+	if (!hm_ycbcr_gpu()) {
+		snprintf(why, sizeof(why), "metal_ycbcrgpu is off");
+	} else if (base == 0 || chroma < base) {
+		snprintf(why, sizeof(why), "no address for its planes");
+	} else {
+		t = hakios_metal_texture_new_ycbcr(gpu, IOSurfaceGetID(surface), (unsigned)width, (unsigned)height, (uint64_t)(chroma - base),
+						   (unsigned)IOSurfaceGetBytesPerRowOfPlane(surface, 1), where);
+		if (t == NULL) snprintf(why, sizeof(why), "%s", hakios_metal_error());
+	}
+	if (atomic_fetch_add(&shown, 1) < 8 || (t == NULL && hm_ycbcr_gpu())) {
+		hm_print("ycbcr: IOSurface %u '%c%c%c%c' %zux%zu as format %lu, texture %lux%lu: plane 0 at +%lu, %zu bytes a row; plane 1 at +%lu, %zu "
+			 "bytes a row, %zux%zu; matrix %s, chroma location %s (siting %u): %s%s\n", IOSurfaceGetID(surface),
+			 (char)(IOSurfaceGetPixelFormat(surface) >> 24), (char)(IOSurfaceGetPixelFormat(surface) >> 16),
+			 (char)(IOSurfaceGetPixelFormat(surface) >> 8), (char)IOSurfaceGetPixelFormat(surface), IOSurfaceGetWidth(surface),
+			 IOSurfaceGetHeight(surface), (unsigned long)format, (unsigned long)width, (unsigned long)height,
+			 (unsigned long)(plane0 - base), IOSurfaceGetBytesPerRowOfPlane(surface, 0), (unsigned long)(chroma - base),
+			 IOSurfaceGetBytesPerRowOfPlane(surface, 1), IOSurfaceGetWidthOfPlane(surface, 1), IOSurfaceGetHeightOfPlane(surface, 1), matrix,
+			 siting, where, t != NULL ? "read by the GPU from the surface" : "read through the RGBA8 copy: ", why);
+	}
+	return t;
+}
+
 static BOOL
 hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 {
@@ -5218,10 +5340,14 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 			return hm_refuse_texture([NSString stringWithFormat:@"a %lux%lu RGBA8 copy of a two-plane surface: %s",
 							    (unsigned long)[descriptor width], (unsigned long)[descriptor height], hakios_metal_error()]);
 		}
-		HM_ONCE("a two-plane YCbCr surface sampled as format %lu is read through an RGBA8 copy converted from it, made again "
-			"when the surface changes\n", (unsigned long)[descriptor pixelFormat]);
+		hakios_metal_texture *direct = hm_ycbcr_direct(_gpu, surface, [descriptor pixelFormat], [descriptor width], [descriptor height]);
+
+		if (direct == NULL) {
+			HM_ONCE("a two-plane YCbCr surface sampled as format %lu is read through an RGBA8 copy converted from it, made again "
+				"when the surface changes\n", (unsigned long)[descriptor pixelFormat]);
+		}
 		t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:copy descriptor:descriptor usage:MTLTextureUsageShaderRead];
-		[t hakiosShadowYCbCr:surface format:[descriptor pixelFormat]];
+		[t hakiosShadowYCbCr:surface format:[descriptor pixelFormat] direct:direct];
 		return t;
 	} else {
 		/* A surface is drawn into whatever usage its texture was asked with: CoreAnimation renders a material's
@@ -5712,6 +5838,9 @@ HM_REFUSES_OUT_LOUD
 	if (_turnedSurface != NULL) {
 		hakios_metal_texture_free(_turnedSurface);
 	}
+	if (_ycbcrDirect != NULL) {
+		hakios_metal_texture_free(_ycbcrDirect);
+	}
 	[_parent release];
 	if (_deallocator != nil) {
 		_deallocator(_deallocBytes, _deallocLength);
@@ -5721,7 +5850,17 @@ HM_REFUSES_OUT_LOUD
 	[super dealloc];
 }
 
-- (hakios_metal_texture *)hakiosTexture { return _texture; }
+/* (a YCbCr surface the GPU reads where it lies has its copy made from it only when something else takes the copy:
+ * whatever asks for the texture here but a fragment draw -- a blit, a compute kernel, an argument buffer -- gets it
+ * refreshed; the fragment draw takes it as it is, and refreshes it itself if it samples it) */
+- (hakios_metal_texture *)hakiosTexture
+{
+	if (_ycbcrDirect != NULL) [self hakiosRefreshShadow];
+	return _texture;
+}
+- (hakios_metal_texture *)hakiosTextureAsIs { return _texture; }
+- (hakios_metal_texture *)hakiosYcbcrDirect { return _parent == nil ? _ycbcrDirect : NULL; }   /* (a view reads the copy) */
+- (unsigned)hakiosYcbcrCode { return _ycbcrCode; }
 
 - (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length
 {
@@ -5918,7 +6057,10 @@ HM_REFUSES_OUT_LOUD
  * here, from the surface's matrix (its IOSurfaceYCbCrMatrix attachment: BT.709 when it says so, BT.601 otherwise,
  * which is what the wallpaper's own HEIC declares) and range, made again when the surface's seed moves as the other
  * copies are. Each 2x2 block of luma takes its one chroma sample (the 4:2:0 siting). */
-- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format
+/* With DIRECT (metal_ycbcrgpu=1: the surface as the GPU reads it) the copy is not made now: a draw samples DIRECT, and
+ * the copy is made from the surface the first time something reads it instead (-hakiosRefreshShadow, as for any copy);
+ * the matrix then knows BT.2020 too, which the stage's conversion and this copy apply alike. */
+- (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format direct:(hakios_metal_texture *)direct
 {
 	CFTypeRef matrix = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceYCbCrMatrix"));
 
@@ -5927,11 +6069,22 @@ HM_REFUSES_OUT_LOUD
 	if (matrix != NULL) {
 		if (CFGetTypeID(matrix) == CFStringGetTypeID() && CFStringFind((CFStringRef)matrix, CFSTR("709"), 0).location != kCFNotFound) {
 			_ycbcr = 2;
+		} else if (direct != NULL && CFGetTypeID(matrix) == CFStringGetTypeID() &&
+			   CFStringFind((CFStringRef)matrix, CFSTR("2020"), 0).location != kCFNotFound) {
+			_ycbcr = 3;
 		}
 		CFRelease(matrix);
 	}
 	_ycbcrFull = IOSurfaceGetPixelFormat(surface) != 0x34323076;   /* not '420v' */
-	[self hakiosShadow:surface];
+	if (direct == NULL) {
+		[self hakiosShadow:surface];
+		return;
+	}
+	_ycbcrDirect = direct;
+	_ycbcrCode = format == (MTLPixelFormat)540 ? 0 : HAKIOS_METAL_YCBCR_CODE(_ycbcr - 1, !_ycbcrFull);
+	[self hakiosSetIOSurface:surface plane:0];
+	_shadow = YES;
+	_shadowSeed = IOSurfaceGetSeed(surface) + 1;   /* (not the surface's seed: the first refresh copies) */
 }
 
 static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f); }
@@ -5943,7 +6096,8 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	const size_t lumaRow = IOSurfaceGetBytesPerRowOfPlane(_iosurface, 0), chromaRow = IOSurfaceGetBytesPerRowOfPlane(_iosurface, 1);
 	const size_t cw = IOSurfaceGetWidthOfPlane(_iosurface, 1), ch = IOSurfaceGetHeightOfPlane(_iosurface, 1);
 	/* Kr, Kb of the matrix; G from Y = Kr R + Kg G + Kb B */
-	const float kr = _ycbcr == 2 ? 0.2126f : 0.299f, kb = _ycbcr == 2 ? 0.0722f : 0.114f, kg = 1.0f - kr - kb;
+	const float kr = _ycbcr == 2 ? 0.2126f : _ycbcr == 3 ? 0.2627f : 0.299f, kb = _ycbcr == 2 ? 0.0722f : _ycbcr == 3 ? 0.0593f : 0.114f;
+	const float kg = 1.0f - kr - kb;
 	const float ys = _ycbcrFull ? 1.0f : 255.0f / 219.0f, yo = _ycbcrFull ? 0.0f : 16.0f, cs = _ycbcrFull ? 1.0f : 255.0f / 224.0f;
 	uint8_t *rows = malloc(w * h * 4);
 
@@ -6267,6 +6421,9 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 {
 	if (![self hakiosRegion:region level:level slice:slice bytes:bytes isFor:"getBytes"]) {
 		return;
+	}
+	if (_ycbcrDirect != NULL) {
+		[self hakiosRefreshShadow];   /* (the copy of a surface the GPU reads where it lies is made when it is read) */
 	}
 	if (hm_layered(hakios_metal_texture_type(_texture))) {
 		if (hakios_metal_texture_read_3d(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y, (unsigned)slice, (unsigned)region.size.width,
@@ -7354,7 +7511,8 @@ static struct {
 	uint64_t lastTpidr;
 	double sampledBytes[6];   /* metal_fps=timeline: the bound fragment textures' sizes, by hakiosStorageKind */
 	struct { unsigned w, h, origin; double bytes; } bySize[16];
-} hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}} };
+	unsigned ycbcrGpu, ycbcrCopies;   /* metal_ycbcrgpu=1: YCbCr textures drawn from their surfaces, and through their copies */
+} hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}}, 0, 0 };
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
  * what each cost such passes before (hakios_metal_cb_set_gmem_tuned). Off by default: for CoreAnimation it won nothing
@@ -7736,6 +7894,11 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			hm_print("fps: ... surface copies on the processor: %u taken from their surfaces in %.0f ms, %u written back in %.0f ms\n",
 				 hm_fps.shadowIns, hm_fps.shadowIn * 1e3, hm_fps.shadowOuts, hm_fps.shadowOut * 1e3);
 		}
+		if (hm_fps.ycbcrGpu + hm_fps.ycbcrCopies != 0) {
+			hm_print("fps: ... YCbCr textures drawn: %u read by the GPU from their surfaces, %u through their copies\n", hm_fps.ycbcrGpu,
+				 hm_fps.ycbcrCopies);
+			hm_fps.ycbcrGpu = hm_fps.ycbcrCopies = 0;
+		}
 		hm_fps.passes = hm_fps.draws = hm_fps.dispatches = hm_fps.copies = hm_fps.gmemPasses = hm_fps.tiles = 0;
 		hm_fps.shadowIn = hm_fps.shadowOut = 0;
 		hm_fps.shadowIns = hm_fps.shadowOuts = 0;
@@ -7747,6 +7910,23 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 		hm_fps.waits = hm_fps.drawCalls = 0;
 		hm_fps.drawCpu = hm_fps.coreCpu = 0;
 	}
+	pthread_mutex_unlock(&hm_fps.lock);
+}
+
+/* metal_ycbcrgpu=1: a draw sampled GPU YCbCr textures where they lie and COPIES through their copies */
+static void
+hm_ycbcr_count(unsigned gpu, unsigned copies)
+{
+	if (hm_ft_mode()) {
+		atomic_fetch_add(&hm_ft_work[HM_FT_W_YCBCR_GPU].n, gpu);
+		atomic_fetch_add(&hm_ft_work[HM_FT_W_YCBCR_COPY].n, copies);
+	}
+	if (!hm_fps_on()) {
+		return;
+	}
+	pthread_mutex_lock(&hm_fps.lock);
+	hm_fps.ycbcrGpu += gpu;
+	hm_fps.ycbcrCopies += copies;
 	pthread_mutex_unlock(&hm_fps.lock);
 }
 
@@ -8051,9 +8231,11 @@ hm_completed(hakios_metal_cb *cb, void *context)
 					 (double)(atomic_load(&hm_ft_work[k].ns) - ft->work0[k][1]) / 1e6,
 					 (double)(atomic_load(&hm_ft_work[k].bytes) - ft->work0[k][2]) / 1e6);
 			}
-			hm_ft_line(ft, "commit t=%.6f label=%s textures=%s surfaces=%s buffers=%s uploads=%s pipelines=%s copies=%s\n", _committedAt,
+			hm_ft_line(ft, "commit t=%.6f label=%s textures=%s surfaces=%s buffers=%s uploads=%s pipelines=%s copies=%s%s%llu/%llu\n", _committedAt,
 				   hm_ft_qs(label, sizeof(label), [self label]), work[HM_FT_W_TEXTURE], work[HM_FT_W_SURFACE], work[HM_FT_W_BUFFER],
-				   work[HM_FT_W_UPLOAD], work[HM_FT_W_PIPELINE], work[HM_FT_W_COPY]);
+				   work[HM_FT_W_UPLOAD], work[HM_FT_W_PIPELINE], work[HM_FT_W_COPY], hm_ycbcr_gpu() ? " ycbcr=" : "",
+				   hm_ycbcr_gpu() ? (unsigned long long)(atomic_load(&hm_ft_work[HM_FT_W_YCBCR_GPU].n) - ft->work0[HM_FT_W_YCBCR_GPU][0]) : 0ull,
+				   hm_ycbcr_gpu() ? (unsigned long long)(atomic_load(&hm_ft_work[HM_FT_W_YCBCR_COPY].n) - ft->work0[HM_FT_W_YCBCR_COPY][0]) : 0ull);
 		}
 	}
 	/* each turned framebuffer drawn into, laid into its surface by the 2D engine after everything that drew it */
@@ -9291,6 +9473,9 @@ HM_REFUSES_OUT_LOUD
 	for (unsigned i = 0; i < _specCount; i++) {
 		if (_specPrograms[i] != NULL) hakios_metal_program_free(_specPrograms[i]);
 	}
+	for (unsigned i = 0; i < _ycbcrCount; i++) {
+		if (_ycbcrPrograms[i] != NULL) hakios_metal_program_free(_ycbcrPrograms[i]);
+	}
 	free(_specKeys);
 	free(_specMasks);
 	[_fsAir release];
@@ -9347,24 +9532,28 @@ hm_spec_off(void)
 - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count
 {
 	_specBinding = -1;
-	if (hm_spec_off() || hakios_metal_program_stage_words(_program, 1) < 4096) return;
-	for (unsigned i = 0; i < hakios_metal_program_resource_count(_program, 1); i++) {
-		unsigned kind, index, size;
+	if (!hm_spec_off() && hakios_metal_program_stage_words(_program, 1) >= 4096) {
+		for (unsigned i = 0; i < hakios_metal_program_resource_count(_program, 1); i++) {
+			unsigned kind, index, size;
 
-		if (hakios_metal_program_resource(_program, 1, i, &kind, &index, &size) == 0 && kind == HAKIOS_METAL_RESOURCE_CONSTANT_BUFFER &&
-		    size != 0 && size <= 256 && (_specBinding < 0 || (unsigned)index < (unsigned)_specBinding)) {
-			_specBinding = (int)index;
-			_specLength = size;
+			if (hakios_metal_program_resource(_program, 1, i, &kind, &index, &size) == 0 && kind == HAKIOS_METAL_RESOURCE_CONSTANT_BUFFER &&
+			    size != 0 && size <= 256 && (_specBinding < 0 || (unsigned)index < (unsigned)_specBinding)) {
+				_specBinding = (int)index;
+				_specLength = size;
+			}
 		}
 	}
-	if (_specBinding < 0) return;
-	_specKeys = calloc(HM_SPEC_MOST, _specLength);
-	_specMasks = malloc((size_t)HM_SPEC_MOST * _specLength);
-	if (_specKeys == NULL || _specMasks == NULL) {
-		_specBinding = -1;
-		return;
+	if (_specBinding >= 0) {
+		_specKeys = calloc(HM_SPEC_MOST, _specLength);
+		_specMasks = malloc((size_t)HM_SPEC_MOST * _specLength);
+		if (_specKeys == NULL || _specMasks == NULL) {
+			_specBinding = -1;
+		} else {
+			memset(_specMasks, 0xff, (size_t)HM_SPEC_MOST * _specLength);
+		}
 	}
-	memset(_specMasks, 0xff, (size_t)HM_SPEC_MOST * _specLength);
+	/* (an uber shader's function is kept to specialise it; with metal_ycbcrgpu=1 every pipeline's, for its YCbCr slots) */
+	if (_specBinding < 0 && !hm_ycbcr_gpu()) return;
 	_specLock = OS_UNFAIR_LOCK_INIT;
 	_fsAir = [air retain];
 	_fsConstantCount = count < 64 ? count : 64;
@@ -9409,11 +9598,29 @@ hm_spec_exact(void)
 	return exact != 0;
 }
 
-- (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
+/* the one queue a pipeline's programs are compiled on, after it is made (a frame must not wait for a compilation) */
+static dispatch_queue_t
+hm_spec_queue(void)
 {
 	static dispatch_queue_t compiling;
 	static dispatch_once_t once;
 
+	dispatch_once(&once, ^{
+		compiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
+	});
+	return compiling;
+}
+
+- (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
+{
+	return [self hakiosProgramFor:buffers offsets:offsets count:count slot:NULL];
+}
+
+/* ...and SLOT the specialisation it is (-1: the pipeline's own program) */
+- (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
+				      slot:(int *)slotOut
+{
+	if (slotOut != NULL) *slotOut = -1;
 	if (_specBinding < 0 || (unsigned)_specBinding >= count || buffers[_specBinding] == NULL) return _program;
 	const uint8_t *bytes = (const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]);
 	const uint64_t length = hakios_metal_buffer_length(buffers[_specBinding]), at = offsets[_specBinding];
@@ -9463,7 +9670,10 @@ hm_spec_exact(void)
 		}
 	}
 	if (slot >= 0) {
-		if (_specPrograms[slot] != NULL) found = _specPrograms[slot];
+		if (_specPrograms[slot] != NULL) {
+			found = _specPrograms[slot];
+			if (slotOut != NULL) *slotOut = slot;
+		}
 	} else if (_specCount < HM_SPEC_MOST) {
 		slot = (int)_specCount++;
 		_specHashes[slot] = hash;
@@ -9479,11 +9689,8 @@ hm_spec_exact(void)
 	if (start) {
 		NSData *content = [NSData dataWithBytes:key length:_specLength];
 
-		dispatch_once(&once, ^{
-			compiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
-		});
 		[self retain];
-		dispatch_async(compiling, ^{
+		dispatch_async(hm_spec_queue(), ^{
 			struct timespec t0, t1;
 
 			clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -9509,6 +9716,63 @@ hm_spec_exact(void)
 				_specMasked[slot] = YES;
 			}
 			os_unfair_lock_unlock(&_specLock);
+			[self release];
+		});
+	}
+	return found;
+}
+
+/* metal_ycbcrgpu=1. An uber shader's YCbCr program is compiled over the specialisation the draw's buffer picks, once
+ * that one is compiled (until then the draw has the copies and the pipeline's own program, as without the switch); a
+ * pipeline that is not one, over its own fragment function. Compiled on the pipeline's queue: a frame never waits. */
+- (hakios_metal_program *)hakiosYcbcrProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
+					   word:(uint64_t)word
+{
+	int spec = -1;
+	hakios_metal_program *base = [self hakiosProgramFor:buffers offsets:offsets count:count slot:&spec];
+	hakios_metal_program *found = NULL;
+	BOOL start = NO;
+	unsigned at = 0;
+	NSData *content = nil;
+
+	if (_fsAir == nil || word == 0 || (_specBinding >= 0 && spec < 0)) return NULL;
+	os_unfair_lock_lock(&_specLock);
+	for (at = 0; at < _ycbcrCount; at++) {
+		if (_ycbcrWords[at] == word && _ycbcrSpecs[at] == spec) break;
+	}
+	if (at < _ycbcrCount) {
+		found = _ycbcrPrograms[at];
+	} else if (_ycbcrCount < HM_YCBCR_MOST) {
+		_ycbcrWords[at] = word;
+		_ycbcrSpecs[at] = spec;
+		_ycbcrPrograms[at] = NULL;
+		_ycbcrCount++;
+		start = YES;
+		/* (the bytes its specialisation was compiled for, under the lock that keeps them) */
+		if (spec >= 0) content = [[NSData alloc] initWithBytes:_specKeys + (size_t)spec * _specLength length:_specLength];
+	} else {
+		HM_ONCE("ycbcr: a pipeline has %d YCbCr programs and is asked for another: those draws sample the copies\n", HM_YCBCR_MOST);
+	}
+	os_unfair_lock_unlock(&_specLock);
+	if (start) {
+		[self retain];
+		dispatch_async(hm_spec_queue(), ^{
+			const double began = hm_now();
+			hakios_metal_program *p = hakios_metal_program_specialize_ycbcr(_program, [_fsAir bytes], [_fsAir length], _fsConstants,
+										       _fsConstantCount, spec >= 0 ? (unsigned)_specBinding : 0,
+										       [content bytes], [content length], word);
+
+			if (p == NULL) {
+				hm_print("ycbcr: %s for YCbCr slots %#llx: %s; its draws sample the copies\n", hakios_metal_program_name(base),
+					 (unsigned long long)word, hakios_metal_error());
+			} else {
+				hm_print("ycbcr: %s compiled for YCbCr slots %#llx%s in %.0f ms\n", hakios_metal_program_name(base), (unsigned long long)word,
+					 spec >= 0 ? " over its specialisation" : "", (hm_now() - began) * 1e3);
+			}
+			os_unfair_lock_lock(&_specLock);
+			_ycbcrPrograms[at] = p;
+			os_unfair_lock_unlock(&_specLock);
+			[content release];
 			[self release];
 		});
 	}
@@ -9833,7 +10097,10 @@ hm_spec_exact(void)
 	[texture retain];
 	[table[index] release];
 	table[index] = texture;
-	[(HakiosMetalTexture *)texture hakiosRefreshShadow];
+	/* (a surface a fragment draw reads where it lies: its copy is refreshed by the draw that needs it, if one does) */
+	if (vertex || [(HakiosMetalTexture *)texture hakiosYcbcrDirect] == NULL) {
+		[(HakiosMetalTexture *)texture hakiosRefreshShadow];
+	}
 	if (texture != nil && index + 1 > *highest) {
 		*highest = (unsigned)index + 1;
 	}
@@ -10471,10 +10738,10 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 		fs[i] = _fsBuffers[i] != nil ? [_fsBuffers[i] hakiosBuffer] : NULL;
 	}
 	for (unsigned i = 0; i < _fsHighestTexture; i++) {
-		fsTex[i] = _fsTextures[i] != nil ? [_fsTextures[i] hakiosTexture] : NULL;
+		fsTex[i] = _fsTextures[i] != nil ? [_fsTextures[i] hakiosTextureAsIs] : NULL;
 		if (_fsTextures[i] != nil && hm_timeline_on()) {
 			unsigned kind = [_fsTextures[i] hakiosStorageKind];
-			const unsigned origin = hakios_metal_texture_origin([_fsTextures[i] hakiosTexture]);
+			const unsigned origin = hakios_metal_texture_origin([_fsTextures[i] hakiosTextureAsIs]);
 			if (origin == 2) kind = 2;   /* (over a buffer's rows: counted where managed was, which iOS has not) */
 			if (origin == 3) kind = 5;   /* (compressed) */
 			const double bytes = 4.0 * [_fsTextures[i] width] * [_fsTextures[i] height];
@@ -10508,7 +10775,41 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 		hakios_metal_cb_set_vertex_textures(cb, vsTex, _vsHighestTexture, vsSamp, _vsHighestSampler);
 		_vsTexturesTold = YES;
 	}
-	hakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];
+	hakios_metal_program *program = NULL;
+
+	/* metal_ycbcrgpu=1: a two-plane YCbCr surface bound to the fragment stage is sampled where it lies -- 540 always,
+	 * 500 when the pipeline's program for these YCbCr slots is compiled; until then, and past slot 16, its copy */
+	if (hm_ycbcr_gpu()) {
+		uint64_t word = 0;
+		unsigned gpu = 0, copies = 0;
+
+		for (unsigned i = 0; i < _fsHighestTexture; i++) {
+			hakios_metal_texture *direct = _fsTextures[i] != nil ? [_fsTextures[i] hakiosYcbcrDirect] : NULL;
+			const unsigned code = direct != NULL ? [_fsTextures[i] hakiosYcbcrCode] : 0;
+
+			if (direct != NULL && code == 0) {
+				fsTex[i] = direct;
+				gpu++;
+			} else if (direct != NULL && i < HAKIOS_METAL_YCBCR_SLOTS) {
+				word |= (uint64_t)code << (3 * i);
+			}
+		}
+		if (word != 0) program = [_pipeline hakiosYcbcrProgramFor:fs offsets:_fsOffsets count:_fsHighest word:word];
+		for (unsigned i = 0; i < _fsHighestTexture; i++) {
+			hakios_metal_texture *direct = _fsTextures[i] != nil ? [_fsTextures[i] hakiosYcbcrDirect] : NULL;
+
+			if (direct == NULL || [_fsTextures[i] hakiosYcbcrCode] == 0) continue;
+			if (program != NULL && i < HAKIOS_METAL_YCBCR_SLOTS) {
+				fsTex[i] = direct;
+				gpu++;
+			} else {
+				[_fsTextures[i] hakiosRefreshShadow];   /* (its bind left the copy as it was) */
+				copies++;
+			}
+		}
+		if (gpu + copies != 0) hm_ycbcr_count(gpu, copies);
+	}
+	if (program == NULL) program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];
 
 	ftProgram = program;
 	hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
