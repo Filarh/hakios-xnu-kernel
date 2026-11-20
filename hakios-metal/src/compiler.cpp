@@ -27,6 +27,29 @@
 
 namespace hakios::metal {
 
+bool ycbcrMatrix(uint32_t code, float m[3][4]) {
+    if (code < 1 || code > 6) return false;
+    const uint32_t model = (code - 1) / 2;
+    const bool narrow = ((code - 1) & 1) != 0;
+    // Kr, Kb of BT.601, BT.709 and BT.2020 (Kg = 1 - Kr - Kb)
+    static const float kKr[3] = {0.299f, 0.2126f, 0.2627f}, kKb[3] = {0.114f, 0.0722f, 0.0593f};
+    const float kr = kKr[model], kb = kKb[model], kg = 1.0f - kr - kb;
+    // Y' = (Y - yo) * ys, C' = (C - 128/255) * cs, all normalised
+    const float ys = narrow ? 255.0f / 219.0f : 1.0f, yo = narrow ? 16.0f / 255.0f : 0.0f, cs = narrow ? 255.0f / 224.0f : 1.0f;
+    const float co = 128.0f / 255.0f;
+    // R = Y' + 2 (1 - Kr) Cr'; B = Y' + 2 (1 - Kb) Cb'; G = Y' - (2 Kr (1 - Kr) / Kg) Cr' - (2 Kb (1 - Kb) / Kg) Cb'
+    const float rCr = 2.0f * (1.0f - kr), bCb = 2.0f * (1.0f - kb);
+    const float gCr = -2.0f * kr * (1.0f - kr) / kg, gCb = -2.0f * kb * (1.0f - kb) / kg;
+    const float cr[3] = {rCr, gCr, 0.0f}, cb[3] = {0.0f, gCb, bCb};
+    for (int c = 0; c < 3; c++) {
+        m[c][0] = cr[c] * cs;
+        m[c][1] = ys;
+        m[c][2] = cb[c] * cs;
+        m[c][3] = -yo * ys - (cr[c] + cb[c]) * cs * co;
+    }
+    return true;
+}
+
 #ifndef HAKIOS_METAL_MESA
 
 bool hasCompiler() { return false; }
@@ -36,7 +59,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why
     return nullptr;
 }
 
-std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*) {
+std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*, uint64_t) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
 }
@@ -703,6 +726,69 @@ bool usesSubgroup(nir_shader* nir) {
     return false;
 }
 
+// A sample of a YCbCr slot (compiler.hpp: kYcbcrSlotBits) converted to RGB after the instruction, as turnip's
+// lower_tex_ycbcr does it (tu_shader.cc:595-616): the sample at fp32, the slot's matrix, clamped, back to the
+// sample's width, and every later use of the sample reading the converted value. The texture's swizzle gives the
+// planes as (Cr, Y, Cb, 1), so alpha passes as it is. What reads a texel without filtering it (txf) is converted too;
+// what asks about the texture (txs, levels, lod) is not. A gather takes one channel of four texels, which no matrix
+// turns into a colour: refused, and the caller samples the RGB copy instead.
+struct YcbcrLowering {
+    uint64_t word;
+    std::string refusal;
+};
+bool lowerYcbcrSample(nir_builder* b, nir_instr* instr, void* data) {
+    YcbcrLowering* l = static_cast<YcbcrLowering*>(data);
+    if (instr->type != nir_instr_type_tex) return false;
+    nir_tex_instr* tex = nir_instr_as_tex(instr);
+    float m[3][4];
+    if (!ycbcrMatrix(ycbcrCodeOf(l->word, tex->texture_index), m)) return false;
+    switch (tex->op) {
+    case nir_texop_tex:
+    case nir_texop_txb:
+    case nir_texop_txl:
+    case nir_texop_txd:
+    case nir_texop_txf:
+        break;
+    case nir_texop_txs:
+    case nir_texop_query_levels:
+    case nir_texop_lod:
+    case nir_texop_texture_samples:
+        return false;
+    default:
+        if (l->refusal.empty()) l->refusal = "texture " + std::to_string(tex->texture_index) + " is YCbCr and is read by a texture operation other than a sample or a fetch";
+        return false;
+    }
+    if (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float || tex->def.num_components < 3 || tex->is_shadow) {
+        if (l->refusal.empty()) l->refusal = "texture " + std::to_string(tex->texture_index) + " is YCbCr and its sample is not three floats or more";
+        return false;
+    }
+    b->cursor = nir_after_instr(instr);
+    nir_def* s = &tex->def;
+    const unsigned bits = s->bit_size;
+    nir_def* f = bits != 32 ? nir_f2f32(b, s) : s;
+    nir_def* crYCb[3] = {nir_channel(b, f, 0), nir_channel(b, f, 1), nir_channel(b, f, 2)};
+    nir_def* out[4];
+    for (int c = 0; c < 3; c++) {
+        nir_def* v = nir_imm_float(b, m[c][3]);
+        for (int k = 0; k < 3; k++) {
+            if (m[c][k] != 0.0f) v = nir_ffma_imm1(b, crYCb[k], m[c][k], v);
+        }
+        out[c] = nir_fsat(b, v);
+    }
+    for (unsigned c = 3; c < s->num_components; c++) out[c] = nir_channel(b, f, c);
+    nir_def* rgb = nir_vec(b, out, s->num_components);
+    if (bits != 32) rgb = nir_f2fN(b, rgb, bits);
+    nir_def_rewrite_uses_after(s, rgb, rgb->parent_instr);
+    return true;
+}
+bool lowerYcbcr(nir_shader* nir, uint64_t word, std::string* why) {
+    if (word == 0) return true;
+    YcbcrLowering l{word, {}};
+    nir_shader_instructions_pass(nir, lowerYcbcrSample, nir_metadata_control_flow, &l);
+    if (!l.refusal.empty()) return refuse(why, std::string(nir->info.name ? nir->info.name : "the stage") + ": " + l.refusal);
+    return true;
+}
+
 bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     ir3_compiler* compiler = theCompiler();
     nir_shader* nir = t.nir;
@@ -1131,7 +1217,7 @@ std::unique_ptr<CompiledKernel> compileAirOnce(const void* bitcode, size_t size,
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known, std::vector<uint8_t>* reads);
+                                                const KnownBuffer* known, std::vector<uint8_t>* reads, uint64_t ycbcr);
 }  // namespace
 
 // A stage compiled as turnip compiles it, unless that spills: ir3's preamble pass hoists what is uniform into a
@@ -1186,7 +1272,8 @@ const char* const kCacheBuild = __DATE__ " " __TIME__;
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
 // HAKIOS_METAL_CACHE, and the read-only ones HAKIOS_METAL_CACHE_SEED (':' between them) -- stages compiled on an
 // earlier boot and put into the system image, looked in after the writable one and never written.
-std::string stageCacheName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
+std::string stageCacheName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known,
+                           uint64_t ycbcr = 0) {
     const char* dir = getenv("HAKIOS_METAL_CACHE");
     const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
     if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
@@ -1209,6 +1296,12 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
     if (known != nullptr) {
         mix(&known->binding, sizeof(known->binding));
         mix(known->bytes.data(), known->bytes.size());
+    }
+    // (a stage with YCbCr slots: their word too; none, the name it always had)
+    if (ycbcr != 0) {
+        const char tag[] = "ycbcr";
+        mix(tag, sizeof(tag));
+        mix(&ycbcr, sizeof(ycbcr));
     }
     char name[64];
     snprintf(name, sizeof(name), "/%016llx%016llx.stage", (unsigned long long)h[0], (unsigned long long)h[1]);
@@ -1350,12 +1443,13 @@ namespace {
 // The known buffers a function was compiled for, kept beside its stages: one file a function (its bitcode, constants,
 // IBO base, the buffer's binding and length), a record a compilation -- the bytes the compilation read (a mask), their
 // values, and the name of the stage's file. A buffer that holds those values where the mask is set is that stage.
-std::string knownIndexName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer& known) {
+std::string knownIndexName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer& known,
+                           uint64_t ycbcr = 0) {
     KnownBuffer shape;
     shape.binding = known.binding;
     const uint32_t length = uint32_t(known.bytes.size());
     shape.bytes.assign(reinterpret_cast<const uint8_t*>(&length), reinterpret_cast<const uint8_t*>(&length) + 4);
-    std::string name = stageCacheName(bitcode, size, constants, iboBase, &shape);
+    std::string name = stageCacheName(bitcode, size, constants, iboBase, &shape, ycbcr);
     if (name.size() > 6) name.replace(name.size() - 6, 6, ".known");   // (".stage")
     return name;
 }
@@ -1427,8 +1521,10 @@ namespace {
 // hash and length, IBO_BASE, the constants as supplied, and for a known buffer its binding, the mask of the bytes the
 // compilation read and their values (0 elsewhere: what was not read decided nothing, and compiling the values alone
 // gives the same stage and the same mask). Its name is a hash of its bytes; the bitcode lies beside it once, by hash.
+// A stage with YCbCr slots is a version 2 recipe, the same with the slots' word after the values; any other is written
+// as version 1, byte for byte as before, so that the recipes a phone holds keep their names.
 constexpr uint32_t kRecipeMagic = 0x43524d48;   // "HMRC"
-constexpr uint32_t kRecipeVersion = 1;
+constexpr uint32_t kRecipeVersion = 1, kRecipeVersionYcbcr = 2;
 enum : uint32_t { kRecipeStage = 0, kRecipeKernel = 1 };
 
 struct Hash128 {
@@ -1497,12 +1593,13 @@ struct Recipe {
     bool known = false;
     uint32_t binding = 0;
     std::vector<uint8_t> mask, values;
+    uint64_t ycbcr = 0;
 };
 
 std::string recipeBytes(const Recipe& r) {
     CacheWriter w;
     w.u32(kRecipeMagic);
-    w.u32(kRecipeVersion);
+    w.u32(r.ycbcr != 0 ? kRecipeVersionYcbcr : kRecipeVersion);
     w.u32(r.kind);
     w.raw(&r.bitcode.a, 8);
     w.raw(&r.bitcode.b, 8);
@@ -1518,12 +1615,15 @@ std::string recipeBytes(const Recipe& r) {
     w.u32(uint32_t(r.mask.size()));
     w.raw(r.mask.data(), r.mask.size());
     w.raw(r.values.data(), r.values.size());
+    if (r.ycbcr != 0) w.raw(&r.ycbcr, 8);
     return w.out;
 }
 
 bool recipeParse(const std::string& data, Recipe* r) {
     CacheReader in{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
-    if (in.u32() != kRecipeMagic || in.u32() != kRecipeVersion) return false;
+    if (in.u32() != kRecipeMagic) return false;
+    const uint32_t version = in.u32();
+    if (version != kRecipeVersion && version != kRecipeVersionYcbcr) return false;
     r->kind = in.u32();
     in.raw(&r->bitcode.a, 8);
     in.raw(&r->bitcode.b, 8);
@@ -1544,6 +1644,8 @@ bool recipeParse(const std::string& data, Recipe* r) {
     r->values.resize(length);
     in.raw(r->mask.data(), length);
     in.raw(r->values.data(), length);
+    r->ycbcr = 0;
+    if (version == kRecipeVersionYcbcr && (!in.raw(&r->ycbcr, 8) || r->ycbcr == 0 || r->kind != kRecipeStage)) return false;
     return in.ok && in.p == in.end && (r->kind == kRecipeStage || r->kind == kRecipeKernel) && r->bitcodeSize != 0;
 }
 
@@ -1553,7 +1655,7 @@ std::set<std::string> gRecipesNoted;   // in this process: each recipe looked fo
 // the recipe of a compilation that gave a result (compiled now, or found), in the writable cache's recipes/; READS the
 // mask of the known buffer's bytes the compilation read (all of them when not known: a stage of a cache that kept none)
 void recipeNote(uint32_t kind, const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known,
-                const std::vector<uint8_t>* reads) {
+                const std::vector<uint8_t>* reads, uint64_t ycbcr = 0) {
     const char* dir = getenv("HAKIOS_METAL_CACHE");
     if (dir == nullptr || dir[0] == 0 || bitcode == nullptr || size == 0) return;
     Recipe r;
@@ -1562,6 +1664,7 @@ void recipeNote(uint32_t kind, const void* bitcode, size_t size, const FunctionC
     r.bitcodeSize = size;
     r.iboBase = iboBase;
     r.constants = constants;
+    r.ycbcr = ycbcr;
     if (known != nullptr) {
         r.known = true;
         r.binding = known->binding;
@@ -1760,7 +1863,7 @@ CompileTimes takeCompileTimes() {
 }
 
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                           const KnownBuffer* known) {
+                                           const KnownBuffer* known, uint64_t ycbcr) {
     // A stage compiled before is read from its file with the compiler left alone: the one compiler is taken for a
     // compilation only. Taken first, a pipeline whose two stages were both in the cache -- half a millisecond of
     // reading -- stood behind whatever another thread was compiling: 173 to 434 ms each on the phone, three of them
@@ -1768,10 +1871,10 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     // background.
     tCompileTimes.stages++;
     const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
-    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
+    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known, ycbcr);
     const std::string cached = stageCacheWritable(name);
     // (for a known buffer: the stages compiled for buffers that hold what this one holds where it matters)
-    const std::string index = known != nullptr && !name.empty() ? knownIndexName(bitcode, size, constants, iboBase, *known) : std::string();
+    const std::string index = known != nullptr && !name.empty() ? knownIndexName(bitcode, size, constants, iboBase, *known, ycbcr) : std::string();
     auto found = [&]() -> std::unique_ptr<CompiledStage> {
         if (std::unique_ptr<CompiledStage> s = stageCacheFind(name, cached)) {
             // (filed under the very bytes, by a build that kept no reads: it stands for these bytes and no others)
@@ -1783,7 +1886,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     if (std::unique_ptr<CompiledStage> s = found()) {
         tCompileTimes.cached++;
         tCompileTimes.loadedUs += microsecondsSince(began);
-        recipeNote(kRecipeStage, bitcode, size, constants, iboBase, known, known != nullptr ? &s->knownReads : nullptr);
+        recipeNote(kRecipeStage, bitcode, size, constants, iboBase, known, known != nullptr ? &s->knownReads : nullptr, ycbcr);
         return s;
     }
     tCompileTimes.loadedUs += microsecondsSince(began);
@@ -1801,7 +1904,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         return nullptr;
     }
     std::vector<uint8_t> reads(known != nullptr ? known->bytes.size() : 0, 0), readsWithout = reads;
-    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known, known != nullptr ? &reads : nullptr);
+    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known, known != nullptr ? &reads : nullptr, ycbcr);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
         chosen = std::move(with);
@@ -1809,7 +1912,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         theCompiler()->has_preamble = false;
         std::string whyNot;
         std::unique_ptr<CompiledStage> without =
-            compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known, known != nullptr ? &readsWithout : nullptr);
+            compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known, known != nullptr ? &readsWithout : nullptr, ycbcr);
         theCompiler()->has_preamble = true;
         // (the folding comes before the preamble pass: both compilations read the same bytes; their union, to be sure)
         for (size_t i = 0; i < reads.size(); i++) reads[i] |= readsWithout[i];
@@ -1820,7 +1923,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         chosen->knownReads = reads;
         if (!cached.empty()) knownIndexNote(index, *known, reads, name);
     }
-    if (chosen != nullptr && !cached.empty()) recipeNote(kRecipeStage, bitcode, size, constants, iboBase, known, known != nullptr ? &reads : nullptr);
+    if (chosen != nullptr && !cached.empty()) recipeNote(kRecipeStage, bitcode, size, constants, iboBase, known, known != nullptr ? &reads : nullptr, ycbcr);
     tCompileTimes.compiled++;
     tCompileTimes.compiledUs += microsecondsSince(compiling);
     return chosen;
@@ -1889,10 +1992,10 @@ WarmUpReport warmUp() {
             KnownBuffer known;
             known.binding = r.binding;
             known.bytes = r.values;
-            const std::string stage = stageCacheName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, r.known ? &known : nullptr);
+            const std::string stage = stageCacheName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, r.known ? &known : nullptr, r.ycbcr);
             bool there = cachedAnywhere(stage);
             if (!there && r.known) {
-                const std::string index = knownIndexName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, known);
+                const std::string index = knownIndexName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, known, r.ycbcr);
                 for (const std::string& d : dirs) there = there || knownIndexHas(d, index, known);
             }
             if (there) {
@@ -1909,7 +2012,7 @@ WarmUpReport warmUp() {
             KnownBuffer known;
             known.binding = r.binding;
             known.bytes = r.values;
-            made = compileStage(bitcode->data(), bitcode->size(), &why, r.constants, r.iboBase, r.known ? &known : nullptr) != nullptr;
+            made = compileStage(bitcode->data(), bitcode->size(), &why, r.constants, r.iboBase, r.known ? &known : nullptr, r.ycbcr) != nullptr;
         }
         report.compileMilliseconds += microsecondsSince(compiling) / 1000.0;
         if (made) {
@@ -1925,7 +2028,7 @@ WarmUpReport warmUp() {
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known, std::vector<uint8_t>* reads) {
+                                                const KnownBuffer* known, std::vector<uint8_t>* reads, uint64_t ycbcr) {
     Translation t;
     if (!translate(bitcode, size, t, why, constants, known, reads)) return nullptr;
     // the stage is the module's named metadata (air.vertex / air.fragment / air.kernel: air_to_nir.c module_stage)
@@ -1954,6 +2057,12 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
     out->writesMemory = writesMemoryOf(t.nir);
     if (!nullTextures(t, out->stage.k, true, why)) return nullptr;
     if (!inlineSamplersOf(t, &out->inlineSamplers, why)) return nullptr;
+    // the YCbCr slots' samples converted to RGB (after the walk: the conversion adds no texture instruction)
+    if (ycbcr != 0 && t.nir->info.stage != MESA_SHADER_FRAGMENT) {
+        refuse(why, name + ": YCbCr slots are converted in a fragment stage alone");
+        return nullptr;
+    }
+    if (!lowerYcbcr(t.nir, ycbcr, why)) return nullptr;
     // a fragment stage's device buffers past the vertex stage's in the one IBO table: every SSBO index the front end
     // emitted plus IBO_BASE, and ir3's count of them (num_ssbos, the table's extent) as far again
     if (iboBase != 0 && t.nir->info.stage == MESA_SHADER_FRAGMENT && t.nir->info.num_ssbos != 0) {

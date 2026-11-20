@@ -317,6 +317,19 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
  * descriptor and sample count come with it. NULL with the reason. */
 hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
+/* BASE again with its fragment stage (FS_BITCODE and FS_CONSTANTS, as BASE was made) compiled to convert the samples
+ * of its YCbCr texture slots to RGB: YCBCR holds 3 bits a slot (slot n at bit 3n, the first 16 slots), 0 for a slot
+ * that is not YCbCr, else HAKIOS_METAL_YCBCR_CODE(model, narrow). A texture bound at such a slot is a two-plane
+ * '420f'/'420v' surface (hakios_metal_texture_new_iosurface2) swizzled to (Cr, Y, Cb, 1)
+ * (hakios_metal_texture_new_swizzled(t, 4, 2, 3, 1)); the program samples it as RGB, the matrix in the shader
+ * (hakios-metal compiler.hpp: kYcbcrSlotBits). BYTES NULL: no known buffer, BINDING ignored; otherwise also compiled
+ * for those bytes, as hakios_metal_program_specialize. NULL with the reason: YCBCR 0, a slot read by a gather, or
+ * what hakios_metal_program_specialize refuses. */
+#define HAKIOS_METAL_YCBCR_SLOTS 16
+#define HAKIOS_METAL_YCBCR_CODE(model, narrow) (1u + 2u * (unsigned)(model) + ((narrow) ? 1u : 0u))   /* model 0 BT.601, 1 BT.709, 2 BT.2020 */
+hakios_metal_program *hakios_metal_program_specialize_ycbcr(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
+    const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length,
+    unsigned long long ycbcr);
 /* Which of the bytes a specialised PROGRAM was compiled for decided anything: MASK[i] 0xff for a byte its compilation
  * read, 0 for one it did not (a structure's padding, a field no branch taken looks at). A buffer that holds the same
  * bytes where the mask is set is drawn by this very program. Writes at most LENGTH bytes and returns how many the

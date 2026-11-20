@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -1440,5 +1441,169 @@ TEST(a_compiled_stage_comes_back_from_the_cache_and_from_a_seed) {
         for (const std::string& n : files(d)) remove((d + "/" + n).c_str());
         rmdir(d.c_str());
     }
+    rmdir(base);
+}
+
+// The YCbCr matrix of a slot (compiler.hpp: ycbcrMatrix), as the converted shader computes it -- a sample's normalised
+// (Cr, Y, Cb) through one multiply-add per term, clamped, stored to 8 bits rounded to nearest -- against the plug-in's
+// conversion on the processor (HakiosMetalCA.m -hakiosConvertYCbCr, copied here with BT.2020 beside BT.601 and 709):
+// within one step of 8 bits in every channel for every code, over every luma and a grid of chroma
+namespace {
+uint8_t cpuClamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : uint8_t(v + 0.5f); }
+void cpuYcbcr(uint32_t code, uint8_t Y, uint8_t Cb, uint8_t Cr, uint8_t out[3]) {
+    const uint32_t model = (code - 1) / 2;
+    const bool full = ((code - 1) & 1) == 0;
+    const float kr = model == 1 ? 0.2126f : model == 2 ? 0.2627f : 0.299f, kb = model == 1 ? 0.0722f : model == 2 ? 0.0593f : 0.114f, kg = 1.0f - kr - kb;
+    const float ys = full ? 1.0f : 255.0f / 219.0f, yo = full ? 0.0f : 16.0f, cs = full ? 1.0f : 255.0f / 224.0f;
+    const float y = (Y - yo) * ys, cb = (Cb - 128.0f) * cs, cr = (Cr - 128.0f) * cs;
+    const float r = y + 2.0f * (1.0f - kr) * cr, b = y + 2.0f * (1.0f - kb) * cb;
+    const float g = (y - kr * r - kb * b) / kg;
+    out[0] = cpuClamp8(r), out[1] = cpuClamp8(g), out[2] = cpuClamp8(b);
+}
+}  // namespace
+
+TEST(a_ycbcr_slots_matrix_is_the_processors_conversion_within_one_step) {
+    float m[3][4];
+    CHECK(!ycbcrMatrix(0, m));
+    CHECK(!ycbcrMatrix(7, m));
+    CHECK_EQ(ycbcrCode(0, false), 1u);
+    CHECK_EQ(ycbcrCode(2, true), 6u);
+    CHECK_EQ(ycbcrCodeOf(uint64_t(5) << 9 | 2, 3), 5u);
+    CHECK_EQ(ycbcrCodeOf(uint64_t(5) << 9 | 2, 0), 2u);
+    CHECK_EQ(ycbcrCodeOf(~0ull, kYcbcrSlots), 0u);
+    for (uint32_t code = 1; code <= 6; code++) {
+        CHECK(ycbcrMatrix(code, m));
+        uint32_t worst = 0;
+        uint64_t off = 0;
+        for (uint32_t Y = 0; Y < 256; Y++) {
+            for (uint32_t Cb = 0; Cb < 256; Cb += 3) {
+                for (uint32_t Cr = 0; Cr < 256; Cr += 3) {
+                    uint8_t want[3];
+                    cpuYcbcr(code, uint8_t(Y), uint8_t(Cb), uint8_t(Cr), want);
+                    const float s[3] = {Cr / 255.0f, Y / 255.0f, Cb / 255.0f};
+                    for (int c = 0; c < 3; c++) {
+                        float v = m[c][3];
+                        for (int k = 0; k < 3; k++) v = std::fma(s[k], m[c][k], v);
+                        v = std::min(1.0f, std::max(0.0f, v));
+                        const int got = int(std::lrint(v * 255.0f));
+                        const uint32_t d = uint32_t(std::abs(got - int(want[c])));
+                        worst = std::max(worst, d);
+                        off += d != 0;
+                    }
+                }
+            }
+        }
+        CHECK(worst <= 1);
+        std::printf("       code %u: at most %u apart from the processor's, %llu channels of %u differ\n", code, worst, (unsigned long long)off,
+                    256u * 86u * 86u * 3u);
+    }
+}
+
+// A fragment stage compiled with a YCbCr slot: the sample converted (more instructions, its clamp), at fp32 and at
+// half; a slot the stage does not sample changes nothing; the stage is filed under a name of its own with a recipe
+// that says its word (version 2), which warmUp compiles again; and through the C interface, a program of its own.
+TEST(a_ycbcr_slot_is_converted_after_its_sample_and_filed_apart) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: the YCbCr lowering did not run)\n");
+        return;
+    }
+    const std::vector<uint8_t> fs = bitcodeOf("tri_tex_fs"), hfs = bitcodeOf("tri_htex_fs"), vs = bitcodeOf("tri_color_vs");
+    CHECK(!fs.empty() && !hfs.empty() && !vs.empty());
+    if (fs.empty() || hfs.empty() || vs.empty()) return;
+    std::string why;
+    const uint64_t slot0 = ycbcrCode(0, false), slot3 = uint64_t(ycbcrCode(1, true)) << (3 * kYcbcrSlotBits);
+    auto plain = compileStage(fs.data(), fs.size(), &why);
+    auto conv = compileStage(fs.data(), fs.size(), &why, {}, 0, nullptr, slot0);
+    auto other = compileStage(fs.data(), fs.size(), &why, {}, 0, nullptr, slot3);
+    auto hplain = compileStage(hfs.data(), hfs.size(), &why);
+    auto hconv = compileStage(hfs.data(), hfs.size(), &why, {}, 0, nullptr, uint64_t(ycbcrCode(1, false)));
+    CHECK(plain != nullptr && conv != nullptr && other != nullptr && hplain != nullptr && hconv != nullptr);
+    if (plain == nullptr || conv == nullptr || other == nullptr || hplain == nullptr || hconv == nullptr) {
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    CHECK(conv->words != plain->words);
+    // R, G and B each clamped once (ir3 folds the fsat into the instruction that makes the channel); the half sample
+    // taken to fp32 and back
+    auto count = [](const std::string& text, const char* what) {
+        size_t n = 0;
+        for (size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) n++;
+        return n;
+    };
+    CHECK_EQ(count(conv->listing, "(sat)"), size_t(3));
+    CHECK_EQ(count(hconv->listing, "(sat)"), size_t(3));
+    CHECK_EQ(count(plain->listing, "(sat)"), size_t(0));
+    CHECK_EQ(count(hplain->listing, "(sat)"), size_t(0));
+    CHECK(count(hconv->listing, "cov.f16f32") > 0 && count(hconv->listing, "cov.f32f16") > 0);
+    CHECK(other->words == plain->words);   // slot 3 is not sampled: nothing to convert
+    // the texture table is the sample's, as before: one 2D float texture at slot 0
+    CHECK_EQ(conv->stage.k.numTextureSlots, plain->stage.k.numTextureSlots);
+    CHECK_EQ(conv->stage.k.textures[0].kind, plain->stage.k.textures[0].kind);
+    auto vstage = compileStage(vs.data(), vs.size(), &why);
+    CHECK(vstage != nullptr);
+    if (vstage != nullptr) {
+        CHECK(linkProgram(std::shared_ptr<CompiledStage>(std::move(vstage)), std::shared_ptr<CompiledStage>(std::move(conv)), PixelFormat::kRGBA8Unorm, &why) != nullptr);
+    }
+    // the cache and the recipes: the plain stage and the converted one filed apart; the converted one's recipe a version
+    // 2 with its word; with the stages gone, warmUp compiles both again and the next compile reads the file
+    char base[] = "/tmp/hakios-metal-ycbcr-test-XXXXXX";
+    CHECK(mkdtemp(base) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", base, 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    auto listing = [](const std::string& d, const char* suffix) {
+        std::vector<std::string> out;
+        if (DIR* dir = opendir(d.c_str())) {
+            while (dirent* e = readdir(dir)) {
+                const std::string n = e->d_name;
+                if (n.size() > strlen(suffix) && n.compare(n.size() - strlen(suffix), strlen(suffix), suffix) == 0) out.push_back(n);
+            }
+            closedir(dir);
+        }
+        return out;
+    };
+    auto a = compileStage(fs.data(), fs.size(), &why, {}, 0, nullptr, slot0);
+    auto b = compileStage(fs.data(), fs.size(), &why);
+    CHECK(a != nullptr && b != nullptr && a->words != b->words);
+    CHECK_EQ(listing(base, ".stage").size(), size_t(2));
+    const std::vector<std::string> recipes = listing(std::string(base) + "/recipes", ".recipe");
+    CHECK_EQ(recipes.size(), size_t(2));
+    uint32_t versions = 0;
+    for (const std::string& r : recipes) {
+        FILE* f = fopen((std::string(base) + "/recipes/" + r).c_str(), "rb");
+        uint32_t head[2] = {};
+        if (f != nullptr) {
+            CHECK_EQ(fread(head, 4, 2, f), size_t(2));
+            fclose(f);
+        }
+        versions |= 1u << (head[1] & 7);
+    }
+    CHECK_EQ(versions, (1u << 1) | (1u << 2));
+    for (const std::string& n : listing(base, ".stage")) remove((std::string(base) + "/" + n).c_str());
+    const WarmUpReport w = warmUp();
+    CHECK_EQ(w.recipes, 2u);
+    CHECK_EQ(w.compiled, 2u);
+    CHECK_EQ(w.failed, 0u);
+    (void)takeCompileTimes();
+    auto c = compileStage(fs.data(), fs.size(), &why, {}, 0, nullptr, slot0);
+    const CompileTimes t = takeCompileTimes();
+    CHECK_EQ(t.cached, 1u);
+    CHECK(c != nullptr && a != nullptr && c->words == a->words);
+    // the C interface: a word of 0 refused; a slot converted, a program of its own beside the base
+    hakios_metal_program* p = hakios_metal_program_new_bitcode(vs.data(), vs.size(), fs.data(), fs.size(), 70);
+    CHECK(p != nullptr);
+    if (p != nullptr) {
+        CHECK(hakios_metal_program_specialize_ycbcr(p, fs.data(), fs.size(), nullptr, 0, 0, nullptr, 0, 0) == nullptr);
+        hakios_metal_program* y = hakios_metal_program_specialize_ycbcr(p, fs.data(), fs.size(), nullptr, 0, 0, nullptr, 0, slot0);
+        CHECK(y != nullptr);
+        if (y != nullptr) {
+            CHECK_EQ(hakios_metal_program_known_reads(y, nullptr, 0), 0u);
+            hakios_metal_program_free(y);
+        }
+        hakios_metal_program_free(p);
+    }
+    unsetenv("HAKIOS_METAL_CACHE");
+    for (const std::string& n : listing(std::string(base) + "/recipes", "")) remove((std::string(base) + "/recipes/" + n).c_str());
+    rmdir((std::string(base) + "/recipes").c_str());
+    for (const std::string& n : listing(base, "")) remove((std::string(base) + "/" + n).c_str());
     rmdir(base);
 }

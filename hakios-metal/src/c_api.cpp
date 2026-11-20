@@ -1240,18 +1240,16 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
     return programOf(std::move(vs), std::move(fs), colorPixelFormat);
 }
 
-hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants,
-                                                     unsigned fsCount, unsigned binding, const void* bytes, size_t length) {
-    if (base == nullptr || fsBitcode == nullptr || fsSize == 0 || bytes == nullptr) {
-        failed("a specialisation needs the program, its fragment function's bitcode and the buffer's bytes");
-        return nullptr;
-    }
+namespace {
+hakios_metal_program* specialized(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
+                                  unsigned binding, const void* bytes, size_t length, uint64_t ycbcr) {
     std::string why;
     KnownBuffer known;
     known.binding = binding;
-    known.bytes.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + length);
+    if (bytes != nullptr) known.bytes.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + length);
     const Program& was = base->program->program;
-    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, &known);
+    std::unique_ptr<CompiledStage> fs =
+        compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, bytes != nullptr ? &known : nullptr, ycbcr);
     if (fs == nullptr) {
         failed(why);
         return nullptr;
@@ -1271,6 +1269,26 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     r->program = std::move(p);
     r->color = base->color;
     return r;
+}
+}  // namespace
+
+hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants,
+                                                     unsigned fsCount, unsigned binding, const void* bytes, size_t length) {
+    if (base == nullptr || fsBitcode == nullptr || fsSize == 0 || bytes == nullptr) {
+        failed("a specialisation needs the program, its fragment function's bitcode and the buffer's bytes");
+        return nullptr;
+    }
+    return specialized(base, fsBitcode, fsSize, fsConstants, fsCount, binding, bytes, length, 0);
+}
+
+hakios_metal_program* hakios_metal_program_specialize_ycbcr(hakios_metal_program* base, const void* fsBitcode, size_t fsSize,
+                                                           const hakios_metal_constant* fsConstants, unsigned fsCount, unsigned binding, const void* bytes,
+                                                           size_t length, unsigned long long ycbcr) {
+    if (base == nullptr || fsBitcode == nullptr || fsSize == 0 || ycbcr == 0) {
+        failed("a YCbCr specialisation needs the program, its fragment function's bitcode and a word naming at least one YCbCr slot");
+        return nullptr;
+    }
+    return specialized(base, fsBitcode, fsSize, fsConstants, fsCount, binding, bytes, length, uint64_t(ycbcr));
 }
 
 }   // extern "C"

@@ -144,8 +144,24 @@ struct KnownBuffer {
     uint32_t binding = 0;
     std::vector<uint8_t> bytes;
 };
+// The texture slots a fragment stage samples as Metal's private YCbCr8_420_2P (500): a '420f' or '420v' surface read by
+// the TP as R8_G8B8_2PLANE_420_UNORM, swizzled so that a sample is (Cr, Y, Cb, 1) -- the planes as they are, which is
+// what format 540 is -- and converted to RGB after each sample by the matrix the slot's code names, as turnip converts
+// (tu_shader.cc lower_tex_ycbcr): the A6xx has no conversion of its own. Three bits a slot, slot n at bit 3n, for the
+// first kYcbcrSlots texture slots; a code is 0 (not YCbCr: nothing changes), or 1 + 2 * model + narrow, model 0
+// BT.601, 1 BT.709, 2 BT.2020, narrow 1 for video range ('420v': Y 16-235, CbCr 16-240). A word of 0 is a stage
+// compiled as before, filed under the same name; any other is part of the stage's name in the cache and its recipe.
+constexpr uint32_t kYcbcrSlotBits = 3;
+constexpr uint32_t kYcbcrSlots = 16;
+constexpr uint32_t ycbcrCode(uint32_t model, bool narrow) { return 1 + 2 * model + (narrow ? 1 : 0); }
+constexpr uint32_t ycbcrCodeOf(uint64_t word, uint32_t slot) { return slot < kYcbcrSlots ? uint32_t(word >> (kYcbcrSlotBits * slot)) & 7 : 0; }
+// The conversion code CODE stands for, as the coefficients of R, G and B on the sample's normalised (Cr, Y, Cb) and a
+// constant: out[c] = m[c][0] * Cr + m[c][1] * Y + m[c][2] * Cb + m[c][3], clamped to [0, 1] -- the BT.601/709/2020
+// equations (Kr, Kb; G from Y = Kr R + Kg G + Kb B) with the range folded in (Y' = (Y - 16/255) * 255/219 and
+// C' = (C - 128/255) * 255/224 for video range, C' = C - 128/255 for full). False for a code that is no conversion.
+bool ycbcrMatrix(uint32_t code, float m[3][4]);
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
-                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
+                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr, uint64_t ycbcr = 0);
 // What compileStage did for the calling thread since it last asked (the counts start again): the stages asked for,
 // those that came out of the cache or a seed and those compiled, and the time each part took -- waiting for the one
 // compiler while another thread compiled, reading cached stages, compiling. A stage found in the cache waits for
