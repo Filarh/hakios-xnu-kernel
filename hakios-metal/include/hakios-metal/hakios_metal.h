@@ -569,6 +569,9 @@ void hakios_metal_cb_cancel_draw(hakios_metal_cb *cb, unsigned tag);
  * serves -- colour attachment 0 compressed, no depth or stencil attachment, one sample -- with a prepass of their opaque
  * draws and the rest tested against its depth, the picture the same; 0, as by default, draws every pass as it comes. */
 void hakios_metal_cb_set_hsr(hakios_metal_cb *cb, int on);
+/* ...and its depth (CommandBuffer::setHsrDepth): KIND 0 Depth32Float, 1 Depth16Unorm (the default), 2 Depth16Unorm
+ * compressed; LRZ non-zero a low-resolution Z buffer beside it (the A610 alone) */
+void hakios_metal_cb_set_hsr_depth(hakios_metal_cb *cb, int kind, int lrz);
 /* what it did so far: the passes drawn with it, and their draws drawn in a prepass, tested, or as barriers */
 void hakios_metal_cb_hsr_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *opaque, unsigned *hidden, unsigned *barriers);
 /* How the process's command buffers take their draws from now on (CommandBuffer::keepStates, verifyDraws). KEEP 0:

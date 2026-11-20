@@ -1013,6 +1013,12 @@ void hakios_metal_cb_set_hsr(hakios_metal_cb* cb, int on) {
     cb->cb->setHsr(on != 0);
 }
 
+void hakios_metal_cb_set_hsr_depth(hakios_metal_cb* cb, int kind, int lrz) {
+    const CommandBuffer::HsrDepth k = kind == 0 ? CommandBuffer::kHsrDepth32F : kind == 2 ? CommandBuffer::kHsrDepth16Ubwc : CommandBuffer::kHsrDepth16;
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, k, lrz] { cb->cb->setHsrDepth(k, lrz != 0); });
+    cb->cb->setHsrDepth(k, lrz != 0);
+}
+
 void hakios_metal_cb_hsr_counts(hakios_metal_cb* cb, unsigned* passes, unsigned* opaque, unsigned* hidden, unsigned* barriers) {
     syncOne(cb);
     const CommandBuffer::Counts& c = cb->cb->counts();

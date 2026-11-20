@@ -7002,6 +7002,7 @@ HM_REFUSES_OUT_LOUD
 		const int hsrMode = hm_hsr_switch();
 		_hsr = hsrMode == 1 || (hsrMode == 2 && __atomic_fetch_add(&hm_hsr_buffers, 1, __ATOMIC_RELAXED) % 2 == 0);
 		hakios_metal_cb_set_hsr(_cb, _hsr);
+		hakios_metal_cb_set_hsr_depth(_cb, hm_hsr_depth() & 3, (hm_hsr_depth() & 4) != 0);
 	}
 	_owesSlot = YES;
 	return self;
@@ -7597,6 +7598,30 @@ hm_hsr_switch(void)
 		if (mode == 2) hm_print("metal_hsr=2: as 1, in the command buffers of even number alone (an A/B within one run)\n");
 	});
 	return mode;
+}
+
+/* boot-arg metal_hsrdepth=N: metal_hsr's depth (hakios_metal_cb_set_hsr_depth), N's low two bits 0 Depth32Float, 1
+ * Depth16Unorm, 2 Depth16Unorm compressed, and 4 an LRZ beside it (the A610 alone). Without it 1: Depth16Unorm, no LRZ.
+ * Which of them costs least is hakios-metal-hsrcheck's to say (its "time" lines). */
+static int
+hm_hsr_depth(void)
+{
+	static dispatch_once_t once;
+	static int depth = 1;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_hsrdepth=")) != NULL && at[15] >= '0' && at[15] <= '7') {
+			depth = at[15] - '0';
+			if ((depth & 3) == 3) depth = (depth & 4) | 1;
+			hm_print("metal_hsrdepth=%d: HSR's depth %s%s\n", depth, (depth & 3) == 0 ? "Depth32Float" : (depth & 3) == 1 ? "Depth16Unorm" : "Depth16Unorm compressed",
+				 (depth & 4) != 0 ? ", with an LRZ" : "");
+		}
+	});
+	return depth;
 }
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
