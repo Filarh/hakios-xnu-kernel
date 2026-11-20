@@ -260,6 +260,8 @@ std::shared_ptr<Texture> ycbcrTexture(Gpu& gpu, IOSurfaceRef s, uint8_t siting, 
     const Layout l = layoutOf(s);
     Texture::SurfacePlane chroma{l.chromaOffset, uint32_t(l.row1)};
     chroma.midpoint = siting;
+    chroma.lumaOffset = l.offset0;
+    chroma.lumaRowBytes = uint32_t(l.row0);
     TextureDesc d;
     d.format = PixelFormat::kYCbCr8_420_2P;
     d.width = uint32_t(IOSurfaceGetWidth(s));
@@ -449,6 +451,8 @@ void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& near
             std::string w;
             const Layout ll = layoutOf(s);
             Texture::SurfacePlane chroma{ll.chromaOffset, uint32_t(ll.row1)};
+            chroma.lumaOffset = ll.offset0;
+            chroma.lumaRowBytes = uint32_t(ll.row0);
             TextureDesc d;
             d.format = PixelFormat::kYCbCr8_420_2P;
             d.width = W;
@@ -482,6 +486,18 @@ void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& near
         const std::vector<Variant> variants = {
             {"nv12 as the plug-in makes it (Cr, Y, Cb, 1)", 0, [&] { return nv12(true); }},
             {"nv12 unswizzled (Y, Cb, Cr, 1)", 1, [&] { return planes(); }},
+            {"nv12 unswizzled, plane 0's rows as the kernel describes the surface (ycbcr-1)", 1, [&] {
+                 std::string w;
+                 Texture::SurfacePlane chroma{l.chromaOffset, uint32_t(l.row1)};
+                 TextureDesc d;
+                 d.format = PixelFormat::kYCbCr8_420_2P;
+                 d.width = W;
+                 d.height = H;
+                 d.usage = kTextureUsageRead;
+                 auto t = Texture::wrapSurface(gpu, IOSurfaceGetID(s), d, &w, &chroma);
+                 if (t == nullptr) std::printf("ycbcrcheck: diag with the kernel's rows: %s\n", w.c_str());
+                 return t;
+             }},
             {"nv12 unswizzled, TILE_ALL", 1, [&] { return overridden([](a6xx::TexConst& d) { d.dword[3] |= a6xx::A6XX_TEX_CONST_3_TILE_ALL; }); }},
             {"nv12 unswizzled, SWAP XYZW", 1, [&] {
                  return overridden([](a6xx::TexConst& d) {

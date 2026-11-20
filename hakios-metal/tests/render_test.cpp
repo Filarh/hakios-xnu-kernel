@@ -3868,6 +3868,24 @@ TEST(a_ycbcr_texture_is_the_two_planes_read_as_cr_y_cb_one) {
     for (int w = 1; w < 16; w++) CHECK_EQ(c.dword[w], p.dword[w]);
     CHECK_EQ(c.dword[0] & (A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X | A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y), 0u);
     CHECK_EQ(t->surface(), 21u);
+    // plane 0's rows as the caller reads them off the surface, not the kernel's surface-wide 128: the pitch in dword 2
+    // and the start in dword 4
+    {
+        Texture::SurfacePlane own{128 * 64, 128};
+        own.lumaOffset = 0;
+        own.lumaRowBytes = 64;
+        auto l = Texture::wrapSurface(*r.gpu, 21, d, &why, &own);
+        CHECK(l != nullptr);
+        if (l != nullptr) {
+            CHECK_EQ((l->sampledDescriptor().dword[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 64u);
+            CHECK_EQ((p.dword[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 128u);
+            CHECK_EQ(l->sampledDescriptor().dword[4], uint32_t(l->buffer()->gpuAddress()));
+        }
+        own.lumaRowBytes = 32;   // shorter than the width: refused
+        std::string w;
+        CHECK(Texture::wrapSurface(*r.gpu, 21, d, &w, &own) == nullptr);
+        CHECK(has(w, "luma rows of 32 bytes"));
+    }
     // the siting: the chroma between two luma columns, then also between two rows
     chroma.midpoint = 1;
     auto left = Texture::wrapSurface(*r.gpu, 21, d, &why, &chroma);

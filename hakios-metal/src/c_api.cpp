@@ -653,10 +653,12 @@ hakios_metal_texture* hakios_metal_texture_new_iosurface2(hakios_metal_device* d
     return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, &chroma);
 }
 
-hakios_metal_texture* hakios_metal_texture_new_ycbcr(hakios_metal_device* d, unsigned surfaceId, unsigned width, unsigned height, uint64_t chromaOffset,
-                                                     unsigned chromaRowBytes, unsigned siting) {
+hakios_metal_texture* hakios_metal_texture_new_ycbcr(hakios_metal_device* d, unsigned surfaceId, unsigned width, unsigned height, uint64_t lumaOffset,
+                                                     unsigned lumaRowBytes, uint64_t chromaOffset, unsigned chromaRowBytes, unsigned siting) {
     Texture::SurfacePlane chroma{chromaOffset, chromaRowBytes};
     chroma.midpoint = uint8_t(siting & 3);
+    chroma.lumaOffset = lumaOffset;
+    chroma.lumaRowBytes = lumaRowBytes;
     TextureDesc desc;
     desc.format = PixelFormat::kYCbCr8_420_2P;
     desc.width = width;

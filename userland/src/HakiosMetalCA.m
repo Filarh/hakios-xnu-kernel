@@ -5073,7 +5073,9 @@ hm_ycbcr_direct(hakios_metal_device *gpu, IOSurfaceRef surface, MTLPixelFormat f
 	} else if (base == 0 || chroma < base) {
 		snprintf(why, sizeof(why), "no address for its planes");
 	} else {
-		t = hakios_metal_texture_new_ycbcr(gpu, IOSurfaceGetID(surface), (unsigned)width, (unsigned)height, (uint64_t)(chroma - base),
+		/* (each plane's rows as IOSurface gives them: the kernel's description is the surface's, not plane 0's) */
+		t = hakios_metal_texture_new_ycbcr(gpu, IOSurfaceGetID(surface), (unsigned)width, (unsigned)height, (uint64_t)(plane0 - base),
+						   (unsigned)IOSurfaceGetBytesPerRowOfPlane(surface, 0), (uint64_t)(chroma - base),
 						   (unsigned)IOSurfaceGetBytesPerRowOfPlane(surface, 1), where);
 		if (t == NULL) snprintf(why, sizeof(why), "%s", hakios_metal_error());
 	}

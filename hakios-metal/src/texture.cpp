@@ -1095,14 +1095,18 @@ std::shared_ptr<Texture> Texture::wrapTwoPlanes(std::shared_ptr<Buffer> buffer, 
         return nullptr;
     }
     const uint64_t cw = (uint64_t(desc.width) + 1) / 2, ch = (uint64_t(desc.height) + 1) / 2;
-    if (s.rowBytes % 64 != 0 || s.offset % 64 != 0 || s.rowBytes < desc.width || uint64_t(s.offset) + uint64_t(s.rowBytes) * desc.height > s.size ||
+    // plane 0 as the caller gives it; the kernel's rows are the surface's, four bytes a pixel for a planar surface
+    // made without IOSurfaceBytesPerElement (on the phone the TP read every luma row 4x too far apart)
+    const uint64_t lumaOffset = chroma->lumaRowBytes != 0 ? chroma->lumaOffset : s.offset;
+    const uint64_t lumaRows = chroma->lumaRowBytes != 0 ? chroma->lumaRowBytes : s.rowBytes;
+    if (lumaRows % 64 != 0 || lumaOffset % 64 != 0 || lumaRows < desc.width || lumaOffset + lumaRows * desc.height > s.size ||
         chroma->rowBytes % 64 != 0 || chroma->offset % 64 != 0 || chroma->rowBytes < 2 * cw || chroma->offset + uint64_t(chroma->rowBytes) * ch > s.size) {
-        refuse(why, name + "'s planes, luma rows of " + n(s.rowBytes) + " bytes from " + n(s.offset) + ", chroma rows of " + n(chroma->rowBytes) + " from " +
+        refuse(why, name + "'s planes, luma rows of " + n(lumaRows) + " bytes from " + n(lumaOffset) + ", chroma rows of " + n(chroma->rowBytes) + " from " +
                         n(chroma->offset) + ", in its " + n(s.size) + " bytes: each plane wants a pitch and a start that are multiples of 64 bytes, rows that "
                         "hold its width, and its rows inside the surface");
         return nullptr;
     }
-    std::shared_ptr<Texture> t = adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, 0));
+    std::shared_ptr<Texture> t = adopt(new Texture(std::move(buffer), desc, info, lumaRows, lumaOffset, 0));
     t->chroma_ = *chroma;
     return t;
 }
