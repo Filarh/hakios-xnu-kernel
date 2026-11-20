@@ -3568,6 +3568,19 @@ hm_boot_arg_set(const char *what)
 		}
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
+	/* metal_fs64=1 (/var/tmp/metal.args or a boot-arg; off by default): every fragment stage compiled for waves of 64,
+	 * as turnip compiles one on this chip, instead of 128 where its registers fit twice (hakios-metal compiler.cpp,
+	 * fsWaves64). Set before the device compiles anything: the stages of the two sizes are filed under different
+	 * names, and the warm-up compiles the recipes of this size it has not filed yet (dev-notes 25-blur/03 §3) */
+	{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_fs64=1") != NULL) {
+			setenv("HAKIOS_METAL_FS_WAVE", "64", 1);
+			hm_print("metal_fs64=1: fragment stages in waves of 64\n");
+		}
+	}
 	hm_ensure_spi([self class]);
 	hm_functions_encode_from_metadata();
 	self = [super init];

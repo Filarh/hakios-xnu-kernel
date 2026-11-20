@@ -687,6 +687,16 @@ bool needsQuadHelpers(nir_shader* nir) {
 
 // Whether a stage works across its subgroup (a SIMD-group to Metal): asks its size or its lane, or reads, votes, reduces
 // or shuffles over it. Quad operations are not among them: a quad is four lanes at any wave size.
+// HAKIOS_METAL_FS_WAVE=64 in the environment (the plug-in's metal_fs64=1): every fragment stage in waves of 64, as turnip
+// compiles one on a chip without supports_double_threadsize (tu_shader.cc:2953-2962, IR3_SINGLE_ONLY; the A610's row in
+// freedreno_devices.py). ir3 then shares the registers out for that size: CoreAnimation's downsample_8 goes from 12
+// registers to 9, 320 fibres resident against 256 (dev-notes 25 §4, 25-blur/03 §3). Read at each compilation and in
+// each stage's cache name, so that the stages of the two sizes never stand for each other.
+bool fsWaves64() {
+    const char* w = getenv("HAKIOS_METAL_FS_WAVE");
+    return w != nullptr && strcmp(w, "64") == 0;
+}
+
 bool usesSubgroup(nir_shader* nir) {
     nir_foreach_function_impl(impl, nir) {
         nir_foreach_block(block, impl) {
@@ -766,8 +776,8 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     // A fragment stage in waves of 128 where its registers fit twice (ir3_should_double_threadsize), as turnip lets one
     // (tu_shader.cc's SINGLE_OR_DOUBLE): a variant built by hand has its options zeroed, and zero is IR3_SINGLE_ONLY,
     // which held every fragment stage here to 64. A stage that works across its subgroup keeps 64, the size it was
-    // given before
-    if (v->type == MESA_SHADER_FRAGMENT && !usesSubgroup(nir)) {
+    // given before. With HAKIOS_METAL_FS_WAVE=64, 64 for every one (fsWaves64)
+    if (v->type == MESA_SHADER_FRAGMENT && !usesSubgroup(nir) && !fsWaves64()) {
         v->shader_options.api_wavesize = v->shader_options.real_wavesize = IR3_SINGLE_OR_DOUBLE;
     }
     t.shader->variants = v;
@@ -1201,6 +1211,12 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
     const uint32_t layout[3] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase};
     mix(kCacheBuild, strlen(kCacheBuild));
     mix(layout, sizeof(layout));
+    if (fsWaves64()) {
+        // (fragment stages in waves of 64: another stage from the same inputs. Mixed in only then, so that every name
+        // is what it was without it)
+        const char wave[] = "fs-wave-64";
+        mix(wave, sizeof(wave));
+    }
     mix(bitcode, size);
     for (const FunctionConstant& c : constants) {
         mix(&c.index, sizeof(c.index));

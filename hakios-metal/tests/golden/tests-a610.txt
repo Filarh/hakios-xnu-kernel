@@ -102,6 +102,8 @@ a_stage_compiled_without_the_preamble_is_taken_only_when_it_spills_less submits 
 a_stage_that_writes_its_device_buffers_is_told_from_one_that_reads_them submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the cache did not run)
 a_compiled_stage_comes_back_from_the_cache_and_from_a_seed submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+       (no compiler in this build: the wave size did not run)
+a_fragment_stage_takes_waves_of_64_behind_its_switch submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets submits 1 words 109 draws 0 loads 2 stream 3ba56fc66894b149 state 73d60166aefc2a51 names 4 94a18d98463af819
 an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 178 draws 0 loads 4 stream 2132bf9308916576 state 65ad89869881ce17 names 5 55c16b327fc26836
 a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 109 draws 0 loads 2 stream 9fc4f61a00b1bad6 state 73d60166aefc2a51 names 3 56e6c080795c4956
