@@ -1536,6 +1536,20 @@ TEST(a_ycbcr_slot_is_converted_after_its_sample_and_filed_apart) {
     CHECK_EQ(count(hplain->listing, "(sat)"), size_t(0));
     CHECK(count(hconv->listing, "cov.f16f32") > 0 && count(hconv->listing, "cov.f32f16") > 0);
     CHECK(other->words == plain->words);   // slot 3 is not sampled: nothing to convert
+    // a stage that asks the YCbCr texture its size (txs) and samples it: the sample converted, the queries as they were
+    {
+        const std::vector<uint8_t> pfs = bitcodeOf("tri_ptex_fs");
+        CHECK(!pfs.empty());
+        auto pplain = compileStage(pfs.data(), pfs.size(), &why);
+        auto pconv = compileStage(pfs.data(), pfs.size(), &why, {}, 0, nullptr, slot0);
+        CHECK(pplain != nullptr && pconv != nullptr);
+        if (pplain != nullptr && pconv != nullptr) {
+            CHECK_EQ(count(pconv->listing, "(sat)"), size_t(3));
+            CHECK_EQ(count(pplain->listing, "(sat)"), size_t(0));
+            CHECK(count(pplain->listing, "getsize") > 0);
+            CHECK_EQ(count(pconv->listing, "getsize"), count(pplain->listing, "getsize"));
+        }
+    }
     // the texture table is the sample's, as before: one 2D float texture at slot 0
     CHECK_EQ(conv->stage.k.numTextureSlots, plain->stage.k.numTextureSlots);
     CHECK_EQ(conv->stage.k.textures[0].kind, plain->stage.k.textures[0].kind);

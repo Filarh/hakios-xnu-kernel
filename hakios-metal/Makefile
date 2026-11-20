@@ -132,8 +132,8 @@ out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard
 # the YCbCr check (tools/ycbcrcheck.cpp): two-plane '420f'/'420v' surfaces sampled by the phone's GPU as 540 and 500,
 # compared with the plug-in's conversion on the processor and timed
 # (its three fixtures named: the *_air.hpp among the rest would want Mesa's ir3_compiler built on the host)
-out/ios/hakios-metal-ycbcrcheck: tools/ycbcrcheck.cpp out/ios/libhakios-metal.a tests/fixtures/tri_color_vs_bc.hpp tests/fixtures/tri_tex_fs_bc.hpp \
-		tests/fixtures/tri_htex_fs_bc.hpp \
+out/ios/hakios-metal-ycbcrcheck: tools/ycbcrcheck.cpp out/ios/libhakios-metal.a tests/fixtures/tri_color_vs_bc.hpp tests/fixtures/tri_ptex_fs_bc.hpp tests/fixtures/tri_tex_fs_bc.hpp \
+		tests/fixtures/tri_hptex_fs_bc.hpp \
 		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
 	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/ycbcrcheck.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
 		-framework IOKit -framework CoreFoundation -framework IOSurface
