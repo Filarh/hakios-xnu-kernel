@@ -183,7 +183,10 @@ public:
         // draw's state than in one that runs the visible ones', and nothing the draw reads.
         // (STATE, when asked for too: what the digest is of, word for word -- each register and its value, then each
         // stage's loads -- for whoever must say WHERE two recordings part)
-        struct DrawLog { uint32_t tile, ordinal; bool binning; uint64_t digest; std::vector<uint64_t> state; };
+        // (INDIRECT: it ran from an indirect buffer of the stream's -- a tiled pass's draws, or an HSR prepass's. WRITTEN,
+        // with STATE: the registers written since the draw before it that was logged, or since its sysmem pass's marker --
+        // of a draw written whole, every register it sets)
+        struct DrawLog { uint32_t tile, ordinal; bool binning; uint64_t digest; std::vector<uint64_t> state; bool indirect = false; std::vector<uint32_t> written; };
         std::vector<DrawLog> drawLog;
     };
 
@@ -405,6 +408,7 @@ private:
     // encodeDraw's note) -- and is a fault here.
     bool gmemCachesStale_ = false, drawReadsGmem_ = false;
     bool logDraws_ = false, logState_ = false;
+    std::set<uint32_t> sinceDraw_;   // (with logState_: the registers written since the last draw logged)
     // (the registers the binning pass's draws wrote, in the order each was first written, and how many of them had
     // been by each of its draws: what the digest of a tile's draw leaves out, above)
     std::vector<uint32_t> bodyOrder_;
@@ -415,7 +419,7 @@ private:
     bool runGroups();               // the pending groups of the mode in force
     bool setDrawState(const uint32_t* p, uint32_t count, int depth);
     void invalidate(uint32_t bits);   // HLSQ_INVALIDATE_CMD
-    void logDraw(bool binning);
+    void logDraw(bool binning, bool indirect);
     uint64_t alwaysOn_ = 0;     // CP_ALWAYS_ON_COUNTER as the fake keeps it: one more at each CP_REG_TO_MEM of it
     uint32_t drawsInSubmission_ = 0, drawsWithoutCcuFlush_ = 0, drawsWithoutCacheFlush_ = 0, drawsWithoutDepthFlush_ = 0;
     // the running sample count ZPASS_DONE copies out (an occlusion query's snapshots). The model has no rasterizer, so

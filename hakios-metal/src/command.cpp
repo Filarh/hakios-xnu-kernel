@@ -668,6 +668,27 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
     return null_;
 }
 
+std::shared_ptr<Texture> CommandQueue::hsrDepth(uint32_t width, uint32_t height, std::string* why) {
+    std::lock_guard<std::mutex> g(lock_);
+    for (size_t i = 0; i < hsrDepths_.size(); i++) {
+        if (hsrDepths_[i]->width() != width || hsrDepths_[i]->height() != height) continue;
+        std::shared_ptr<Texture> t = hsrDepths_[i];
+        hsrDepths_.erase(hsrDepths_.begin() + long(i));
+        hsrDepths_.push_back(t);
+        return t;
+    }
+    TextureDesc d;
+    d.format = PixelFormat::kDepth32Float;
+    d.width = width;
+    d.height = height;
+    d.usage = kTextureUsageRenderTarget;
+    std::shared_ptr<Texture> t = Texture::make(gpu_, d, why);
+    if (t == nullptr) return nullptr;
+    if (hsrDepths_.size() >= kHsrDepthSizes) hsrDepths_.erase(hsrDepths_.begin());
+    hsrDepths_.push_back(t);
+    return t;
+}
+
 namespace {
 // the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
 constexpr uint32_t kSpCores = 2;

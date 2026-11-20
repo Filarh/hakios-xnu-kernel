@@ -88,7 +88,11 @@ public:
     // at AT is no longer such a header: the stream changed under it)
     size_t lastPacket(size_t from, uint32_t opcodeA, uint32_t opcodeB) const;
     bool nopPacket(size_t at, uint32_t opcodeA, uint32_t opcodeB);
+    // the N words at AT, which must already be in the stream, overwritten with WORDS (a packet put where a NOP of the same
+    // length was left for it); false, the stream unchanged, when they are not all there
+    bool patch(size_t at, const uint32_t* words, size_t n);
     void clear() { words_.clear(); }
+    void truncate(size_t n) { if (n < words_.size()) words_.resize(n); }
 
 private:
     void command(uint32_t opcode, uint32_t count);

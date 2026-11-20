@@ -11,7 +11,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "hakios-metal/a6xx.hpp"
@@ -7017,5 +7019,488 @@ TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
         const FakeGpu::Stats st = w.r.fake->stats();
         CHECK(st.faults != before);
         CHECK(has(st.lastFault, "a draw of the stream itself with draw-state group 5 still set by a tiled pass's draws"));
+    }
+}
+
+// --- hidden surface removal by depth (CommandBuffer::setHsr) ----------------------------------------------------------------
+// The fake rasterizes nothing, so a picture with HSR cannot be held to the picture without it here: that is
+// hakios-metal-hsrcheck's, on the phone's GPU (tools/hsrcheck.cpp). What is held here is what makes the two pictures one
+// by construction (dev-notes/investigacion/anexos/32-interfaz-telegram/02 section 3), read off the draws the fake ran
+// with the GPU's whole state at each (FakeGpu::logDraws) in a scene drawn twice, without HSR and with it -- the rules:
+//   1. every draw of the scene runs once with HSR, found by its Z (Z_I names draw I), and with the GPU in the state it
+//      has for that draw without HSR, register for register and load for load, the depth's registers alone apart
+//   2. a draw of a prepass (one run from an indirect buffer) tests LessEqual and writes depth, writes colour 0 alone
+//      with every channel and no blending, has no IBO and reads no attachment by fetch; the draws of one prepass run
+//      last to first; and a prepass runs before its segment, after the draw before the segment and with no untested
+//      draw between it and its draws' places
+//   3. a draw of the pass tested against the depth tests LessEqual without writing, and writes colour 0 alone with no
+//      IBO: one that writes another attachment or has an IBO is a barrier, untested
+// and every mutation twin of the stream (CommandBuffer::setHsrTest) breaks one of them.
+namespace {
+enum HsrKind : uint8_t {
+    kHsrFlat,        // opaque: tri_flat, blending off
+    kHsrBlend,       // hidden: tri_flat blended (source over)
+    kHsrFetch,       // hidden: tri_fb, a framebuffer fetch
+    kHsrKill,        // hidden: tri_flat whose fragment stage discards
+    kHsrMrt,         // barrier: tri_mrt, writes colour 1 too (the pass has it)
+    kHsrVsIbo,       // barrier: tri_dpos, its vertex stage reads its positions through an IBO
+    kHsrQuery,       // barrier: the blended tri_flat counting its samples into a visibility result
+    kHsrOverlap,     // opaque: tri_attr, two triangles of two colours over each other in one draw
+    kHsrInstances,   // opaque: tri_flat, three instances over each other
+    kHsrBlendC1,     // barrier: the blended tri_flat with colour 1's write mask left whole, though its FS writes no colour 1
+};
+struct HsrStep {
+    HsrKind kind;
+    double x, y, w, h;
+};
+struct HsrScene {
+    const char* name;
+    std::vector<HsrStep> steps;
+    bool clear = false;   // the pass opens with a Clear of colour 0
+    bool c1 = false;      // ...and has colour attachment 1, which every pipeline but tri_mrt's masks off
+};
+struct HsrRun {
+    bool completed = false;
+    std::string error;
+    FakeGpu::Stats stats;
+    CommandBuffer::Counts counts;
+};
+
+// SCENE drawn into a 96 x 64 BGRA8 target in one pass, with HSR or without -- without it every draw written whole
+// (Options::dedupRegs off), so that the log says which registers each sets; TWIN and LIMIT setHsrTest's. The target is
+// linear, which this fake draws into (a compressed one it does not), taken by setHsrTest's ANY_TARGET; every pass in
+// sysmem, as a pass into a compressed target is.
+HsrRun runHsr(const HsrScene& scene, bool on, uint8_t twin = 0, uint32_t limit = CommandBuffer::kHsrMaxDraws) {
+    HsrRun out;
+    Rig r;
+    const uint32_t W = 96, H = 64;
+    std::string why;
+    auto t = target(r, W, H, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto c1 = target(r, W, H, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    const float xy[6][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, -1}, {1, 1}, {-1, 1}};
+    auto pos = bufferWith(r, xy, sizeof xy);
+    // two triangles over each other, red under green, each a vertex: float2 position, uchar4 colour (attrProgram's)
+    struct V {
+        float x, y;
+        uint8_t c[4];
+    };
+    const V verts[6] = {{-1, -1, {255, 0, 0, 255}}, {1, -1, {255, 0, 0, 255}}, {0, 1, {255, 0, 0, 255}},
+                        {-1, 1, {0, 255, 0, 255}},  {1, 1, {0, 255, 0, 255}},  {0, -1, {0, 255, 0, 255}}};
+    auto vb = bufferWith(r, verts, sizeof verts);
+    auto vis = newBuffer(*r.gpu, 64, &why);
+    CHECK(vis != nullptr);
+    if (vis == nullptr) return out;
+    auto masked = [&](Program p) {
+        p.ssboWrites = 0;
+        if (scene.c1) p.moreBlend[0].writeMask = 0;
+        return p;
+    };
+    const Program flat = masked(flatProgram());
+    Program blend = flat;
+    blend.blend = ColorBlend{true, 0, 0, 4, 5, 1, 5, 0xf};
+    Program blendC1 = blend;
+    blendC1.moreBlend[0].writeMask = 0xf;
+    const Program fetch = masked(Program{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"});
+    Program kill = flat;
+    kill.fs.hasKill = 1;
+    Program mrt{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"};
+    mrt.ssboWrites = 0;
+    const Program dpos = masked(Program{kernels::tri_dpos_vs_air, kernels::tri_flat_fs_air, Linkage{}, "tri_dpos"});
+    const Program attr = masked(attrProgram());
+    render::Options o;
+    o.gmem = false;
+    o.dedupRegs = on;
+    // (what the queue makes at a first use made before the scene, with HSR or without: the depth attachment, each
+    // program's words, a slab -- so that every buffer lies at the same address in both runs, and the state the GPU has
+    // at each draw, addresses and all, is the same but for what HSR changes)
+    CHECK(r.queue->hsrDepth(W, H, &why) != nullptr);
+    {
+        auto warm = target(r, W, H, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass wp;
+        wp.color0 = warm.get();
+        wp.more[0].texture = c1.get();
+        auto cw = r.queue->commandBuffer();
+        Bindings pv, av;
+        pv.buffers = {Binding{pos.get(), 0}};
+        av.buffers = {Binding{vb.get(), 0}};
+        for (const auto& [p, b] : {std::pair<const Program*, const Bindings*>{&flat, &pv}, {&fetch, &pv}, {&mrt, &pv}, {&dpos, &pv}, {&attr, &av}}) {
+            CHECK(cw->draw(*p, wp, wholeDraw(6), *b, Bindings{}, o));
+        }
+        cw->commit();
+        cw->waitUntilCompleted();
+        CHECK(cw->status() == CommandBuffer::kCompleted);
+        r.fake->logDraws(true, true);   // (the log from here)
+    }
+    auto cb = r.queue->commandBuffer();
+    cb->setHsr(on);
+    cb->setHsrTest(twin, limit, true);
+    RenderPass pass;
+    pass.color0 = t.get();
+    if (scene.c1) pass.more[0].texture = c1.get();
+    bool first = true;
+    for (const HsrStep& s : scene.steps) {
+        RenderPass p = pass;
+        if (first && scene.clear) {
+            p.load = LoadAction::kClear;
+            p.clearColor[0] = 0.25, p.clearColor[1] = 0.5, p.clearColor[2] = 0.75, p.clearColor[3] = 1;
+        }
+        first = false;
+        Draw d = wholeDraw(6);
+        d.viewport = Viewport{s.x, s.y, s.w, s.h, 0, 1};
+        Bindings vsb;
+        const Program* program = &flat;
+        switch (s.kind) {
+        case kHsrFlat: break;
+        case kHsrBlend: program = &blend; break;
+        case kHsrFetch: program = &fetch; break;
+        case kHsrKill: program = &kill; break;
+        case kHsrMrt: program = &mrt; break;
+        case kHsrVsIbo:
+            program = &dpos;
+            vsb.buffers = {Binding{pos.get(), 0}};
+            break;
+        case kHsrQuery:
+            program = &blend;
+            d.visibility = vis.get();
+            d.visibilityMode = 2;
+            break;
+        case kHsrOverlap:
+            program = &attr;
+            vsb.buffers = {Binding{vb.get(), 0}};
+            break;
+        case kHsrInstances: d.instanceCount = 3; break;
+        case kHsrBlendC1: program = &blendC1; break;
+        }
+        if (!cb->draw(*program, p, d, vsb, Bindings{}, o)) {
+            out.error = cb->error();
+            return out;
+        }
+    }
+    cb->commit();
+    cb->waitUntilCompleted();
+    out.completed = cb->status() == CommandBuffer::kCompleted;
+    if (!out.completed) out.error = cb->error() + " | " + r.fake->stats().lastFault;
+    out.stats = r.fake->stats();
+    out.counts = cb->counts();
+    return out;
+}
+
+// a logged draw's registers and loads (FakeGpu::Stats::DrawLog::state: each register as REG << 32 | VALUE, ~0, the loads)
+struct HsrLogged {
+    std::map<uint32_t, uint32_t> regs;
+    std::vector<uint64_t> loads;
+    std::set<uint32_t> written;
+    bool indirect = false;
+    uint32_t reg(uint32_t r) const {
+        auto it = regs.find(r);
+        return it == regs.end() ? 0u : it->second;
+    }
+};
+HsrLogged hsrLogged(const FakeGpu::Stats::DrawLog& l) {
+    HsrLogged out;
+    out.indirect = l.indirect;
+    out.written.insert(l.written.begin(), l.written.end());
+    size_t i = 0;
+    for (; i < l.state.size() && l.state[i] != ~0ull; i++) out.regs[uint32_t(l.state[i] >> 32)] = uint32_t(l.state[i]);
+    out.loads.assign(l.state.begin() + long(std::min(i + 1, l.state.size())), l.state.end());
+    return out;
+}
+
+// what the rules above find wrong with ON against OFF (the same scene without HSR, each draw written whole: the
+// registers each sets are those written since the draw before it), "" when nothing
+std::string hsrRules(const HsrRun& off, const HsrRun& on, uint32_t limit = CommandBuffer::kHsrMaxDraws) {
+    using namespace a6xx;
+    if (!off.completed || !on.completed) return "not completed: " + off.error + " / " + on.error;
+    if (off.stats.faults != 0 || on.stats.faults != 0) return "a fault: " + off.stats.lastFault + " / " + on.stats.lastFault;
+    const uint32_t zoffset = regGrasClVport(REG_A6XX_GRAS_CL_VPORT_XOFFSET, 0) + 4, zscale = zoffset + 1;
+    // (the registers HSR changes: the depth buffer, its test and mode, the viewport's Z and its clamps)
+    // (the viewport's Z and clamps apart from the rest: past the limit a draw has its own viewport, and the depth buffer)
+    const std::set<uint32_t> zRegs = {zoffset, zscale, regGrasClZClamp(REG_A6XX_GRAS_CL_Z_CLAMP_MIN, 0), regGrasClZClamp(REG_A6XX_GRAS_CL_Z_CLAMP_MIN, 0) + 1,
+                                      REG_A6XX_RB_Z_CLAMP_MIN, REG_A6XX_RB_Z_CLAMP_MAX};
+    std::set<uint32_t> depthRegs = {REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, REG_A6XX_RB_DEPTH_PLANE_CNTL, REG_A6XX_RB_DEPTH_CNTL, REG_A6XX_GRAS_SU_DEPTH_CNTL,
+                                    REG_A6XX_GRAS_SU_DEPTH_PLANE_CNTL};
+    for (uint32_t k = 0; k < 6; k++) depthRegs.insert(REG_A6XX_RB_DEPTH_BUFFER_INFO + k);
+    for (uint32_t k = 0; k < 3; k++) depthRegs.insert(REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE + k);
+    std::vector<HsrLogged> was, is;
+    for (const auto& l : off.stats.drawLog) was.push_back(hsrLogged(l));
+    for (const auto& l : on.stats.drawLog) is.push_back(hsrLogged(l));
+    for (const HsrLogged& x : was) {
+        if (x.indirect || (x.reg(REG_A6XX_RB_DEPTH_CNTL) & A6XX_RB_DEPTH_CNTL_Z_TEST_ENABLE)) return "the scene without HSR has a prepass or a depth test";
+    }
+    const uint32_t n = uint32_t(was.size());
+    // rule 1: each draw once, found by its Z (past LIMIT, by its order), in the state it has without HSR
+    std::vector<uint32_t> index(is.size());
+    std::vector<int> seen(n, 0);
+    uint32_t past = limit;
+    for (size_t k = 0; k < is.size(); k++) {
+        const uint32_t zs = is[k].reg(zscale);
+        float z;
+        const uint32_t zw = is[k].reg(zoffset);
+        memcpy(&z, &zw, 4);
+        const double i = (1.0 - double(z)) * 65536.0 - 1.0;
+        if (zs == 0 && i >= 0 && i < double(limit) && i == std::floor(i) && float(1.0 - (i + 1) / 65536.0) == z) {
+            index[k] = uint32_t(i);
+        } else {
+            index[k] = past++;
+        }
+        if (index[k] >= n) return "draw " + std::to_string(k) + " has no draw of the scene: Z " + std::to_string(z);
+        seen[index[k]]++;
+        const HsrLogged &a = was[index[k]], &b = is[k];
+        if (a.loads != b.loads) return "draw " + std::to_string(index[k]) + " runs with other loads than without HSR";
+        // (the registers the draw sets: what it reads; another left by a draw before it is not the draw's)
+        std::map<uint32_t, uint32_t> x, y;
+        for (uint32_t r : a.written) {
+            if (depthRegs.count(r) != 0 || (index[k] < limit && zRegs.count(r) != 0)) continue;
+            x[r] = a.reg(r);
+            y[r] = b.reg(r);
+        }
+        // (and the 2D engine's, which the depth's Clear at the pass's start writes and no draw reads: GRAS_2D_BLIT_CNTL to
+        // GRAS_2D_DST_BR, RB_2D_*, SP_2D_DST_FORMAT, SP_PS_2D_SRC*)
+        auto twoD = [&](uint32_t r) {
+            return (r >= REG_A6XX_GRAS_2D_BLIT_CNTL && r <= REG_A6XX_GRAS_2D_DST_BR) || (r >= REG_A6XX_RB_2D_BLIT_CNTL && r < REG_A6XX_RB_2D_BLIT_CNTL + 0x40) ||
+                   r == REG_A6XX_SP_2D_DST_FORMAT || (r >= REG_A6XX_SP_PS_2D_SRC_INFO && r < REG_A6XX_SP_PS_2D_SRC_INFO + 0x10);
+        };
+        for (auto* m : {&x, &y}) {
+            for (auto it = m->begin(); it != m->end();) it = twoD(it->first) ? m->erase(it) : std::next(it);
+        }
+        if (x != y) {
+            for (const auto& [r, v] : y) {
+                auto it = x.find(r);
+                if (it == x.end() || it->second != v) {
+                    char t[96];
+                    snprintf(t, sizeof t, ": register %#x is %#x, without HSR %#x", r, v, it == x.end() ? 0u : it->second);
+                    return "draw " + std::to_string(index[k]) + " runs in another state than without HSR" + t;
+                }
+            }
+            return "draw " + std::to_string(index[k]) + " runs in another state than without HSR (a register missing)";
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (seen[i] != 1) return "draw " + std::to_string(i) + " runs " + std::to_string(seen[i]) + " times";
+    }
+    auto test = [](const HsrLogged& x) { return (x.reg(REG_A6XX_RB_DEPTH_CNTL) & A6XX_RB_DEPTH_CNTL_Z_TEST_ENABLE) != 0; };
+    auto writes = [](const HsrLogged& x) { return (x.reg(REG_A6XX_RB_DEPTH_CNTL) & A6XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE) != 0; };
+    auto func = [](const HsrLogged& x) { return (x.reg(REG_A6XX_RB_DEPTH_CNTL) & A6XX_RB_DEPTH_CNTL_ZFUNC__MASK) >> A6XX_RB_DEPTH_CNTL_ZFUNC__SHIFT; };
+    auto colour0Alone = [](const HsrLogged& x) {
+        const uint32_t mrts = (x.reg(REG_A6XX_RB_FS_OUTPUT_CNTL1) & A6XX_RB_FS_OUTPUT_CNTL1_MRT__MASK) >> A6XX_RB_FS_OUTPUT_CNTL1_MRT__SHIFT;
+        for (uint32_t i = 1; i < mrts; i++) {
+            if (x.reg(regRbMrt(REG_A6XX_RB_MRT_CONTROL, i)) & A6XX_RB_MRT_CONTROL_COMPONENT_ENABLE__MASK) return false;
+        }
+        return x.reg(REG_A6XX_SP_IBO_COUNT) == 0;
+    };
+    // rules 2 and 3, in the order the draws ran
+    for (size_t k = 0; k < is.size(); k++) {
+        const HsrLogged& x = is[k];
+        const std::string at = "draw " + std::to_string(index[k]);
+        if (!x.indirect) {
+            if (writes(x)) return at + " writes depth in the pass";
+            if (test(x) && func(x) != FUNC_LEQUAL) return at + " is tested other than LessEqual in the pass";
+            if (test(x) && !colour0Alone(x)) return at + " writes another attachment or has an IBO, and is tested";
+            continue;
+        }
+        const uint32_t control = x.reg(regRbMrt(REG_A6XX_RB_MRT_CONTROL, 0));
+        if (!test(x) || !writes(x) || func(x) != FUNC_LEQUAL) return at + " of a prepass is not tested LessEqual with a depth write";
+        if (!colour0Alone(x)) return at + " of a prepass writes another attachment or has an IBO";
+        if ((control & A6XX_RB_MRT_CONTROL_COMPONENT_ENABLE__MASK) != A6XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf) ||
+            (control & (A6XX_RB_MRT_CONTROL_BLEND | A6XX_RB_MRT_CONTROL_BLEND2)) != 0) {
+            return at + " of a prepass blends or writes colour 0 in part";
+        }
+        if (((x.reg(REG_A6XX_GRAS_SC_CNTL) & A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__MASK) >> A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE__SHIFT) ==
+            FLUSH_PER_OVERLAP_AND_OVERWRITE) {
+            return at + " of a prepass reads its target";
+        }
+        if (k > 0 && is[k - 1].indirect && index[k - 1] <= index[k]) return at + " of a prepass runs after a draw that comes before it";
+        // its place: after the pass's draw before the prepass, and no untested draw of the pass between them
+        size_t before = k;
+        while (before > 0 && is[before - 1].indirect) before--;
+        const int64_t prior = before == 0 ? -1 : int64_t(index[before - 1]);
+        if (int64_t(index[k]) <= prior) return at + " of a prepass runs after a later draw of the pass";
+        for (size_t m = k + 1; m < is.size(); m++) {
+            if (is[m].indirect || int64_t(index[m]) <= prior || index[m] >= index[k]) continue;
+            if (!test(is[m])) return at + " of a prepass is drawn across draw " + std::to_string(index[m]) + ", untested";
+        }
+    }
+    return "";
+}
+
+const HsrScene kHsrScenes[] = {
+    {"opaque layers stacked", {{kHsrFlat, 0, 0, 96, 64}, {kHsrFlat, 8, 8, 80, 48}, {kHsrFlat, 0, 0, 96, 64}, {kHsrFlat, 16, 16, 32, 32}}},
+    {"blending behind and in front of an opaque draw", {{kHsrBlend, 0, 0, 96, 64}, {kHsrFlat, 10, 10, 50, 40}, {kHsrBlend, 30, 20, 60, 40}}},
+    {"a fetch behind and in front of an opaque draw", {{kHsrFetch, 0, 0, 96, 64}, {kHsrFlat, 10, 10, 50, 40}, {kHsrFetch, 30, 20, 60, 40}}},
+    {"a discard behind and in front of an opaque draw", {{kHsrKill, 0, 0, 96, 64}, {kHsrFlat, 10, 10, 50, 40}, {kHsrKill, 30, 20, 60, 40}}},
+    {"an opaque draw over half of the rest", {{kHsrBlend, 0, 0, 96, 64}, {kHsrFlat, 0, 0, 48, 64}, {kHsrBlend, 20, 0, 60, 64}}},
+    {"a barrier (colour 1) between a hidden draw and the opaque one over it",
+     {{kHsrBlend, 0, 0, 96, 64}, {kHsrMrt, 20, 20, 40, 30}, {kHsrFlat, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 30, 30}},
+     false,
+     true},
+    {"a visibility result", {{kHsrBlend, 0, 0, 96, 64}, {kHsrQuery, 10, 10, 40, 40}, {kHsrFlat, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 30, 30}}},
+    {"a Clear, then draws", {{kHsrFlat, 0, 0, 60, 40}, {kHsrBlend, 20, 20, 70, 40}, {kHsrFlat, 40, 0, 56, 64}}, true},
+    {"two segments",
+     {{kHsrFlat, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 40, 40}, {kHsrFlat, 30, 0, 66, 64}, {kHsrMrt, 0, 0, 20, 20}, {kHsrBlend, 0, 0, 96, 64},
+      {kHsrFlat, 50, 30, 46, 34}, {kHsrFetch, 10, 10, 80, 50}},
+     false,
+     true},
+    {"two triangles of two colours over each other in one opaque draw", {{kHsrBlend, 0, 0, 96, 64}, {kHsrOverlap, 0, 0, 96, 64}, {kHsrBlend, 20, 20, 40, 30}}},
+    {"instances over each other", {{kHsrBlend, 0, 0, 96, 64}, {kHsrInstances, 8, 8, 70, 50}, {kHsrBlend, 20, 20, 40, 30}}},
+    {"a vertex stage with an IBO, a barrier", {{kHsrBlend, 0, 0, 96, 64}, {kHsrVsIbo, 0, 0, 96, 64}, {kHsrFlat, 10, 10, 30, 30}}},
+    // (the first draw after the segment's hole is a hidden one of the barrier's very shaders: the shadow, kept across the
+    // hole, would leave out the registers of those shaders that the prepass changed -- twin 4's)
+    {"a hidden draw of the barrier's shaders first in its segment",
+     {{kHsrBlendC1, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 60, 40}, {kHsrFlat, 0, 0, 96, 64}},
+     false,
+     true},
+};
+
+uint32_t hsrCount(const HsrScene& s, HsrKind a, HsrKind b = HsrKind(0xff), HsrKind c = HsrKind(0xff)) {
+    uint32_t k = 0;
+    for (const HsrStep& x : s.steps) k += x.kind == a || x.kind == b || x.kind == c;
+    return k;
+}
+}  // namespace
+
+// Every scene of section 5 of the design, drawn with HSR and without: the rules hold, every draw has the class the
+// design gives it, and HSR is off unless asked for (the stream as before).
+TEST(hsr_draws_each_scene_as_the_draws_without_it_by_the_rules) {
+    for (const HsrScene& s : kHsrScenes) {
+        const HsrRun off = runHsr(s, false), on = runHsr(s, true);
+        const std::string broken = hsrRules(off, on);
+        CHECK(broken.empty());
+        if (!broken.empty()) std::printf("       %s: %s\n", s.name, broken.c_str());
+        CHECK_EQ(off.counts.hsrPasses, 0u);
+        CHECK_EQ(on.counts.hsrPasses, 1u);
+        CHECK_EQ(on.counts.hsrOpaque, hsrCount(s, kHsrFlat, kHsrOverlap, kHsrInstances));
+        CHECK_EQ(on.counts.hsrHidden, hsrCount(s, kHsrBlend, kHsrFetch, kHsrKill));
+        CHECK_EQ(on.counts.hsrBarriers, hsrCount(s, kHsrMrt, kHsrVsIbo, kHsrQuery) + hsrCount(s, kHsrBlendC1));
+        uint32_t indirect = 0;
+        for (const auto& l : on.stats.drawLog) indirect += l.indirect;
+        CHECK_EQ(indirect, on.counts.hsrOpaque);   // (each opaque draw in a prepass, and only there)
+        CHECK_EQ(on.stats.draws, off.stats.draws);
+    }
+    // the scenes' prepasses: one a segment with an opaque draw
+    const HsrRun two = runHsr(kHsrScenes[8], true);
+    CHECK_EQ(two.counts.hsrPrepasses, 2u);
+    const HsrRun stacked = runHsr(kHsrScenes[0], true);
+    CHECK_EQ(stacked.counts.hsrPrepasses, 1u);
+}
+
+// Each mutation twin of the stream breaks a rule: 1 the prepass left out (rule 1: its draws never run), 2 a barrier
+// tested (rule 3), 3 a draw that writes colour 1 taken as opaque (rule 2), 4 the shadow kept across a hole (rule 1: the
+// draw after it runs with the prepass's program), 5 the prepass tested Less (rule 2: two primitives of one draw at one
+// Z would leave the first), 6 a draw whose vertex stage has an IBO taken as opaque (rule 2).
+TEST(hsr_rules_catch_each_twin) {
+    struct Case {
+        uint8_t twin;
+        size_t scene;
+        const char* want;
+    };
+    const Case cases[] = {{1, 0, "runs 0 times"},
+                          {2, 5, "writes another attachment or has an IBO, and is tested"},
+                          {3, 5, "of a prepass writes another attachment or has an IBO"},
+                          {4, 12, "runs in another state than without HSR"},
+                          {5, 9, "of a prepass is not tested LessEqual with a depth write"},
+                          {6, 11, "of a prepass writes another attachment or has an IBO"}};
+    for (const Case& c : cases) {
+        const HsrScene& s = kHsrScenes[c.scene];
+        CHECK(hsrRules(runHsr(s, false), runHsr(s, true)).empty());   // (the scene as meant passes)
+        const std::string broken = hsrRules(runHsr(s, false), runHsr(s, true, c.twin));
+        CHECK(has(broken, c.want));
+        if (!has(broken, c.want)) std::printf("       twin %u on %s: \"%s\"\n", c.twin, s.name, broken.c_str());
+    }
+}
+
+// Past its draw limit a pass draws the rest of its draws as barriers, untested, at the Z their viewports give.
+TEST(hsr_past_its_draw_limit_draws_the_rest_as_barriers) {
+    const HsrScene s{"seven draws", {{kHsrFlat, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 40, 40}, {kHsrFlat, 30, 0, 66, 64}, {kHsrFlat, 0, 0, 96, 64},
+                                     {kHsrBlend, 0, 0, 96, 64}, {kHsrFlat, 50, 30, 46, 34}, {kHsrBlend, 10, 10, 80, 50}}};
+    const HsrRun off = runHsr(s, false), on = runHsr(s, true, 0, 3);
+    const std::string broken = hsrRules(off, on, 3);
+    CHECK(broken.empty());
+    if (!broken.empty()) std::printf("       %s\n", broken.c_str());
+    CHECK_EQ(on.counts.hsrOpaque, 2u);
+    CHECK_EQ(on.counts.hsrHidden, 1u);
+    CHECK_EQ(on.counts.hsrBarriers, 4u);
+    // the same scene with the limit taken as Z: one draw past it fails rule 1
+    CHECK(!hsrRules(off, on).empty());
+}
+
+// The prepass's draws are written from the facts the pass's draw is written from: taken from the programs' kept states
+// or judged the long way, the GPU runs every draw of the scene in the same state.
+TEST(hsr_kept_states_and_whole_draws_give_the_same_draws) {
+    for (size_t k : {size_t(0), size_t(1), size_t(8), size_t(12)}) {
+        const bool was = CommandBuffer::keepStates(false);
+        const HsrRun whole = runHsr(kHsrScenes[k], true);
+        CommandBuffer::keepStates(true);
+        const HsrRun kept = runHsr(kHsrScenes[k], true);
+        CommandBuffer::keepStates(was);
+        CHECK(whole.completed && kept.completed);
+        CHECK_EQ(whole.stats.drawLog.size(), kept.stats.drawLog.size());
+        for (size_t i = 0; i < whole.stats.drawLog.size() && i < kept.stats.drawLog.size(); i++) {
+            CHECK_EQ(whole.stats.drawLog[i].digest, kept.stats.drawLog[i].digest);
+            CHECK_EQ(whole.stats.drawLog[i].indirect, kept.stats.drawLog[i].indirect);
+        }
+        CHECK(kept.counts.keptDraws != 0 || k == 12);   // (12 draws each of its programs once)
+        if ((kept.counts.keptDraws == 0 && k != 12) || !whole.completed || !kept.completed) std::printf("       %s: %u kept draws; %s / %s\n", kHsrScenes[k].name, kept.counts.keptDraws, whole.error.c_str(), kept.error.c_str());
+    }
+}
+
+// Version 1 serves a compressed colour 0 alone (the UBWC screen): such a pass is drawn with HSR, GMEM allowed or not,
+// by the rules; one into a linear target, or with a depth attachment or multisampled, is drawn as it comes.
+TEST(hsr_serves_the_passes_into_a_compressed_target_alone) {
+    {
+        Rig r;
+        auto t = target(r), d = depthTarget(r);
+        RenderPass withDepth;
+        withDepth.color0 = t.get();
+        withDepth.depth = d.get();
+        RenderPass linear;
+        linear.color0 = t.get();
+        auto ms = msTarget(r);
+        RenderPass multi;
+        multi.color0 = ms.get();
+        Program flat = flatProgram();
+        flat.ssboWrites = 0;
+        Program flat4 = flat;
+        flat4.samples = 4;
+        auto cb = r.queue->commandBuffer();
+        cb->setHsr(true);
+        CHECK(cb->draw(flat, linear, wholeDraw(6), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flat, withDepth, wholeDraw(6), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flat4, multi, wholeDraw(6), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(cb->counts().hsrPasses, 0u);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+    }
+    // (recorded, not run: this fake draws into linear targets alone -- the passes it would run are the scenes' above,
+    // whose targets setHsrTest's ANY_TARGET takes)
+    Rig r;
+    TextureDesc td;
+    td.format = PixelFormat::kBGRA8Unorm;
+    td.width = 96;
+    td.height = 64;
+    td.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    td.compressed = true;
+    std::string why;
+    auto t = Texture::make(*r.gpu, td, &why);
+    if (t == nullptr) {
+        std::printf("       (no Mesa in this build: %s; no compressed target to draw)\n", why.c_str());
+        return;
+    }
+    Program flat = flatProgram(), blend = flatProgram();
+    flat.ssboWrites = blend.ssboWrites = 0;
+    blend.blend = ColorBlend{true, 0, 0, 4, 5, 1, 5, 0xf};
+    RenderPass pass;
+    pass.color0 = t.get();
+    for (const bool on : {false, true}) {
+        auto cb = r.queue->commandBuffer();
+        cb->setHsr(on);
+        CHECK(cb->draw(blend, pass, wholeDraw(6, 96, 64), Bindings{}, Bindings{}));   // (GMEM allowed: render::gmemPlan refuses a compressed target)
+        CHECK(cb->draw(flat, pass, wholeDraw(6, 96, 64), Bindings{}, Bindings{}));
+        CHECK(cb->draw(blend, pass, wholeDraw(6, 96, 64), Bindings{}, Bindings{}));
+        CHECK_EQ(cb->counts().passes, 1u);
+        CHECK_EQ(cb->counts().hsrPasses, on ? 1u : 0u);
+        CHECK_EQ(cb->counts().hsrOpaque, on ? 1u : 0u);
+        CHECK_EQ(cb->counts().hsrHidden, on ? 2u : 0u);
     }
 }

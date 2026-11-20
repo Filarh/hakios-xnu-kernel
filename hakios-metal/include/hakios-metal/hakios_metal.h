@@ -565,6 +565,10 @@ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
  * What is then drawn is not what was asked: for timing the draws nobody sees, never in use. */
 void hakios_metal_cb_set_draw_tag(hakios_metal_cb *cb, unsigned tag);
 void hakios_metal_cb_cancel_draw(hakios_metal_cb *cb, unsigned tag);
+/* Hidden surface removal by depth (CommandBuffer::setHsr; the plug-in's metal_hsr): ON non-zero draws the passes it
+ * serves -- colour attachment 0 compressed, no depth or stencil attachment, one sample -- with a prepass of their opaque
+ * draws and the rest tested against its depth, the picture the same; 0, as by default, draws every pass as it comes. */
+void hakios_metal_cb_set_hsr(hakios_metal_cb *cb, int on);
 /* How the process's command buffers take their draws from now on (CommandBuffer::keepStates, verifyDraws). KEEP 0:
  * each draw judged and written whole, as the first with its program is -- the stream is the same either way, so this is
  * a bisect's switch and a measurement's. VERIFY 1: each draw taken from its program's kept state is also written whole

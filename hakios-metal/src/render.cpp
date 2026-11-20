@@ -3933,6 +3933,43 @@ bool sameTargets(const RenderPass& a, const RenderPass& b) {
     return true;
 }
 
+// --- hidden surface removal by depth (CommandBuffer::setHsr) ---------------------------------------------------------------
+// A draw's class in a pass drawn with it, from what the draw's Program, the pass (the caller's, without the depth the
+// HSR adds) and the Draw say alone -- no geometry (dev-notes/investigacion/anexos/32-interfaz-telegram/02 section 2):
+// - writes colour 0 alone: every other attachment the pass has masked off by its pipeline (moreBlend's write mask)
+// - no memory written: Program::ssboWrites 0 and no IBO in either stage (an image a stage writes is an IBO; moving the
+//   vertex stage of a draw with any of them to the prepass would change when it runs against the rest)
+// Opaque, besides: colour 0 written (the FS has the output and the mask is whole), blending off, no discard, no
+// framebuffer fetch (fbRead, a texture slot that is a fetch's), no depth, sample mask or stencil from the FS, one
+// sample, no visibility result. Hidden: no depth from the FS (writesPos, depthRegid) and no visibility result -- it
+// may blend, discard or fetch, since it is drawn in its place. Barrier: anything else.
+// (TWIN, CommandBuffer::setHsrTest's: 3 the other attachments not asked about for an opaque draw, 6 the IBOs and
+// ssboWrites not asked about for one)
+enum HsrClass : uint8_t { kHsrOpaque = 0, kHsrHidden = 1, kHsrBarrier = 2 };
+HsrClass hsrClassOf(const Program& p, const RenderPass& pass, const Draw& d, uint8_t twin) {
+    const Stage& fs = p.fs;
+    bool othersMasked = true;
+    for (uint32_t i = 0; i < kMaxColorOutputs - 1; i++) {
+        if (pass.more[i].texture != nullptr && p.moreBlend[i].writeMask != 0) othersMasked = false;
+    }
+    const bool noMemory = p.ssboWrites == 0 && p.vs.k.numIbos == 0 && fs.k.numIbos == 0;
+    const bool fsDepth = fs.writesPos != 0 || fs.depthRegid != kRegidNone;
+    bool fetchSlot = false;
+    for (uint32_t i = 0; i < kMaxTextureSlots && i < fs.k.numTextureSlots; i++) fetchSlot = fetchSlot || fs.k.textures[i].fbTarget != 0;
+    const bool opaque = (othersMasked || twin == 3) && (noMemory || twin == 6) && (drawnAttachments(p, pass) & 1u) != 0 && !p.blend.enabled &&
+                        p.blend.writeMask == 0xf && fs.hasKill == 0 && fs.fbRead == 0 && !fetchSlot && !fsDepth && fs.sampleMaskRegid == kRegidNone &&
+                        fs.writesSmask == 0 && fs.stencilRefRegid == kRegidNone && fs.writesStencilref == 0 && p.samples == 1 &&
+                        firstAttachment(pass)->samples() == 1 && d.visibilityMode == 0;
+    if (opaque) return kHsrOpaque;
+    if (othersMasked && noMemory && !fsDepth && d.visibilityMode == 0) return kHsrHidden;
+    return kHsrBarrier;
+}
+// Z_I of the pass's draw I: 1 - (I + 1) 2^-16, which a Depth32Float holds exactly (and a Depth16, version 2's)
+double hsrZ(uint32_t i) { return 1.0 - double(i + 1) / 65536.0; }
+// the prepass's words at most: the bound turnip keeps every IB of its own under (tu_cs.cc:470-473, "an upper bound on
+// IB size, which appears to be 0x0fffff"); an opaque draw that would take it past is drawn as a barrier
+constexpr size_t kHsrPrepassMaxWords = 0x0fffff;
+
 // --- a draw onto a pass's stream from a kept state --------------------------------------------------------------------------
 // The groups in the order a draw has them. One kept as words goes through the shadow unless the stream last held those
 // very words for it; one made of the draw's numbers is made when the numbers are not the last draw's; the two stages'
@@ -4268,7 +4305,7 @@ void CommandBuffer::PassReturn::operator()(OpenPass* p) const {
         return;
     }
     RegShadow regs = std::move(p->regs), bodyRegs = std::move(p->bodyRegs);
-    pm4::Stream bodies = std::move(p->bodies), sysStream = std::move(p->sysStream), headGmem = std::move(p->headGmem);
+    pm4::Stream bodies = std::move(p->bodies), sysStream = std::move(p->sysStream), headGmem = std::move(p->headGmem), hsrPrepass = std::move(p->hsrPrepass);
     std::vector<uint8_t> staticKey = std::move(p->staticKey);
     std::shared_ptr<render::PassCache> cache = std::move(p->cache);
     *p = OpenPass{};
@@ -4277,12 +4314,14 @@ void CommandBuffer::PassReturn::operator()(OpenPass* p) const {
     bodies.clear();
     sysStream.clear();
     headGmem.clear();
+    hsrPrepass.clear();
     staticKey.clear();
     p->regs = std::move(regs);
     p->bodyRegs = std::move(bodyRegs);
     p->bodies = std::move(bodies);
     p->sysStream = std::move(sysStream);
     p->headGmem = std::move(headGmem);
+    p->hsrPrepass = std::move(hsrPrepass);
     p->staticKey = std::move(staticKey);
     if (cache != nullptr && cache.use_count() == 1) {
         *cache = render::PassCache{};
@@ -4318,11 +4357,35 @@ void CommandQueue::givePass(CommandBuffer::OpenPass* p) {
 void CommandBuffer::verifyDraws(bool on) { render::gVerifyDraws = on; }
 bool CommandBuffer::keepStates(bool on) { return render::gKeepStates.exchange(on); }
 
-bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
+bool CommandBuffer::draw(const Program& program, const RenderPass& given, const Draw& givenDraw, const Bindings& vsBindings, const Bindings& fsBindings,
                          const render::Options& options) {
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
+    // setHsr: a pass it serves is drawn with the queue's depth attachment, each draw with its Z and its class's test
+    // (command.hpp). The draw goes on as a draw of PASS and D, those; GIVEN and GIVEN_DRAW are what was asked. A draw
+    // that asks for a depth or stencil test of its own -- refused, the pass having neither -- is left as it came, to be
+    // refused by name as it would be. (Its depth attachment's load action Load for the join, Clear for a pass it opens.)
+    RenderPass hsrPass;
+    Draw hsrDraw;
+    std::shared_ptr<Texture> hsrDepth;
+    if (hsr_ && given.color0 != nullptr && (given.color0->compressed() || hsrAnyTarget_) && given.depth == nullptr && given.stencil == nullptr &&
+        given.color0->samples() == 1 && givenDraw.depth.compare == 7 && !givenDraw.depth.write && !givenDraw.stencil.enabled) {
+        const auto [W, H] = render::windowOf(given);
+        std::string no;
+        hsrDepth = queue_.hsrDepth(W, H, &no);   // (none to be had: the draw goes on without, a pass of its own)
+        if (hsrDepth != nullptr) {
+            hsrPass = given;
+            hsrPass.depth = hsrDepth.get();
+            hsrPass.depthLevel = hsrPass.depthSlice = 0;
+            hsrPass.depthLoad = LoadAction::kLoad;
+            hsrPass.depthStore = StoreAction::kDontCare;
+            hsrPass.clearDepth = 1.0;
+        }
+    }
+    const bool hsr = hsrDepth != nullptr;
+    const RenderPass& pass = hsr ? hsrPass : given;
+    const Draw& d = hsr ? hsrDraw : givenDraw;   // (written below, once the draw's place in its pass is known)
     // A compressed texture whose rows this processor changed since the GPU last copied them in (Texture::staging): the
     // copy first, by the 2D engine into the UBWC layout, in a pass of its own before this draw's
     if (!freshen(vsBindings, options) || !freshen(fsBindings, options)) return false;
@@ -4346,6 +4409,20 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         // (the attachments past 0 the same textures and stores, none asking for a Clear: the same pass)
         const ColorAttachment &a = pass.more[i], &b = open_->pass.more[i];
         joins = a.texture == b.texture && a.level == b.level && a.store == b.store && (a.texture == nullptr || a.load != LoadAction::kClear);
+    }
+    // setHsr: the draw's place in its pass, its class, its Z and its test (a pass it opens clears its depth)
+    render::HsrClass hsrClass = render::kHsrBarrier;
+    bool hsrOpens = false;   // (it begins a segment: its hole, and the shadow and the cursors forgotten there)
+    if (hsr) {
+        if (!joins) hsrPass.depthLoad = LoadAction::kClear;
+        const uint32_t i = joins ? open_->hsrDraws : 0;
+        hsrDraw = givenDraw;
+        if (i < hsrLimit_) {
+            hsrClass = render::hsrClassOf(program, given, givenDraw, hsrTwin_);
+            hsrDraw.viewport.znear = hsrDraw.viewport.zfar = render::hsrZ(i);
+            if (hsrClass != render::kHsrBarrier || hsrTwin_ == 2) hsrDraw.depth = DepthState{3, false};   // LessEqual, no write
+        }
+        hsrOpens = hsrClass != render::kHsrBarrier && !(joins && open_->hsrSegment);
     }
 
     // --- what this program came to the last time it was drawn into a pass of this kind (render.cpp: ProgramState) ---
@@ -4664,6 +4741,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     // program, blending, sample count and options are the last draw's in this pass: deduplication dropped every word of
     // it anyway, and making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made
     // the deduplication forget what the registers hold (staticKey emptied then).
+    const render::Options wholeOptions = encodeOptions;   // (every group: an HSR prepass's draw is written whole)
     std::vector<uint8_t>& staticKey = dc.staticKey;
     staticKey.clear();
     if (!fast && options.dedupRegs) {
@@ -4677,7 +4755,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         // (the options before the two lines above changed them, as they were keyed when the key was made of them: a pass's
         // draws have the same two changes or none)
         add(&options, sizeof options);
-        if (joins && !open_->staticKey.empty() && open_->staticKey == staticKey) {
+        // (not for the first draw of an HSR segment: the prepass runs before it, behind the shadow's back)
+        if (joins && !open_->staticKey.empty() && open_->staticKey == staticKey && !(hsrOpens && hsrTwin_ != 4)) {
             encodeOptions.zsNone = encodeOptions.mrt = encodeOptions.msaaOff = encodeOptions.renderCntl = encodeOptions.lrzOff = false;
             encodeOptions.vpc = encodeOptions.fsInputs = encodeOptions.fsOutputs = false;
             sysOptions.zsNone = sysOptions.mrt = sysOptions.msaaOff = sysOptions.renderCntl = sysOptions.lrzOff = false;
@@ -4724,6 +4803,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         gmemClears_ = 0;
         open_->kind = kind;
         open_->ordinal = ordinal;
+        open_->hsr = hsr;
+        if (hsr) {
+            keepAlive(hsrDepth);   // (the queue's may be let go for another size while this buffer is in flight)
+            counts_.hsrPasses++;
+        }
         useAttachments(pass);
         counts_.passes++;
     }
@@ -4743,6 +4827,36 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     open_->lastFetched = program.fs.fbRead != 0;
     open_->draws++;
     pm4::Stream& into = open_->gmem ? open_->bodies : stream_;
+    if (hsr) {
+        // (a pass with a depth attachment is never tiled, gmemPlan: INTO is the stream)
+        open_->hsrDraws++;
+        if (hsrClass == render::kHsrBarrier) {
+            if (!hsrCloseSegment()) return false;
+        } else if (hsrOpens) {
+            hsrOpenSegment();
+        }
+        if (hsrClass == render::kHsrOpaque) {
+            // its whole words for the prepass (LessEqual and a depth write; 5, the twin: Less), from the facts the pass's
+            // draw is written from; past what an IB holds it is a barrier instead, the segment ending before it
+            Draw whole = hsrDraw;
+            whole.depth = DepthState{hsrTwin_ == 5 ? 1u : 3u, true};
+            const size_t at = open_->hsrPrepass.size();
+            render::emitDraw(open_->hsrPrepass, f, program, pass, whole, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), wholeOptions, nullptr, false,
+                             render::kGAll);
+            if (open_->hsrPrepass.size() > render::kHsrPrepassMaxWords) {
+                open_->hsrPrepass.truncate(at);
+                hsrClass = render::kHsrBarrier;
+                hsrDraw.depth = DepthState{};
+                f.depthTest = false;
+                if (!hsrCloseSegment()) return false;
+            } else {
+                open_->hsrStarts.push_back(at);
+            }
+        }
+        if (hsrClass == render::kHsrOpaque) counts_.hsrOpaque++;
+        if (hsrClass == render::kHsrHidden) counts_.hsrHidden++;
+        if (hsrClass == render::kHsrBarrier) counts_.hsrBarriers++;
+    }
     const bool timed = profileDraws_ && !open_->gmem && drawsProfiled_.size() < kMaxProfiledDraws;
     if (timed) {
         DrawTime dt{program.name != nullptr ? program.name : "?", 0};
@@ -4886,6 +5000,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
         open_->cache->cur[0].forget();
         open_->cache->cur[1].forget();
+    }
+    if (hsr && hsrClass == render::kHsrOpaque) {
+        // (drawn in the prepass: here its state alone, which the draws after it are written against)
+        into.nopPacket(into.lastPacket(markInto, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI), a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI);
     }
     if (drawTag_ != 0) {
         // (setDrawTag: where this draw's draw packet went, for a cancelDraw while the pass is open)
@@ -5143,6 +5261,53 @@ bool CommandBuffer::append(CommandBuffer& other) {
     return true;
 }
 
+void CommandBuffer::hsrOpenSegment() {
+    OpenPass& o = *open_;
+    o.hsrHole = stream_.size();
+    stream_.nop(3);   // (CP_INDIRECT_BUFFER's three words, when the segment has a prepass)
+    if (hsrTwin_ != 4) {
+        o.regs.clear();
+        o.staticKey.clear();
+        o.cache->cur[0].forget();
+        o.cache->cur[1].forget();
+    }
+    o.hsrSegment = true;
+    o.hsrPrepass.clear();
+    o.hsrStarts.clear();
+}
+
+bool CommandBuffer::hsrCloseSegment() {
+    if (open_ == nullptr || !open_->hsrSegment) return true;
+    OpenPass& o = *open_;
+    o.hsrSegment = false;
+    if (o.hsrStarts.empty() || hsrTwin_ == 1) return true;   // (no opaque draw: the hole stays a NOP)
+    const std::vector<uint32_t>& w = o.hsrPrepass.words();
+    // (a buffer of its own from the queue's pool, not a piece of the slab: the draws' tables are cut where they would be
+    // without HSR, and a prepass of a few dozen whole draws would take a fair share of a slab)
+    std::string why;
+    std::shared_ptr<Buffer> ib = queue_.takeBuffer(4 * w.size(), &why);
+    if (ib == nullptr) {
+        // (the opaque draws' packets are NOPs: without the prepass they would not be drawn at all)
+        return fail("no memory for an HSR prepass: " + why);
+    }
+    slabs_.push_back(ib);   // (given back to the queue with the slabs when the buffer is done)
+    use(*ib, false);
+    keep(ib);
+    // the opaque draws last to first, each whole
+    auto* out = reinterpret_cast<uint32_t*>(ib->contents());
+    size_t put = 0;
+    for (size_t k = o.hsrStarts.size(); k-- > 0;) {
+        const size_t from = o.hsrStarts[k], to = k + 1 < o.hsrStarts.size() ? o.hsrStarts[k + 1] : w.size();
+        std::memcpy(out + put, w.data() + from, 4 * (to - from));
+        put += to - from;
+    }
+    const uint64_t at = ib->gpuAddress();
+    const uint32_t call[4] = {pm4::type7(pm4::kIndirectBuffer, 3), uint32_t(at), uint32_t(at >> 32), uint32_t(w.size())};
+    if (!stream_.patch(o.hsrHole, call, 4)) return fail("an HSR segment's hole is not in the stream");
+    counts_.hsrPrepasses++;
+    return true;
+}
+
 bool CommandBuffer::cancelDraw(uint32_t tag) {
     for (const DrawMark& m : drawMarks_) {
         if (m.tag != tag || open_ == nullptr) continue;
@@ -5160,6 +5325,7 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
     if (open_ == nullptr) {
         return;
     }
+    (void)hsrCloseSegment();   // (setHsr: the last segment's prepass; on failure the buffer has failed)
     // What the tiles load and store of each attachment (masks), the render area's last row being Y1 of a window H high.
     // A touched one is loaded unless its load action is DontCare and the area's granules stay above its last row (below
     // it the store would put back what it never loaded into the rows of the next layer or level; CoreAnimation's second

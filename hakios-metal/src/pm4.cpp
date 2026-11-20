@@ -1,5 +1,6 @@
 #include "hakios-metal/pm4.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 
@@ -44,6 +45,12 @@ bool Stream::nopPacket(size_t at, uint32_t opcodeA, uint32_t opcodeB) {
     const Header h = decode(words_[at]);
     if (h.kind != Header::kCommand || (h.opcode != opcodeA && h.opcode != opcodeB) || at + h.count >= words_.size()) return false;
     words_[at] = type7(kNop, h.count);
+    return true;
+}
+
+bool Stream::patch(size_t at, const uint32_t* words, size_t n) {
+    if (at > words_.size() || n > words_.size() - at) return false;
+    std::copy(words, words + n, words_.begin() + long(at));
     return true;
 }
 

@@ -179,6 +179,9 @@ public:
         // ...of the draws, those encoded from what the queue keeps of their program (render.cpp: ProgramState) rather than
         // judged and written whole: all but the first with each program in each kind of pass, when all is well
         uint32_t keptDraws = 0;
+        // setHsr's: the passes drawn with it, their draws by class (each drawn in the prepass, tested, or as a barrier),
+        // and the prepasses written (segments that had an opaque draw)
+        uint32_t hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0, hsrPrepasses = 0;
     };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -250,6 +253,39 @@ public:
     void setDrawTag(uint32_t tag) { drawTag_ = tag; }
     bool cancelDraw(uint32_t tag);
     uint32_t cancelledDraws() const { return cancelled_; }
+    // Hidden surface removal by depth (the plug-in's metal_hsr; dev-notes/investigacion/anexos/32-interfaz-telegram/
+    // 02-hsr-por-profundidad.md): what a GPU of Apple's does not shade -- a fragment a later opaque draw of the pass
+    // covers -- is not shaded here either, and the picture is the one the draws give in their order. Off by default.
+    // Version 1 serves the passes that are sysmem whatever is drawn: colour attachment 0 compressed (the UBWC screen,
+    // which render::gmemPlan refuses), no depth or stencil attachment of their own, one sample. Such a pass is drawn
+    // with a depth attachment of the queue's (CommandQueue::hsrDepth: Depth32Float, the window's size, cleared to 1
+    // as the pass opens and never stored), and each of its draws I with Z_I = 1 - (I + 1) 2^-16 for its depth through
+    // the viewport (znear = zfar = Z_I: the clipping before the viewport is the draw's own). Each draw is one of three
+    // classes, from its Program, the pass and the Draw alone (render.cpp: hsrClassOf):
+    //   opaque    writes colour 0 alone, blending off and every channel, no discard, no framebuffer fetch, no memory
+    //             written or read through IBOs by either stage, no depth, sample mask or stencil from the FS, one
+    //             sample, no visibility result: drawn in the prepass of its segment, its draw packet in the pass a NOP
+    //   hidden    writes colour 0 alone, no memory written by either stage, no depth from the FS, no visibility
+    //             result (it may blend, discard or fetch): drawn in its place, tested LEQUAL against the depth, no write
+    //   barrier   anything else, and every draw past kHsrMaxDraws: drawn in its place untested; it ends its segment
+    // A segment is the draws between two barriers. Its first draw leaves a hole in the stream (a NOP of 3 words) and the
+    // register shadow and the cursors are forgotten there, so that this draw writes its whole state; at the segment's
+    // end the hole becomes a CP_INDIRECT_BUFFER to the prepass: the segment's opaque draws in REVERSE order, each with
+    // its whole state, tested LEQUAL and writing colour and depth -- the last opaque over a pixel is the first to reach
+    // it and the earlier ones fail (larger Z), the primitives of one draw (same Z) land as they come.
+    void setHsr(bool on) { hsr_ = on; }
+    static constexpr uint32_t kHsrMaxDraws = 65534;   // (the design's: Z_I > 0 for every I below it)
+    // (for the tests) TWIN: a mutation of the stream the tests' rules must catch -- 1 the prepass left out (the hole
+    // stays a NOP, the opaque draws still NOPs), 2 a barrier tested as a hidden draw, 3 an opaque draw that writes
+    // another attachment taken as opaque, 4 the shadow and the cursors kept at a segment's hole, 5 the prepass tested
+    // LESS, 6 an opaque draw whose stages have IBOs taken as opaque; 0 the stream as meant. LIMIT: kHsrMaxDraws, or
+    // fewer to reach it in a test. ANY_TARGET: a pass whose colour 0 is not compressed taken too (the suites without
+    // Mesa have no compressed texture).
+    void setHsrTest(uint8_t twin, uint32_t limit = kHsrMaxDraws, bool anyTarget = false) {
+        hsrTwin_ = twin;
+        hsrLimit_ = limit < kHsrMaxDraws ? limit : kHsrMaxDraws;
+        hsrAnyTarget_ = anyTarget;
+    }
     // why the last pass that could not be drawn in GMEM was not (gmemPlan's or gmemDrawOk's reason), empty when none was refused
     const std::string& gmemRefusal() const { return gmemWhy_; }
     // the words recorded so far (what the command processor will read; once it is done, what it was given)
@@ -294,6 +330,13 @@ private:
     };
     uint32_t drawTag_ = 0, cancelled_ = 0;
     std::vector<DrawMark> drawMarks_;
+    bool hsr_ = false, hsrAnyTarget_ = false;   // setHsr's, setHsrTest's
+    uint8_t hsrTwin_ = 0;
+    uint32_t hsrLimit_ = kHsrMaxDraws;
+    // setHsr: a segment of the open pass begun (its hole, the shadow and the cursors forgotten), and ended (the hole made
+    // the prepass's CP_INDIRECT_BUFFER when the segment had an opaque draw); false with the buffer failed
+    void hsrOpenSegment();
+    bool hsrCloseSegment();
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)
     std::string gmemWhy_;
     std::unordered_map<uint64_t, uint32_t> ordinals_;   // passes opened so far into each kind of target
@@ -407,6 +450,14 @@ private:
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
         std::shared_ptr<render::PassCache> cache;
+        // setHsr: the pass is drawn so (its depth attachment the queue's), the draws given a Z so far, and the segment
+        // open: where its hole lies in the stream, its opaque draws' words each whole (HSR_PREPASS, in their order),
+        // and where each of them begins there
+        bool hsr = false, hsrSegment = false;
+        uint32_t hsrDraws = 0;
+        size_t hsrHole = 0;
+        pm4::Stream hsrPrepass;
+        std::vector<size_t> hsrStarts;
     };
     // NEXT: the pass of the draw that could not join the open one, when it is such a draw that closes it (nullptr for
     // anything else: a copy, a dispatch, the commit). A memoryless attachment the tiles wrote is stored for it alone:
@@ -508,6 +559,13 @@ public:
     // the visibility streams' memory binned GMEM passes share (render::vscBytes): one is enough, the GPU running one
     // submission at a time and each pass's binning before its tiles; nullptr with *why
     std::shared_ptr<Buffer> vscBuffer(std::string* why);
+    // The depth attachment of a pass drawn with CommandBuffer::setHsr: a Depth32Float render target of W x H, the queue's,
+    // one for each size asked for lately (kHsrDepthSizes, the least recently asked for let go). Every pass that uses it
+    // clears it as it opens and stores nothing of it, and the GPU runs one submission at a time, so the passes of every
+    // command buffer share it; a command buffer keeps the one it drew with alive. nullptr with *why.
+    std::shared_ptr<Texture> hsrDepth(uint32_t width, uint32_t height, std::string* why);
+    // (the screen's size and the odd other: CoreAnimation's compressed targets are its screens, all of one size)
+    static constexpr size_t kHsrDepthSizes = 2;
     // K's words in a buffer of their own, made the first time a command buffer of this queue draws with them and kept
     // for the next: copying them into each command buffer was most of a draw's first cost (CoreAnimation's uber shader is
     // 124 KB, into write-combined memory). Found by the words' pointer and taken only when every word is the same -- a
@@ -571,6 +629,7 @@ private:
     Gpu& gpu_;
     std::shared_ptr<Texture> null_;   // (under lock_) nullTexture's
     std::shared_ptr<Buffer> vsc_;     // (under lock_) vscBuffer's
+    std::vector<std::shared_ptr<Texture>> hsrDepths_;   // (under lock_) hsrDepth's, the last asked for at the back
     // (under poolLock_, a lock of its own: a command buffer gives its stamps back as it is destroyed, which can be under
     // lock_ -- the queue letting go of the last one in flight -- and lock_ there was the window server hung at boot)
     std::mutex poolLock_;

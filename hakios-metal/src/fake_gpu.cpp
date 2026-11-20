@@ -2139,7 +2139,7 @@ void FakeGpu::logDraws(bool on, bool state) {
 
 // a draw that ran, into the log: where it ran and a digest (FNV-1a) of every register as written and of what each
 // stage has loaded
-void FakeGpu::logDraw(bool binning) {
+void FakeGpu::logDraw(bool binning, bool indirect) {
     if (!logDraws_) return;
     uint64_t k = 0xcbf29ce484222325ull;
     std::vector<uint64_t> state;
@@ -2170,7 +2170,9 @@ void FakeGpu::logDraw(bool binning) {
     }
     mix(gfxIbosLoaded_ ? gfxIbosFrom_ : ~0ull);
     mix(gfxIboUnits_);
-    stats_.drawLog.push_back(Stats::DrawLog{tileOrdinal_, drawOrdinal_ - 1, binning, k, std::move(state)});
+    stats_.drawLog.push_back(Stats::DrawLog{tileOrdinal_, drawOrdinal_ - 1, binning, k, std::move(state), indirect,
+                                            std::vector<uint32_t>(sinceDraw_.begin(), sinceDraw_.end())});
+    sinceDraw_.clear();
 }
 
 // the packets from ADDRESS on, WORDS of them; false on a fault (the submission stops there)
@@ -2213,6 +2215,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
             for (uint32_t j = 0; j < h.count; j++) {
                 regs_[h.reg + j] = p[j];   // kept as written; a dispatch or a draw is checked against them
                 written_.insert(h.reg + j);
+                if (logState_) sinceDraw_.insert(h.reg + j);
                 if (h.reg + j == REG_A6XX_HLSQ_INVALIDATE_CMD) invalidate(p[j]);
                 if (binning_ && depth >= 1 && logDraws_ && bodySeen_.insert(h.reg + j).second) bodyOrder_.push_back(h.reg + j);
                 if (h.reg + j == REG_A6XX_RB_CCU_CNTL) {
@@ -2307,6 +2310,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     binned_ = false;
                     tileOrdinal_ = ~0u;
                     drawOrdinal_ = 0;
+                    sinceDraw_.clear();   // (what the batch start set is no draw's)
                     stats_.passes++;
                 }
                 // the binning pass: within a pass begun, before its tiles
@@ -2477,14 +2481,14 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     regs_[REG_A6XX_VFD_INSTANCE_START_OFFSET] = w[4];
                     uint32_t d[7] = {p[0], w[1], w[0], 0, uint32_t(base), uint32_t(base >> 32), w[2] <= p[5] ? p[5] - w[2] : 0};
                     if (!execDraw(d, 7)) return false;
-                    logDraw(binning_);
+                    logDraw(binning_, depth > 0);
                 } else {
                     // vertexCount, instanceCount, firstVertex, firstInstance
                     regs_[REG_A6XX_VFD_INDEX_OFFSET] = w[2];
                     regs_[REG_A6XX_VFD_INSTANCE_START_OFFSET] = w[3];
                     uint32_t d[3] = {p[0], w[1], w[0]};
                     if (!execDraw(d, 3)) return false;
-                    logDraw(binning_);
+                    logDraw(binning_, depth > 0);
                 }
                 break;
             }
@@ -2495,7 +2499,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 if (!execDraw(p, h.count)) {
                     return false;
                 }
-                logDraw(binning_);
+                logDraw(binning_, depth > 0);
                 break;
             }
             case CP_BLIT:
