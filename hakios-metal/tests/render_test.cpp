@@ -3549,6 +3549,86 @@ TEST(a_depth32float_texture_is_tiled_and_an_attachment_only) {
     }
 }
 
+// A Depth16Unorm attachment (CommandBuffer::setHsrDepth's): DEPTH6_16 (1) in both copies, its 256-byte rows, its Clear a
+// fill of FMT6_16_UNORM (54) TILE6_3 through R2D_FLOAT32 with the float bits of the clear value (r2d_clear_value's Z16
+// branch); the fake runs it. And with an LRZ buffer beside it (RenderPass::depthLrz): the buffer's registers -- its base,
+// PITCH 32 values (64 x 64: 8 blocks across, to 32) >> 5 = 1, no fast-clear buffer --, its Clear a second, linear,
+// FMT6_16_UNORM fill of PITCH x HEIGHT values to 1.0 between a CACHE_FLUSH_TS and the colour CCU's flush with a
+// CACHE_INVALIDATE, and the draw's LRZ: tested Less with a write, ENABLE | LRZ_WRITE | Z_TEST_ENABLE (0x13), the RB's
+// ENABLE; tested without a write ENABLE alone; untested, blended or with stencil, 0.
+TEST(a_depth16_attachment_and_its_lrz) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    auto d = target(r, 64, 64, kTextureUsageRenderTarget, PixelFormat::kDepth16Unorm);
+    RenderPass pass;
+    pass.color0 = t.get();
+    pass.depth = d.get();
+    pass.depthLoad = LoadAction::kClear;
+    Draw dr = wholeDraw();
+    dr.depth = DepthState{1, true};
+    Program flat = flatProgram();
+    flat.ssboWrites = 0;   // (unknown is taken as writing memory: a stage that does has the LRZ off, TU_LRZ_FORCE_DISABLE_LRZ)
+    Encoded e(r, flat, pass, dr);
+    CHECK(e.ok);
+    CHECK_EQ(e.reg(REG_A6XX_RB_DEPTH_BUFFER_INFO), uint32_t(DEPTH6_16));
+    CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), uint32_t(DEPTH6_16));
+    CHECK_EQ(e.reg(REG_A6XX_RB_DEPTH_BUFFER_PITCH), 256u >> 6);
+    CHECK_EQ(e.reg(REG_A6XX_RB_2D_DST_INFO), uint32_t(FMT6_16_UNORM) | 3u << 8);
+    CHECK_EQ(e.reg(REG_A6XX_RB_2D_SRC_SOLID_C0), 0x3f800000u);
+    CHECK_EQ((e.reg(REG_A6XX_RB_2D_BLIT_CNTL) & A6XX_RB_2D_BLIT_CNTL_IFMT__MASK) >> A6XX_RB_2D_BLIT_CNTL_IFMT__SHIFT, uint32_t(R2D_FLOAT32));
+    CHECK_EQ(e.reg(REG_A6XX_GRAS_LRZ_CNTL), 0u);
+    {
+        auto cb = drawOnce(r, flat, pass, dr);
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    }
+    if (!render::kLrzServed) return;
+    std::string why;
+    auto lrz = newBuffer(*r.gpu, render::lrzLayout(64, 64).bytes(), &why);
+    CHECK(lrz != nullptr);
+    if (lrz == nullptr) return;
+    CHECK_EQ(render::lrzLayout(64, 64).pitch, 32u);
+    CHECK_EQ(render::lrzLayout(750, 1624).pitch, 96u);    // (94 blocks across, to 32)
+    CHECK_EQ(render::lrzLayout(750, 1624).height, 224u);  // (203 blocks down, to 32)
+    pass.depthLrz = lrz.get();
+    Encoded l(r, flat, pass, dr);
+    CHECK(l.ok);
+    CHECK_EQ(uint64_t(l.reg(REG_A6XX_GRAS_LRZ_BUFFER_BASE)) | uint64_t(l.reg(REG_A6XX_GRAS_LRZ_BUFFER_BASE + 1)) << 32, lrz->gpuAddress());
+    CHECK_EQ(l.reg(REG_A6XX_GRAS_LRZ_BUFFER_PITCH), 1u);
+    CHECK_EQ(l.reg(REG_A6XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE), 0u);
+    CHECK_EQ(l.reg(REG_A6XX_GRAS_LRZ_CNTL), 0x13u);
+    CHECK_EQ(l.reg(REG_A6XX_RB_LRZ_CNTL), 1u);
+    const size_t first = l.find(CP_BLIT), second = first == size_t(-1) ? first : l.find(CP_BLIT, first + 1);
+    CHECK(second != size_t(-1) && l.find(CP_BLIT, second + 1) == size_t(-1));   // (the depth's fill, then the LRZ's)
+    CHECK_EQ(l.reg(REG_A6XX_RB_2D_DST_INFO), uint32_t(FMT6_16_UNORM));   // (the last fill: linear, WZYX 0)
+    CHECK_EQ(l.reg(REG_A6XX_GRAS_2D_DST_BR), 31u | 31u << 16);
+    CHECK_EQ(uint64_t(l.reg(REG_A6XX_RB_2D_DST)) | uint64_t(l.reg(REG_A6XX_RB_2D_DST + 1)) << 32, lrz->gpuAddress());
+    struct Case {
+        DepthState depth;
+        bool blend, stencil;
+        uint32_t want;
+    };
+    for (const Case c : {Case{{3, false}, false, false, 0x1u}, Case{{7, false}, false, false, 0u}, Case{{3, true}, true, false, 0x1u},
+                         Case{{4, true}, false, false, 0u}, Case{{1, true}, false, true, 0u}}) {
+        Draw x = wholeDraw();
+        x.depth = c.depth;
+        if (c.stencil) x.stencil.enabled = true;
+        Program p = flat;
+        p.blend.enabled = c.blend;
+        Encoded k(r, p, pass, x);
+        CHECK(k.ok || c.stencil);   // (a stencil test without a stencil attachment is refused: no LRZ to judge)
+        if (k.ok) CHECK_EQ(k.reg(REG_A6XX_GRAS_LRZ_CNTL), c.want);
+    }
+    // ...and a stage that may write memory, none
+    Encoded mem(r, flatProgram(), pass, dr);
+    CHECK_EQ(mem.reg(REG_A6XX_GRAS_LRZ_CNTL), 0u);
+    // the fake runs it, the LRZ cleared in the pass and out of the caches
+    auto cb = drawOnce(r, flat, pass, dr);
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+}
+
 TEST(a_draw_tests_and_writes_depth_through_its_attachment) {
     using namespace a6xx;
     Rig r;
@@ -7070,7 +7150,8 @@ struct HsrRun {
 // (Options::dedupRegs off), so that the log says which registers each sets; TWIN and LIMIT setHsrTest's. The target is
 // linear, which this fake draws into (a compressed one it does not), taken by setHsrTest's ANY_TARGET; every pass in
 // sysmem, as a pass into a compressed target is.
-HsrRun runHsr(const HsrScene& scene, bool on, uint8_t twin = 0, uint32_t limit = CommandBuffer::kHsrMaxDraws) {
+HsrRun runHsr(const HsrScene& scene, bool on, uint8_t twin = 0, uint32_t limit = CommandBuffer::kHsrMaxDraws,
+              CommandBuffer::HsrDepth kind = CommandBuffer::kHsrDepth16, bool lrz = false) {
     HsrRun out;
     Rig r;
     const uint32_t W = 96, H = 64;
@@ -7110,10 +7191,10 @@ HsrRun runHsr(const HsrScene& scene, bool on, uint8_t twin = 0, uint32_t limit =
     render::Options o;
     o.gmem = false;
     o.dedupRegs = on;
-    // (what the queue makes at a first use made before the scene, with HSR or without: the depth attachment, each
+    // (what the queue makes at a first use made before the scene, with HSR or without: the depth attachment (and its LRZ), each
     // program's words, a slab -- so that every buffer lies at the same address in both runs, and the state the GPU has
     // at each draw, addresses and all, is the same but for what HSR changes)
-    CHECK(r.queue->hsrDepth(W, H, &why) != nullptr);
+    CHECK(r.queue->hsrDepth(W, H, &why, kind, lrz && render::kLrzServed).depth != nullptr);
     {
         auto warm = target(r, W, H, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
         RenderPass wp;
@@ -7133,6 +7214,7 @@ HsrRun runHsr(const HsrScene& scene, bool on, uint8_t twin = 0, uint32_t limit =
     }
     auto cb = r.queue->commandBuffer();
     cb->setHsr(on);
+    cb->setHsrDepth(kind, lrz);
     cb->setHsrTest(twin, limit, true);
     RenderPass pass;
     pass.color0 = t.get();
@@ -7221,6 +7303,10 @@ std::string hsrRules(const HsrRun& off, const HsrRun& on, uint32_t limit = Comma
                                     REG_A6XX_GRAS_SU_DEPTH_PLANE_CNTL};
     for (uint32_t k = 0; k < 6; k++) depthRegs.insert(REG_A6XX_RB_DEPTH_BUFFER_INFO + k);
     for (uint32_t k = 0; k < 3; k++) depthRegs.insert(REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE + k);
+    // (and the LRZ's, with an LRZ buffer: its base, pitch and fast-clear base, the two LRZ_CNTL)
+    for (uint32_t k = 0; k < 5; k++) depthRegs.insert(REG_A6XX_GRAS_LRZ_BUFFER_BASE + k);
+    depthRegs.insert(REG_A6XX_GRAS_LRZ_CNTL);
+    depthRegs.insert(REG_A6XX_RB_LRZ_CNTL);
     std::vector<HsrLogged> was, is;
     for (const auto& l : off.stats.drawLog) was.push_back(hsrLogged(l));
     for (const auto& l : on.stats.drawLog) is.push_back(hsrLogged(l));
@@ -7237,8 +7323,9 @@ std::string hsrRules(const HsrRun& off, const HsrRun& on, uint32_t limit = Comma
         float z;
         const uint32_t zw = is[k].reg(zoffset);
         memcpy(&z, &zw, 4);
-        const double i = (1.0 - double(z)) * 65536.0 - 1.0;
-        if (zs == 0 && i >= 0 && i < double(limit) && i == std::floor(i) && float(1.0 - (i + 1) / 65536.0) == z) {
+        // (Z_I = (65533 - 2 I) / 65535: render.cpp's hsrZ)
+        const double i = (65533.0 - std::round(double(z) * 65535.0)) / 2.0;
+        if (zs == 0 && i >= 0 && i < double(limit) && i == std::floor(i) && float((65533.0 - 2 * i) / 65535.0) == z) {
             index[k] = uint32_t(i);
         } else {
             index[k] = past++;
@@ -7251,8 +7338,10 @@ std::string hsrRules(const HsrRun& off, const HsrRun& on, uint32_t limit = Comma
         std::map<uint32_t, uint32_t> x, y;
         for (uint32_t r : a.written) {
             if (depthRegs.count(r) != 0 || (index[k] < limit && zRegs.count(r) != 0)) continue;
-            x[r] = a.reg(r);
-            y[r] = b.reg(r);
+            // (RB_RENDER_CNTL's FLAG_DEPTH is the depth's: set with a compressed one)
+            const uint32_t mask = r == REG_A6XX_RB_RENDER_CNTL ? ~uint32_t(A6XX_RB_RENDER_CNTL_FLAG_DEPTH) : ~0u;
+            x[r] = a.reg(r) & mask;
+            y[r] = b.reg(r) & mask;
         }
         // (and the 2D engine's, which the depth's Clear at the pass's start writes and no draw reads: GRAS_2D_BLIT_CNTL to
         // GRAS_2D_DST_BR, RB_2D_*, SP_2D_DST_FORMAT, SP_PS_2D_SRC*)
@@ -7288,6 +7377,18 @@ std::string hsrRules(const HsrRun& off, const HsrRun& on, uint32_t limit = Comma
         }
         return x.reg(REG_A6XX_SP_IBO_COUNT) == 0;
     };
+    // rule 4, with an LRZ buffer: a prepass's draw tests and writes the LRZ, a draw of the pass tested against the depth
+    // tests it without writing, an untested one leaves it off
+    const bool lrz = std::any_of(is.begin(), is.end(), [](const HsrLogged& x) { return x.reg(REG_A6XX_GRAS_LRZ_BUFFER_BASE) != 0; });
+    auto lrzOf = [](const HsrLogged& x) { return x.reg(REG_A6XX_GRAS_LRZ_CNTL); };
+    const uint32_t lrzTest = A6XX_GRAS_LRZ_CNTL_ENABLE, lrzWrite = lrzTest | A6XX_GRAS_LRZ_CNTL_LRZ_WRITE | A6XX_GRAS_LRZ_CNTL_Z_TEST_ENABLE;
+    for (size_t k = 0; lrz && k < is.size(); k++) {
+        const HsrLogged& x = is[k];
+        const std::string at = "draw " + std::to_string(index[k]);
+        if (x.indirect && lrzOf(x) != lrzWrite) return at + " of a prepass does not write the LRZ";
+        if (!x.indirect && test(x) && lrzOf(x) != lrzTest) return at + " tested in the pass " + (lrzOf(x) == lrzWrite ? "writes the LRZ" : "does not test the LRZ");
+        if (!x.indirect && !test(x) && lrzOf(x) != 0) return at + " untested in the pass has the LRZ on";
+    }
     // rules 2 and 3, in the order the draws ran
     for (size_t k = 0; k < is.size(); k++) {
         const HsrLogged& x = is[k];
@@ -7344,9 +7445,10 @@ const HsrScene kHsrScenes[] = {
     {"instances over each other", {{kHsrBlend, 0, 0, 96, 64}, {kHsrInstances, 8, 8, 70, 50}, {kHsrBlend, 20, 20, 40, 30}}},
     {"a vertex stage with an IBO, a barrier", {{kHsrBlend, 0, 0, 96, 64}, {kHsrVsIbo, 0, 0, 96, 64}, {kHsrFlat, 10, 10, 30, 30}}},
     // (the first draw after the segment's hole is a hidden one of the barrier's very shaders: the shadow, kept across the
-    // hole, would leave out the registers of those shaders that the prepass changed -- twin 4's)
+    // hole, would leave out the registers of those shaders that the prepass changed -- twin 4's -- its blending among
+    // them, which shows where the opaque draw does not cover it: hakios-metal-hsrcheck's scene is this one)
     {"a hidden draw of the barrier's shaders first in its segment",
-     {{kHsrBlendC1, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 60, 40}, {kHsrFlat, 0, 0, 96, 64}},
+     {{kHsrBlendC1, 0, 0, 96, 64}, {kHsrBlend, 4, 4, 88, 40}, {kHsrFlat, 0, 0, 48, 64}},
      false,
      true},
     // (the second opaque draw of one program in the pass is taken from its kept state: its prepass words too)
@@ -7362,12 +7464,33 @@ uint32_t hsrCount(const HsrScene& s, HsrKind a, HsrKind b = HsrKind(0xff), HsrKi
 
 // Every scene of section 5 of the design, drawn with HSR and without: the rules hold, every draw has the class the
 // design gives it, and HSR is off unless asked for (the stream as before).
+// Each kind of depth (CommandBuffer::setHsrDepth) alike, and with the LRZ where it is served (the A610).
 TEST(hsr_draws_each_scene_as_the_draws_without_it_by_the_rules) {
+    struct Kind {
+        CommandBuffer::HsrDepth kind;
+        bool lrz;
+    };
+    bool ubwc = false;   // (a compressed depth: Mesa's layout, in a build with it)
+    {
+        Rig r;
+        TextureDesc td;
+        td.format = PixelFormat::kDepth16Unorm;
+        td.width = 96;
+        td.height = 64;
+        td.usage = kTextureUsageRenderTarget;
+        td.compressed = true;
+        std::string why;
+        ubwc = Texture::make(*r.gpu, td, &why) != nullptr;
+        if (!ubwc) std::printf("       (no compressed Depth16Unorm in this build: %s)\n", why.c_str());
+    }
+    for (const Kind kd : {Kind{CommandBuffer::kHsrDepth16, false}, Kind{CommandBuffer::kHsrDepth32F, false}, Kind{CommandBuffer::kHsrDepth16, true},
+                          Kind{CommandBuffer::kHsrDepth16Ubwc, false}, Kind{CommandBuffer::kHsrDepth16Ubwc, true}}) {
+    if ((kd.lrz && !render::kLrzServed) || (kd.kind == CommandBuffer::kHsrDepth16Ubwc && !ubwc)) continue;
     for (const HsrScene& s : kHsrScenes) {
-        const HsrRun off = runHsr(s, false), on = runHsr(s, true);
+        const HsrRun off = runHsr(s, false, 0, CommandBuffer::kHsrMaxDraws, kd.kind, kd.lrz), on = runHsr(s, true, 0, CommandBuffer::kHsrMaxDraws, kd.kind, kd.lrz);
         const std::string broken = hsrRules(off, on);
         CHECK(broken.empty());
-        if (!broken.empty()) std::printf("       %s: %s\n", s.name, broken.c_str());
+        if (!broken.empty()) std::printf("       %s (kind %u, LRZ %d): %s\n", s.name, unsigned(kd.kind), int(kd.lrz), broken.c_str());
         CHECK_EQ(off.counts.hsrPasses, 0u);
         CHECK_EQ(on.counts.hsrPasses, 1u);
         CHECK_EQ(on.counts.hsrOpaque, hsrCount(s, kHsrFlat, kHsrOverlap, kHsrInstances));
@@ -7379,6 +7502,12 @@ TEST(hsr_draws_each_scene_as_the_draws_without_it_by_the_rules) {
         CHECK_EQ(on.stats.draws, off.stats.draws);
         CHECK_EQ(on.stats.tiledFills, 1u);   // (the depth cleared as the pass opens: a fill into a TILE6_3 depth texture)
         CHECK_EQ(off.stats.tiledFills, 0u);
+        CHECK_EQ(on.stats.fills - off.stats.fills, kd.lrz ? 2u : 1u);   // (...and its LRZ buffer, a linear fill)
+        // (with the LRZ: every draw of a prepass writes it, every tested one of the pass tests it -- rule 4 -- and some do)
+        uint32_t lrzOn = 0;
+        for (const auto& l : on.stats.drawLog) lrzOn += hsrLogged(l).reg(a6xx::REG_A6XX_GRAS_LRZ_CNTL) != 0;
+        CHECK_EQ(lrzOn != 0, kd.lrz);
+    }
     }
     // the scenes' prepasses: one a segment with an opaque draw
     const HsrRun two = runHsr(kHsrScenes[8], true);
@@ -7390,7 +7519,9 @@ TEST(hsr_draws_each_scene_as_the_draws_without_it_by_the_rules) {
 // Each mutation twin of the stream breaks a rule: 1 the prepass left out (rule 1: its draws never run), 2 a barrier
 // tested (rule 3), 3 a draw that writes colour 1 taken as opaque (rule 2), 4 the shadow kept across a hole (rule 1: the
 // draw after it runs with the prepass's program), 5 the prepass tested Less (rule 2: two primitives of one draw at one
-// Z would leave the first), 6 a draw whose vertex stage has an IBO taken as opaque (rule 2).
+// Z would leave the first), 6 a draw whose vertex stage has an IBO taken as opaque (rule 2); and with an LRZ (the A610),
+// 7 the LRZ not cleared (the fake: an earlier pass's LRZ would reject this one's fragments), 8 a hidden draw writing it
+// (the fake: an LRZ over depth no draw wrote; rule 4 as well).
 TEST(hsr_rules_catch_each_twin) {
     struct Case {
         uint8_t twin;
@@ -7402,11 +7533,16 @@ TEST(hsr_rules_catch_each_twin) {
                           {3, 5, "of a prepass writes another attachment or has an IBO"},
                           {4, 12, "runs in another state than without HSR"},
                           {5, 9, "of a prepass is not tested LessEqual with a depth write"},
-                          {6, 11, "of a prepass writes another attachment or has an IBO"}};
+                          {6, 11, "of a prepass writes another attachment or has an IBO"},
+                          {7, 0, "is not cleared to 1.0 in this pass"},
+                          {8, 1, "writes no depth: the LRZ would bound depth that is not there"}};
     for (const Case& c : cases) {
         const HsrScene& s = kHsrScenes[c.scene];
-        CHECK(hsrRules(runHsr(s, false), runHsr(s, true)).empty());   // (the scene as meant passes)
-        const std::string broken = hsrRules(runHsr(s, false), runHsr(s, true, c.twin));
+        const bool lrz = c.twin >= 7;   // (the LRZ's twins, with an LRZ: the A610's alone)
+        if (lrz && !render::kLrzServed) continue;
+        const CommandBuffer::HsrDepth kind = CommandBuffer::kHsrDepth16;
+        CHECK(hsrRules(runHsr(s, false, 0, CommandBuffer::kHsrMaxDraws, kind, lrz), runHsr(s, true, 0, CommandBuffer::kHsrMaxDraws, kind, lrz)).empty());   // (the scene as meant passes)
+        const std::string broken = hsrRules(runHsr(s, false, 0, CommandBuffer::kHsrMaxDraws, kind, lrz), runHsr(s, true, c.twin, CommandBuffer::kHsrMaxDraws, kind, lrz));
         CHECK(has(broken, c.want));
         if (!has(broken, c.want)) std::printf("       twin %u on %s: \"%s\"\n", c.twin, s.name, broken.c_str());
     }

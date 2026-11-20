@@ -668,24 +668,33 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
     return null_;
 }
 
-std::shared_ptr<Texture> CommandQueue::hsrDepth(uint32_t width, uint32_t height, std::string* why) {
+CommandQueue::HsrTarget CommandQueue::hsrDepth(uint32_t width, uint32_t height, std::string* why, uint8_t kind, bool lrz) {
     std::lock_guard<std::mutex> g(lock_);
+    const uint8_t key = uint8_t(kind | (lrz ? 0x80 : 0));
     for (size_t i = 0; i < hsrDepths_.size(); i++) {
-        if (hsrDepths_[i]->width() != width || hsrDepths_[i]->height() != height) continue;
-        std::shared_ptr<Texture> t = hsrDepths_[i];
+        const HsrKept& k = hsrDepths_[i];
+        if (k.kind != key || k.t.depth->width() != width || k.t.depth->height() != height) continue;
+        HsrKept t = k;
         hsrDepths_.erase(hsrDepths_.begin() + long(i));
         hsrDepths_.push_back(t);
-        return t;
+        return t.t;
     }
     TextureDesc d;
-    d.format = PixelFormat::kDepth32Float;
+    d.format = kind == CommandBuffer::kHsrDepth32F ? PixelFormat::kDepth32Float : PixelFormat::kDepth16Unorm;
+    d.compressed = kind == CommandBuffer::kHsrDepth16Ubwc;
     d.width = width;
     d.height = height;
     d.usage = kTextureUsageRenderTarget;
-    std::shared_ptr<Texture> t = Texture::make(gpu_, d, why);
-    if (t == nullptr) return nullptr;
+    HsrTarget t;
+    t.depth = Texture::make(gpu_, d, why);
+    if (t.depth == nullptr) return HsrTarget{};
+    if (lrz) {
+        // (GRAS_LRZ_BUFFER_BASE is 256-aligned, a6xx.xml:3387: a buffer of its own is page-aligned)
+        t.lrz = newBuffer(gpu_, render::lrzLayout(width, height).bytes(), why);
+        if (t.lrz == nullptr) return HsrTarget{};
+    }
     if (hsrDepths_.size() >= kHsrDepthSizes) hsrDepths_.erase(hsrDepths_.begin());
-    hsrDepths_.push_back(t);
+    hsrDepths_.push_back(HsrKept{key, t});
     return t;
 }
 

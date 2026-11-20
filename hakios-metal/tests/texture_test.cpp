@@ -89,6 +89,44 @@ TEST(texture_pitch_is_mesas_layout_rule) {
     CHECK(formatInfo(PixelFormat(0)) == nullptr);
 }
 
+// Depth16Unorm, CommandBuffer::setHsrDepth's depth: tiled as fdl6_tile_alignment lays cpp 2 out (pitchalign 2: rows to
+// 256 bytes, not cpp 2's 128; rows counted to 16; the plane 4096-aligned), FMT6_16_UNORM to the 2D engine; a render
+// target alone, one level of 2D, one sample
+TEST(a_depth16_texture_is_tiled_as_fdl6_lays_cpp_2_out) {
+    const FormatInfo* f = formatInfo(PixelFormat::kDepth16Unorm);
+    CHECK(f != nullptr && f->depth && f->bytesPerPixel == 2 && f->fmt6 == a6xx::FMT6_16_UNORM);
+    CHECK_EQ(texturePitch(*f, 96), 256u);
+    CHECK_EQ(texturePitch(*f, 750), 1536u);     // align(1500, 256)
+    CHECK_EQ(texturePitch(*f, 128), 256u);
+    CHECK_EQ(texturePitch(*f, 129), 512u);
+    CHECK_EQ(textureBytes(*f, 750, 1624), 2506752u);   // 1632 rows of 1536, a whole number of pages
+    CHECK_EQ(texturePitch(*formatInfo(PixelFormat::kDepth32Float), 750), 3072u);   // (cpp 4 as before: align(3000, 256))
+    Rig r;
+    TextureDesc d;
+    d.format = PixelFormat::kDepth16Unorm;
+    d.width = 750;
+    d.height = 1624;
+    d.usage = kTextureUsageRenderTarget;
+    std::string why;
+    auto t = Texture::make(r.gpu, d, &why);
+    CHECK(t != nullptr);
+    if (t != nullptr) {
+        CHECK_EQ(t->bytesPerRow(), 1536u);
+        CHECK_EQ(t->depthPlaneBytes(), 2506752u);
+        CHECK_EQ(t->gpuAddress() % 4096, 0u);
+    }
+    for (const uint32_t usage : {uint32_t(kTextureUsageRead | kTextureUsageRenderTarget), uint32_t(kTextureUsageRead)}) {
+        TextureDesc x = d;
+        x.usage = usage;
+        CHECK(Texture::make(r.gpu, x, &why) == nullptr);
+        CHECK(has(why, "a render target (4) alone is served"));
+    }
+    TextureDesc levels = d;
+    levels.mipLevels = 2;
+    CHECK(Texture::make(r.gpu, levels, &why) == nullptr);
+    CHECK(has(why, "Depth16Unorm"));
+}
+
 TEST(texture_make_lays_the_memory_out_and_refuses_by_name) {
     Rig r;
     auto t = make(r, PixelFormat::kRGBA8Unorm, 100, 7);

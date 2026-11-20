@@ -932,11 +932,15 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     const uint32_t bpp = bytesPerPixel(fmt);
     // a linear image of a known format, or the one tiled image this driver makes: a depth texture (FMT6_32_FLOAT, TILE6_3)
     const uint32_t tile = fieldOf(info, A6XX_RB_2D_DST_INFO_TILE_MODE__MASK, A6XX_RB_2D_DST_INFO_TILE_MODE__SHIFT);
-    const bool tiled = tile == TILE6_3 && (fmt == FMT6_32_FLOAT || fmt == FMT6_8_UINT);
+    const bool tiled = tile == TILE6_3 && (fmt == FMT6_32_FLOAT || fmt == FMT6_16_UNORM || fmt == FMT6_8_UINT);
     // ...or a UBWC one (TILE6_3 with FLAGS, RGBA8-sized, WZYX): what a copy fills a compressed texture through
     const bool ubwc = copy && tile == TILE6_3 && (info & A6XX_RB_2D_DST_INFO_FLAGS) != 0 && fmt == FMT6_8_8_8_8_UNORM &&
                       fieldOf(info, A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_2D_DST_INFO_COLOR_SWAP__SHIFT) == WZYX;
-    if (bpp == 0 || (tile != TILE6_LINEAR && !tiled && !ubwc)) {
+    // ...or a compressed Depth16Unorm's Clear (TILE6_3 with FLAGS, FMT6_16_UNORM, WZYX: CommandBuffer::setHsrDepth's
+    // kHsrDepth16Ubwc), judged as the tiled ones are
+    const bool ubwcDepthFill = !copy && tile == TILE6_3 && (info & A6XX_RB_2D_DST_INFO_FLAGS) != 0 && fmt == FMT6_16_UNORM &&
+                               fieldOf(info, A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_2D_DST_INFO_COLOR_SWAP__SHIFT) == WZYX;
+    if (bpp == 0 || (tile != TILE6_LINEAR && !tiled && !ubwc && !ubwcDepthFill)) {
         fault(text("a fill into format %llu, tile mode %llu: a linear image of a known format (or a TILE6_3 depth texture) is what this GPU model fills", fmt, tile));
         return false;
     }
@@ -952,6 +956,7 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
         want = R2D_FLOAT16;
         break;
     case FMT6_32_FLOAT: case FMT6_32_32_FLOAT: case FMT6_32_32_32_32_FLOAT: want = R2D_FLOAT32; break;
+    case FMT6_16_UNORM: want = R2D_FLOAT32; break;   // (16 bits, neither float nor integer: tu_clear_blit.cc:62-65)
     case FMT6_32_UINT: case FMT6_32_32_32_32_UINT: want = R2D_INT32; break;
     case FMT6_8_UINT: want = R2D_INT8; break;
     default: break;
@@ -991,9 +996,24 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     if (copy) {
         return execCopy(fmt, bpp, ifmt, x0, y0, x1, y1, base, pitch, tiled);
     }
+    if (ubwcDepthFill) {
+        const uint64_t flags = reg64(REG_A6XX_RB_2D_DST_FLAGS);
+        const uint64_t rows = (uint64_t(y1) + 1 + 15) / 16 * 16;
+        if (base % 4096 != 0 || pitch % 256 != 0 || at(base, rows * pitch) == nullptr || flags == 0 || at(flags, 64) == nullptr) {
+            fault(text("a compressed depth's fill at %#llx with a pitch of %llu bytes: not 4096-aligned, not a multiple of 256, or it or its flag buffer outside every buffer", base, pitch));
+            return false;
+        }
+        stats_.fills++;
+        stats_.tiledFills++;
+        drawsInSubmission_++;
+        drawsWithoutCcuFlush_++;
+        drawsWithoutCacheFlush_++;
+        return true;
+    }
     if (tiled) {
         // a TILE6_3 image: 4096-aligned, the pitch a multiple of 256 bytes, its rows counted to 16 (fdl6_tile_alignment
-        // for cpp 4). Its bytes are in an order this model does not reproduce, so the fill is judged and not written.
+        // for cpp 4, and for cpp 2, Depth16Unorm's, whose pitchalign is 2). Its bytes are in an order this model does not
+        // reproduce, so the fill is judged and not written.
         // (an S8 plane: cpp 1, so its pitch is a multiple of 128 bytes and its rows are counted to 32)
         const bool s8 = fmt == FMT6_8_UINT;
         const uint64_t rows = (uint64_t(y1) + 1 + (s8 ? 31 : 15)) / (s8 ? 32 : 16) * (s8 ? 32 : 16);
@@ -1040,6 +1060,14 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
         }
     } else if (ifmt == R2D_FLOAT16) {
         for (uint32_t i = 0; i < bpp / 2; i++) { uint16_t v = uint16_t(c[i]); memcpy(pixel + 2 * i, &v, 2); }
+    } else if (fmt == FMT6_16_UNORM) {
+        // a 16-bit unorm through R2D_FLOAT32: the float in the first word, converted (round to nearest, clamped)
+        float f;
+        memcpy(&f, &c[0], 4);
+        const uint16_t v = uint16_t(std::lround(std::min(1.0f, std::max(0.0f, f)) * 65535.0f));
+        memcpy(pixel, &v, 2);
+        fills16_[base + y0 * pitch] = Fill16{stats_.passes, v, (y1 - y0 + 1) * pitch};
+        lrzFillPending_ = 3;
     } else {
         for (uint32_t i = 0; i < bpp / 4; i++) memcpy(pixel + 4 * i, &c[i], 4);
     }
@@ -1754,8 +1782,9 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                 return false;
             }
         } else {
-            if (depthFormat != DEPTH6_32 || fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0) != depthFormat) {
-                fault(text("depth format %llu in RB_DEPTH_BUFFER_INFO and %llu in GRAS_SU_DEPTH_BUFFER_INFO: DEPTH6_32 in both is what this GPU model runs", depthFormat,
+            if ((depthFormat != DEPTH6_32 && depthFormat != DEPTH6_16) ||
+                fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0) != depthFormat) {
+                fault(text("depth format %llu in RB_DEPTH_BUFFER_INFO and %llu in GRAS_SU_DEPTH_BUFFER_INFO: DEPTH6_32 or DEPTH6_16 in both is what this GPU model runs", depthFormat,
                            fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0)));
                 return false;
             }
@@ -1771,8 +1800,9 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             const uint32_t br = reg(REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR);
             const uint64_t width = (br & 0x3fff) + 1, rows = ((br >> 16 & 0x3fff) + 1 + 15) / 16 * 16;
             // (a multisample one holds the draw's sample count of 4-byte depths a texel: fdl6's cpp 4 * samples, its pitch a
-            // multiple of 64 such texels)
-            if (base % 4096 != 0 || pitch % (256 * d.samples) != 0 || pitch < width * 4 * d.samples || at(base, rows * pitch) == nullptr) {
+            // multiple of 64 such texels; a DEPTH6_16 one 2 bytes a texel, its pitch a multiple of 256 bytes as well)
+            const uint64_t cpp = depthFormat == DEPTH6_16 ? 2 : 4;
+            if (base % 4096 != 0 || pitch % (256 * d.samples) != 0 || pitch < width * cpp * d.samples || at(base, rows * pitch) == nullptr) {
                 fault(text("the depth buffer at %#llx with a pitch of %llu bytes, ", base, pitch) + text("%llu rows, ", rows) +
                       text("%llu sample(s): not 4096-aligned, not a multiple of 256 a sample, narrower than the window, or outside every buffer", d.samples));
                 return false;
@@ -1786,6 +1816,72 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             d.depthBase = base;
         }
         d.depthCntl = depthCntl;
+        // the LRZ (GRAS_LRZ_CNTL.ENABLE): the RB's enable the same (tu6_emit_lrz), a depth tested LessEqual or Less --
+        // LE, the one direction this model takes (GREATER, DIR and the fast-clear bits clear, as on a chip without
+        // direction tracking) -- and an LRZ buffer of PITCH x rows 16-bit values over the window's 8 x 8 blocks
+        // (fdl6_lrz_layout_init), cleared to 1.0 in this pass and out of the CCU and the caches; LRZ_WRITE with
+        // Z_TEST_ENABLE and both only with a depth write and no blending on any target the FS writes (FakeGpu's note
+        // on fills16_ says why that keeps the LRZ an LRZ of the depth)
+        const uint32_t lrz = reg(REG_A6XX_GRAS_LRZ_CNTL);
+        if (((lrz & A6XX_GRAS_LRZ_CNTL_ENABLE) != 0) != ((reg(REG_A6XX_RB_LRZ_CNTL) & A6XX_RB_LRZ_CNTL_ENABLE) != 0)) {
+            fault(text("GRAS_LRZ_CNTL %#llx and RB_LRZ_CNTL %#llx: the LRZ enable must agree", lrz, reg(REG_A6XX_RB_LRZ_CNTL)));
+            return false;
+        }
+        if ((lrz & A6XX_GRAS_LRZ_CNTL_ENABLE) == 0 && lrz != 0) {
+            fault(text("GRAS_LRZ_CNTL %#llx: bits set with the LRZ off", lrz));
+            return false;
+        }
+        if ((lrz & A6XX_GRAS_LRZ_CNTL_ENABLE) != 0) {
+            const uint32_t func = fieldOf(depthCntl, A6XX_RB_DEPTH_CNTL_ZFUNC__MASK, A6XX_RB_DEPTH_CNTL_ZFUNC__SHIFT);
+            if (depthFormat == DEPTH6_NONE || !test || (func != FUNC_LESS && func != FUNC_LEQUAL) ||
+                (lrz & ~(A6XX_GRAS_LRZ_CNTL_ENABLE | A6XX_GRAS_LRZ_CNTL_LRZ_WRITE | A6XX_GRAS_LRZ_CNTL_Z_TEST_ENABLE)) != 0) {
+                fault(text("the LRZ on (GRAS_LRZ_CNTL %#llx) ", lrz) + text("with RB_DEPTH_CNTL %#llx: a depth tested Less or LessEqual, and none of GREATER, FC_ENABLE, DIR is what it is for", depthCntl));
+                return false;
+            }
+            const bool lrzWrite = (lrz & A6XX_GRAS_LRZ_CNTL_LRZ_WRITE) != 0;
+            if (lrzWrite != ((lrz & A6XX_GRAS_LRZ_CNTL_Z_TEST_ENABLE) != 0)) {
+                fault(text("GRAS_LRZ_CNTL %#llx: LRZ_WRITE and Z_TEST_ENABLE go together (tu_lrz.cc: z_test_enable = z_write_enable)", lrz));
+                return false;
+            }
+            if (lrzWrite) {
+                bool blends = false;
+                const uint32_t mrts = fieldOf(reg(REG_A6XX_RB_FS_OUTPUT_CNTL1), A6XX_RB_FS_OUTPUT_CNTL1_MRT__MASK, A6XX_RB_FS_OUTPUT_CNTL1_MRT__SHIFT);
+                for (uint32_t i = 0; i < mrts; i++) blends = blends || (reg(regRbMrt(REG_A6XX_RB_MRT_CONTROL, i)) & A6XX_RB_MRT_CONTROL_BLEND) != 0;
+                if (!write || blends) {
+                    fault(text("the LRZ written (GRAS_LRZ_CNTL %#llx) by a draw that ", lrz) +
+                          (!write ? "writes no depth: the LRZ would bound depth that is not there" : "blends"));
+                    return false;
+                }
+            }
+            const uint64_t lrzBase = reg64(REG_A6XX_GRAS_LRZ_BUFFER_BASE);
+            const uint64_t lrzPitch = uint64_t(fieldOf(reg(REG_A6XX_GRAS_LRZ_BUFFER_PITCH), A6XX_GRAS_LRZ_BUFFER_PITCH_PITCH__MASK, A6XX_GRAS_LRZ_BUFFER_PITCH_PITCH__SHIFT))
+                                      << A6XX_GRAS_LRZ_BUFFER_PITCH_PITCH__SCALE;
+            const uint32_t wbr = reg(REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR);
+            const uint64_t blocksW = ((wbr & 0x3fff) + 1 + 7) / 8, blocksH = ((wbr >> 16 & 0x3fff) + 1 + 7) / 8;
+            if (lrzBase == 0 || lrzBase % 256 != 0 || lrzPitch < blocksW || at(lrzBase, lrzPitch * blocksH * 2) == nullptr ||
+                reg64(REG_A6XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE) != 0) {
+                fault(text("the LRZ buffer at %#llx, ", lrzBase) + text("%llu values a row: not 256-aligned, narrower than the window's blocks, outside every buffer, or with a fast-clear buffer", lrzPitch));
+                return false;
+            }
+            auto f = fills16_.find(lrzBase);
+            if (f == fills16_.end() || f->second.pass != stats_.passes || f->second.value != 0xffff || f->second.bytes < lrzPitch * 2 * blocksH) {
+                fault(text("the LRZ buffer at %#llx is not cleared to 1.0 in this pass: what an earlier pass wrote there would reject this one's fragments", lrzBase));
+                return false;
+            }
+            if (lrzFillPending_ != 0) {
+                fault("the LRZ buffer's clear not out of the colour CCU (PC_CCU_FLUSH_COLOR_TS) and the caches (CACHE_INVALIDATE) before a draw reads it");
+                return false;
+            }
+        }
+        // a compressed depth: its flag buffer in reach with RB_RENDER_CNTL.FLAG_DEPTH, none without
+        {
+            const bool flagDepth = (reg(REG_A6XX_RB_RENDER_CNTL) & A6XX_RB_RENDER_CNTL_FLAG_DEPTH) != 0;
+            const uint64_t flags = reg64(REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE);
+            if (flagDepth && (depthFormat == DEPTH6_NONE || flags == 0 || at(flags, 64) == nullptr)) {
+                fault(text("RB_RENDER_CNTL.FLAG_DEPTH with the depth flag buffer at %#llx: a compressed depth's flag buffer is in reach", flags));
+                return false;
+            }
+        }
     }
     // the scissors inside the window
     auto scissor = [&](uint32_t tlReg, uint32_t* out) {
@@ -2523,6 +2619,10 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == CACHE_INVALIDATE && lastWasWfi_) {
                     gmemCachesStale_ = false;
                 }
+                // (an LRZ fill out of the CCU is out of the caches too once they are invalidated after it)
+                if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == CACHE_INVALIDATE && (lrzFillPending_ & 1) == 0) {
+                    lrzFillPending_ = 0;
+                }
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == ZPASS_DONE) {
                     if ((reg(REG_A6XX_RB_SAMPLE_COUNT_CONTROL) & A6XX_RB_SAMPLE_COUNT_CONTROL_COPY) == 0) {
                         fault("ZPASS_DONE without RB_SAMPLE_COUNT_CONTROL.COPY: no count is written");
@@ -2557,6 +2657,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     // 4-word form with an address, freedreno_gpu_event.h:60-85 needs_seqno) and then the cache flush
                     uint32_t ev = fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT);
                     if (ev == PC_CCU_FLUSH_COLOR_TS) drawsWithoutCcuFlush_ = 0;
+                    if (ev == PC_CCU_FLUSH_COLOR_TS) lrzFillPending_ &= ~1u;
                     if (ev == PC_CCU_FLUSH_DEPTH_TS) drawsWithoutDepthFlush_ = 0;
                     if (ev == CACHE_FLUSH_TS) drawsWithoutCacheFlush_ = 0;
                 }

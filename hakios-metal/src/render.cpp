@@ -36,6 +36,37 @@ std::string n(uint64_t v) { return std::to_string(v); }
 // differs from the TP's FMT for RGB10A2 (10_10_10_2_UNORM_DEST)
 a6xx_format colorFmt(const FormatInfo& f) { return f.rbFmt != FMT6_NONE ? f.rbFmt : f.fmt6; }
 
+// a depth texture's format to the RB (tu6_pipe2depth / fd6_pipe2depth): DEPTH6_16 for Z16_UNORM, DEPTH6_32 for the
+// Z32_FLOAT ones
+a6xx_depth_format depthFormatOf(const Texture& d) { return d.info().bytesPerPixel == 2 ? DEPTH6_16 : DEPTH6_32; }
+
+// GRAS_LRZ_CNTL for a draw into a pass whose depth has an LRZ buffer (RenderPass::depthLrz), as turnip's
+// tu6_calculate_lrz_state works it out (tu_lrz.cc:668-850) for a chip without direction tracking or fast clear (the
+// A610: DIR, DIR_WRITE, DISABLE_ON_WRONG_DIR and FC_ENABLE stay 0): 0 when the draw does not test depth, or tests it
+// other than Less or LessEqual (Always/NotEqual/Equal/Never, Greater: LRZ's direction is LE alone here, tu_lrz.cc:757-
+// 790 -- every draw of such a depth is one of setHsr's, LessEqual or untested), or has the stencil test (:820-845), or
+// a fragment stage that writes depth or memory (TU_LRZ_FORCE_DISABLE_LRZ: no_earlyz or writes_pos,
+// tu_shader.cc:2694-2695); else ENABLE, and LRZ_WRITE with Z_TEST_ENABLE (turnip's "z_test_enable = z_write_enable")
+// for a draw that writes depth with no discard (TU_LRZ_FORCE_DISABLE_WRITE for has_kill, tu_shader.cc:2692-2693)
+// and no blending on any target.
+// Where it is not turnip's: turnip also leaves LRZ unwritten by a draw that leaves a channel of any attachment
+// unwritten (tu6_calc_blend_lrz, tu_pipeline.cc:2903-2925, "reads_dest"), which every draw with CoreAnimation's
+// memoryless colour 1 masked off is. That rule is the binning pass's: there the LRZ is built from every draw of the
+// pass before any is drawn, so a draw that hides nothing must not write it (fd6_emit.cc:149-168 gives the case). In a
+// sysmem pass the LRZ is written in the draws' order, by draws that write the depth it bounds, and holds no more than
+// that depth: a block's LRZ never rejects what the per-pixel test would pass. So a draw with the other attachments
+// masked off writes it here, the blended ones still not (the masks of attachment 0 being whole is the opaque class's).
+// WRITE_ALL: Options::lrzWriteAll, a test's twin
+uint32_t lrzCntl(const Program& p, const RenderPass& pass, const Draw& d, bool depthTest, bool writeAll) {
+    if (pass.depthLrz == nullptr || pass.depth == nullptr || !depthTest || (d.depth.compare != 1 && d.depth.compare != 3) || d.stencil.enabled) return 0;
+    const Stage& fs = p.fs;
+    if (fs.writesPos != 0 || fs.depthRegid != kRegidNone || (p.ssboWrites & 2) != 0 || fs.k.numIbos != 0) return 0;
+    bool blends = p.blend.enabled;
+    for (uint32_t i = 0; i < kMaxColorOutputs - 1; i++) blends = blends || (pass.more[i].texture != nullptr && p.moreBlend[i].enabled);
+    const bool write = writeAll || (d.depth.write && fs.hasKill == 0 && !blends);
+    return A6XX_GRAS_LRZ_CNTL_ENABLE | (write ? A6XX_GRAS_LRZ_CNTL_LRZ_WRITE | A6XX_GRAS_LRZ_CNTL_Z_TEST_ENABLE : 0u);
+}
+
 bool refuse(std::string* why, const std::string& text) {
     if (why != nullptr) *why = text;
     return false;
@@ -1048,10 +1079,43 @@ void stencilClearStream(pm4::Stream& stream, const Texture& t, uint32_t value, u
     stream.waitForIdle();
 }
 
-// the depth attachment's Clear and the stencil attachment's, each when asked for (tu_clear_sysmem_attachment, each aspect in turn)
-void zsClears(pm4::Stream& stream, const RenderPass& pass, uint64_t table) {
+// The LRZ buffer's Clear (RenderPass::depthLrz), as turnip's tu_lrz_sysmem_begin does it on a chip without LRZ fast
+// clear (tu_lrz.cc:497-510 -> tu6_clear_lrz, tu_clear_blit.cc:2088-2125): the caches cleaned first (FD_CACHE_CLEAN,
+// CACHE_FLUSH_TS: "LRZ writes are going through UCHE cache, flush UCHE before changing LRZ via CCU"), the 2D engine's
+// fill of its PITCH x HEIGHT 16-bit values as Z16_UNORM (FMT6_16_UNORM, linear, R2D_FLOAT32: format_to_ifmt and
+// r2d_clear_value's Z16 branch, the depth's float bits) to the depth's clear value, then the colour CCU flushed and the
+// caches invalidated with a WFI ("Clearing writes via CCU color in the PS stage, and LRZ is read via UCHE in the
+// earlier GRAS stage"; fd6's emit_lrz_clears the same, fd6_gmem.cc:346-360). The waits as this driver's other flushes
+// have them. fd6's LRZ_FLUSH at the pass's start (passStart) and the tail's after its last draw (tu_lrz_sysmem_end)
+// stand around it.
+void lrzClearStream(pm4::Stream& stream, const Texture& depth, const Buffer& lrz, double clearDepth, uint64_t table) {
+    const LrzLayout l = lrzLayout(depth.width(), depth.height());
+    eventTimestamp(stream, CACHE_FLUSH_TS, table + kTableLrzCleanAt, kLrzCleanValue, false);
+    waitForWordAtLeast(stream, table + kTableLrzCleanAt, kLrzCleanValue);
+    const uint32_t blit = rb2dBlitCntlClear(FMT6_16_UNORM, R2D_FLOAT32);
+    const uint64_t at = lrz.gpuAddress();
+    reg(stream, REG_A6XX_RB_2D_UNKNOWN_8C01, 0);
+    reg(stream, REG_A6XX_RB_2D_BLIT_CNTL, blit);
+    reg(stream, REG_A6XX_GRAS_2D_BLIT_CNTL, blit);
+    reg(stream, REG_A6XX_SP_2D_DST_FORMAT, sp2dDstFormat(FMT6_16_UNORM, false, false, false));
+    regs(stream, REG_A6XX_GRAS_2D_DST_TL, {regXY(0, 0), regXY(l.pitch - 1, l.height - 1)});
+    regs(stream, REG_A6XX_RB_2D_SRC_SOLID_C0, {fui(float(clearDepth)), 0, 0, 0});
+    regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(FMT6_16_UNORM, TILE6_LINEAR, WZYX, false), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(l.pitch * 2)});
+    regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
+    command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
+    eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, table + kTableLrzClearFlushAt, kLrzClearFlushValue, false);
+    waitForWord(stream, table + kTableLrzClearFlushAt, kLrzClearFlushValue);
+    stream.waitForIdle();
+    event(stream, CACHE_INVALIDATE);
+    stream.waitForIdle();
+}
+
+// the depth attachment's Clear and the stencil attachment's, each when asked for (tu_clear_sysmem_attachment, each aspect in turn);
+// the depth's LRZ buffer cleared with it (Options::lrzClear)
+void zsClears(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o) {
     if (pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) {
         depthClearStream(stream, *pass.depth, pass.clearDepth, table, pass.depthLevel, pass.depthSlice);
+        if (pass.depthLrz != nullptr && o.lrzClear) lrzClearStream(stream, *pass.depth, *pass.depthLrz, pass.clearDepth, table);
     }
     if (pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) {
         stencilClearStream(stream, *pass.stencil, pass.clearStencil, table);
@@ -1809,10 +1873,13 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
     }
     // 4. no depth attachment (tu6_emit_zs :415-433; fd6 emit_zs(NULL), fd6_gmem.cc:231-247): RB_DEPTH_BUFFER_INFO
     // DEPTH6_NONE with its pitches and bases 0, GRAS_SU_DEPTH_BUFFER_INFO 0, RB_STENCIL_INFO 0
-    // With one (tu6_emit_zs :437-475; fd6 emit_zs, fd6_gmem.cc:180-229): DEPTH6_32, the texture's pitch and layer size,
-    // its base, BASE_GMEM 0 in sysmem, the same format in GRAS_SU_DEPTH_BUFFER_INFO, the flag buffer 0 (no UBWC), no
-    // stencil. A6XX's RB_DEPTH_BUFFER_INFO has no tile field: the RB reads and writes depth TILE6_3, the only layout the
-    // hardware has for it (fd6_layout.c:157-164), which is how texture.cpp lays a Depth32Float texture out.
+    // With one (tu6_emit_zs :437-475; fd6 emit_zs, fd6_gmem.cc:180-229): DEPTH6_32 (DEPTH6_16 for a Depth16Unorm,
+    // tu6_pipe2depth), the texture's pitch and layer size, its base, BASE_GMEM 0 in sysmem, the same format in
+    // GRAS_SU_DEPTH_BUFFER_INFO, the flag buffer 0 (no UBWC) -- or a compressed one's, as tu_cs_image_flag_ref writes
+    // it (its address, fd6_view.c:337-339's FLAG_BUFFER_PITCH: the pitch and the layer over 4) --, no stencil. A6XX's
+    // RB_DEPTH_BUFFER_INFO has no tile field and no LOSSLESSCOMPEN (both A7XX's, a6xx.xml:3755-3765): the RB reads and
+    // writes depth TILE6_3, the only layout the hardware has for it (fd6_layout.c:157-164), which is how texture.cpp
+    // lays a depth texture out, and a compressed one by its flag buffer and RB_RENDER_CNTL.FLAG_DEPTH (step 7).
     if ((g & kGZs) && o.zsNone && pass.depth == nullptr) {
         regs(stream, REG_A6XX_RB_DEPTH_BUFFER_INFO, {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE), 0, 0, 0, 0, 0});
         reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE));
@@ -1822,11 +1889,18 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
         const Texture& d = *pass.depth;
         // (a depth array's layer: that many tiled planes on, sliceBytes apart)
         const uint64_t depthAt = d.levelAddress(pass.depthLevel) + uint64_t(pass.depthSlice) * d.sliceBytes();
+        const a6xx_depth_format df = depthFormatOf(d);
         regs(stream, REG_A6XX_RB_DEPTH_BUFFER_INFO,
-             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
+             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(df), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
               A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t(d.depthPlaneBytes())), uint32_t(depthAt), uint32_t(depthAt >> 32), 0});
-        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32));
-        regs(stream, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, {0, 0, 0});
+        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(df));
+        if (d.compressed()) {
+            regs(stream, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE,
+                 {uint32_t(d.flagAddress()), uint32_t(d.flagAddress() >> 32),
+                  A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH(d.flagPitch()) | A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH(d.flagLayerSize() >> 2)});
+        } else {
+            regs(stream, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, {0, 0, 0});
+        }
         if (pass.stencil != nullptr) {
             // the S8 plane as a separate stencil buffer (tu6_emit_zs's D32_SFLOAT_S8_UINT branch): SEPARATE_STENCIL, its
             // pitch and layer, its base, BASE_GMEM 0; A6XX's RB_STENCIL_INFO has no tile field -- stencil is TILE6_3, as laid out
@@ -1876,17 +1950,29 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
     }
     // 7. RB_RENDER_CNTL: CCUSINGLECACHELINESIZE 2 in both pipelines (tu_cmd_buffer.cc:633-693; fd6_gmem.cc:531-552), 0 in
     // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false here.
+    // ...and FLAG_DEPTH for a compressed depth (tu6_emit_render_cntl, tu_cmd_buffer.cc:661-666; fd6's update_render_cntl,
+    // fd6_gmem.cc:515-538)
     if ((g & kGRenderCntl) && o.renderCntl) {
         uint32_t flagMrts = 0;
         for (uint32_t i = 0; i < numRt; i++) flagMrts |= mrts[i].flagPitch != 0 ? 1u << i : 0u;
-        reg(stream, REG_A6XX_RB_RENDER_CNTL, o.renderCntlZero ? 0u : rbRenderCntlSysmem() | A6XX_RB_RENDER_CNTL_FLAG_MRTS(flagMrts));
+        const uint32_t flagDepth = pass.depth != nullptr && pass.depth->compressed() ? uint32_t(A6XX_RB_RENDER_CNTL_FLAG_DEPTH) : 0u;
+        reg(stream, REG_A6XX_RB_RENDER_CNTL, o.renderCntlZero ? 0u : rbRenderCntlSysmem() | A6XX_RB_RENDER_CNTL_FLAG_MRTS(flagMrts) | flagDepth);
     }
     // 8. LRZ off (tu_lrz.cc:936-944 via a zero state; r3d :1622-1623; fd6 build_lrz with no zsbuf, fd6_emit.cc:262-270)
     // and fd6's zeroed LRZ buffer registers (emit_lrz, fd6_gmem.cc:250-260): BASE (2), PITCH, FAST_CLEAR_BUFFER_BASE (2)
-    if ((g & kGLrz) && o.lrzOff) {
+    // With an LRZ buffer (RenderPass::depthLrz) its registers instead, as tu6_emit_lrz_buffer writes them (tu_lrz.cc:
+    // 63-96): its base, PITCH its values a row (the field counts 32 of them), no ARRAY_PITCH (one layer), and no
+    // fast-clear buffer (0: lrz_fc_offset is 0 on this chip, freedreno_lrz_layout.h:72-78); the two LRZ_CNTL are then
+    // each draw's own, in step 17 (lrzCntl)
+    if ((g & kGLrz) && o.lrzOff && pass.depthLrz == nullptr) {
         reg(stream, REG_A6XX_GRAS_LRZ_CNTL, 0);
         reg(stream, REG_A6XX_RB_LRZ_CNTL, 0);
         regs(stream, REG_A6XX_GRAS_LRZ_BUFFER_BASE, {0, 0, 0, 0, 0});
+    }
+    if ((g & kGLrz) && o.lrzOff && pass.depthLrz != nullptr) {
+        const uint64_t lrz = pass.depthLrz->gpuAddress();
+        const LrzLayout l = lrzLayout(pass.depth->width(), pass.depth->height());
+        regs(stream, REG_A6XX_GRAS_LRZ_BUFFER_BASE, {uint32_t(lrz), uint32_t(lrz >> 32), A6XX_GRAS_LRZ_BUFFER_PITCH_PITCH(l.pitch), 0, 0});
     }
     // 9. program config (tu6_emit_program_config, tu_pipeline.cc:1272-1300; fd6 setup_config_stateobj, fd6_program.cc:
     // 400-458): HLSQ_INVALIDATE_CMD for the five graphics stages and the 3D IBOs, then SP_xS_CONFIG / HLSQ_xS_CNTL per
@@ -2236,10 +2322,13 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
         // and the Z mode (tu6_build_depth_plane_z_mode, tu_cmd_buffer.cc:5538-5583: LATE_Z with the test off or a kill
         // that writes depth, EARLY_Z otherwise); with no depth attachment r3d's zeros and EARLY_Z, as measured
         const bool stencilWrites = st.enabled && (st.front.writeMask != 0 || st.back.writeMask != 0);
+        // (with LRZ on for the draw, a kill that writes depth is EARLY_LRZ_LATE_Z, tu_cmd_buffer.cc:5549-5556: the LRZ
+        // tested early, the depth late; never so for setHsr's draws, whose opaque ones do not discard)
+        const uint32_t lrz = lrzCntl(program, pass, draw, depthTest, o.lrzWriteAll);
         const a6xx_ztest_mode zmode = pass.depth == nullptr ? A6XX_EARLY_Z
-                                      : (!depthTest && !st.enabled) || (fs.hasKill && (draw.depth.write || stencilWrites)) || fs.depthRegid != kRegidNone
-                                          ? A6XX_LATE_Z
-                                          : A6XX_EARLY_Z;
+                                      : (!depthTest && !st.enabled) || fs.depthRegid != kRegidNone ? A6XX_LATE_Z
+                                      : fs.hasKill && (draw.depth.write || stencilWrites)            ? (lrz != 0 ? A6XX_EARLY_LRZ_LATE_Z : A6XX_LATE_Z)
+                                                                                                     : A6XX_EARLY_Z;
         const uint32_t depthCntl = pass.depth == nullptr ? 0u
                                    : (depthTest ? A6XX_RB_DEPTH_CNTL_Z_TEST_ENABLE | A6XX_RB_DEPTH_CNTL_Z_READ_ENABLE : 0u) |
                                          (depthTest && draw.depth.write ? A6XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE : 0u) |
@@ -2248,6 +2337,12 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
         regs(stream, REG_A6XX_GRAS_SU_DEPTH_CNTL, {depthTest && pass.depth != nullptr ? A6XX_GRAS_SU_DEPTH_CNTL_Z_TEST_ENABLE : 0u,
                                                   st.enabled ? A6XX_GRAS_SU_STENCIL_CNTL_STENCIL_ENABLE : 0u});   // ..., GRAS_SU_STENCIL_CNTL
         reg(stream, REG_A6XX_GRAS_SU_DEPTH_PLANE_CNTL, A6XX_GRAS_SU_DEPTH_PLANE_CNTL_Z_MODE(zmode));
+        // the draw's LRZ (tu6_emit_lrz, tu_lrz.cc:936-944: GRAS_LRZ_CNTL, RB_LRZ_CNTL its ENABLE) when the depth has an
+        // LRZ buffer; without one step 8 wrote both 0 for the pass
+        if (pass.depthLrz != nullptr) {
+            reg(stream, REG_A6XX_GRAS_LRZ_CNTL, lrz);
+            reg(stream, REG_A6XX_RB_LRZ_CNTL, (lrz & A6XX_GRAS_LRZ_CNTL_ENABLE) != 0 ? A6XX_RB_LRZ_CNTL_ENABLE : 0u);
+        }
         // the stencil test (tu6_emit_stencil_*, tu_pipeline.cc: both faces enabled and read, each face's function and
         // three operations; the references, read masks and write masks front | back << 8)
         if (st.enabled) {
@@ -2352,7 +2447,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // a Clear: the 2D engine fills the target before any draw state is written, as turnip's subpass begin does it;
         // the depth attachment's Clear after it (tu_clear_sysmem_attachment, each attachment in turn)
         clearAll(stream, pass, f.clears, table);
-        zsClears(stream, pass, table);
+        zsClears(stream, pass, table, o);
     }
     emitDraw(stream, f, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, o, gmem, afterFetch, kGAll);
     if (whole) {
@@ -2385,7 +2480,7 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
     tableStart(tableCpu);
     passStart(stream, windowOf(pass).first, windowOf(pass).second, table, o);
     clearAll(stream, pass, clears, table, skipClears);
-    zsClears(stream, pass, table);
+    zsClears(stream, pass, table, o);
     return true;
 }
 
@@ -2921,7 +3016,7 @@ bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
     tableStart(tableCpu);
     passStart(stream, windowOf(pass).first, windowOf(pass).second, table, o);
     clearAll(stream, pass, clears, table);
-    zsClears(stream, pass, table);
+    zsClears(stream, pass, table, o);
     passTail(stream, table, o, pass.depth != nullptr);
     return true;
 }
@@ -3964,8 +4059,14 @@ HsrClass hsrClassOf(const Program& p, const RenderPass& pass, const Draw& d, uin
     if (othersMasked && noMemory && !fsDepth && d.visibilityMode == 0) return kHsrHidden;
     return kHsrBarrier;
 }
-// Z_I of the pass's draw I: 1 - (I + 1) 2^-16, which a Depth32Float holds exactly (and a Depth16, version 2's)
-double hsrZ(uint32_t i) { return 1.0 - double(i + 1) / 65536.0; }
+// Z_I of the pass's draw I: (65533 - 2 I) / 65535. A Depth16Unorm holds a Z as round(Z * 65535) (Vulkan's and D3D's
+// float-to-unorm conversion; the hardware may take either neighbour, which the spec allows) and the viewport hands the
+// RB the float32 nearest Z_I (ZSCALE 0, ZOFFSET Z_I): its level is 65533 - 2 I, give or take one if the conversion
+// truncates or rounds up -- odd levels two apart stay distinct and in order whichever of the three it does, and all
+// below 65535, the clear's 1.0. (Measured on the host: float(L / 65535) * 65535 in float32 is L for every L, so the
+// rounding conversion gives exactly the odd level.) A Depth32Float holds every Z_I as a float of its own, in the same
+// order. kHsrMaxDraws (32767) keeps the last level, 1, above 0.
+double hsrZ(uint32_t i) { return double(65533 - 2 * int64_t(i)) / 65535.0; }
 // the prepass's words at most: the bound turnip keeps every IB of its own under (tu_cs.cc:470-473, "an upper bound on
 // IB size, which appears to be 0x0fffff"); an opaque draw that would take it past is drawn as a barrier
 constexpr size_t kHsrPrepassMaxWords = 0x0fffff;
@@ -4371,14 +4472,19 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     RenderPass hsrPass;
     Draw hsrDraw;
     std::shared_ptr<Texture> hsrDepth;
+    std::shared_ptr<Buffer> hsrLrz;
     if (hsr_ && given.color0 != nullptr && (given.color0->compressed() || hsrAnyTarget_) && given.depth == nullptr && given.stencil == nullptr &&
         given.color0->samples() == 1 && givenDraw.depth.compare == 7 && !givenDraw.depth.write && !givenDraw.stencil.enabled) {
         const auto [W, H] = render::windowOf(given);
         std::string no;
-        hsrDepth = queue_.hsrDepth(W, H, &no);   // (none to be had: the draw goes on without, a pass of its own)
+        // (none to be had: the draw goes on without, a pass of its own)
+        const CommandQueue::HsrTarget ht = queue_.hsrDepth(W, H, &no, hsrKind_, hsrLrz_ && render::kLrzServed);
+        hsrDepth = ht.depth;
+        hsrLrz = ht.lrz;
         if (hsrDepth != nullptr) {
             hsrPass = given;
             hsrPass.depth = hsrDepth.get();
+            hsrPass.depthLrz = hsrLrz.get();
             hsrPass.depthLevel = hsrPass.depthSlice = 0;
             hsrPass.depthLoad = LoadAction::kLoad;
             hsrPass.depthStore = StoreAction::kDontCare;
@@ -4658,8 +4764,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
                 if (t != nullptr && la == LoadAction::kClear && render::gmemClearWords(t->info(), cc, gmemClearWords_[i])) gmemClears_ |= 1u << i;
             }
         }
-        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, options, gmemClears_) ||
-            (dual && !render::encodeBegin(headSys, pass, passTable.gpuAddress(), passTable.contents(), &why, options))) {
+        render::Options beginOptions = options;
+        if (hsr && hsrTwin_ == 7) beginOptions.lrzClear = false;   // (setHsrTest's twin 7: the LRZ left as the last pass left it)
+        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, beginOptions, gmemClears_) ||
+            (dual && !render::encodeBegin(headSys, pass, passTable.gpuAddress(), passTable.contents(), &why, beginOptions))) {
             gmemClears_ = 0;
             return refuseWork(why);
         }
@@ -4680,6 +4788,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     const render::GmemPlan* const tiled = gmem ? &plan : nullptr;
     const bool afterFetch = joins && open_->lastFetched;
     render::Options encodeOptions = options;
+    if (hsr && hsrTwin_ == 8) encodeOptions.lrzWriteAll = true;   // (setHsrTest's twin 8: the hidden draws write the LRZ too)
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
     if (gmemOff_ & kSysmemFetchUnordered) encodeOptions.fbReadOverlap = false;
     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
@@ -4808,6 +4917,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         open_->hsr = hsr;
         if (hsr) {
             keepAlive(hsrDepth);   // (the queue's may be let go for another size while this buffer is in flight)
+            if (hsrLrz != nullptr) keep(hsrLrz);
             counts_.hsrPasses++;
         }
         useAttachments(pass);
@@ -5231,6 +5341,7 @@ void CommandBuffer::useAttachments(const RenderPass& pass) {
         use(*a.texture->buffer(), true);
         keep(a.texture->buffer());
     }
+    if (pass.depthLrz != nullptr) use(*pass.depthLrz, true);   // (kept by the draw that opened the pass: setHsr's)
 }
 
 // the open pass's tail: what puts its colour and depth in memory, before anything else is recorded or the buffer runs

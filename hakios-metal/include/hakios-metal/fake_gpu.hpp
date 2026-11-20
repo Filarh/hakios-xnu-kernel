@@ -422,6 +422,20 @@ private:
     void logDraw(bool binning, bool indirect);
     uint64_t alwaysOn_ = 0;     // CP_ALWAYS_ON_COUNTER as the fake keeps it: one more at each CP_REG_TO_MEM of it
     uint32_t drawsInSubmission_ = 0, drawsWithoutCcuFlush_ = 0, drawsWithoutCacheFlush_ = 0, drawsWithoutDepthFlush_ = 0;
+    // An LRZ buffer (GRAS_LRZ_BUFFER_BASE): the model rasterizes nothing, so it keeps no LRZ values -- only what makes
+    // the LRZ an LRZ of the depth beside it in a sysmem pass, where it is written in the draws' order: cleared to 1.0
+    // (a linear Z16 fill of 0xffff over its PITCH x rows) in the pass that tests it, the fill out of the colour CCU and
+    // the caches invalidated before a draw reads it, and written only by a draw that writes depth with a LessEqual or
+    // Less test, without blending (FakeGpu::draw). The clears seen: each fill of 16-bit values at its base, the pass it
+    // was in (Stats::passes then), its value and bytes; and whether the last one is still to be flushed (bit 0 the CCU
+    // flush, bit 1 the CACHE_INVALIDATE after it)
+    struct Fill16 {
+        uint32_t pass;
+        uint16_t value;
+        uint64_t bytes;
+    };
+    std::map<uint64_t, Fill16> fills16_;
+    uint32_t lrzFillPending_ = 0;
     // the running sample count ZPASS_DONE copies out (an occlusion query's snapshots). The model has no rasterizer, so
     // a draw counts one sample per index it submits, times its instances: enough to tell begin from end and the
     // query's arithmetic from a wrong one; how many samples a real draw passes is the phone's (probe 9q)

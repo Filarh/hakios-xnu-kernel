@@ -258,9 +258,9 @@ public:
     // covers -- is not shaded here either, and the picture is the one the draws give in their order. Off by default.
     // Version 1 serves the passes that are sysmem whatever is drawn: colour attachment 0 compressed (the UBWC screen,
     // which render::gmemPlan refuses), no depth or stencil attachment of their own, one sample. Such a pass is drawn
-    // with a depth attachment of the queue's (CommandQueue::hsrDepth: Depth32Float, the window's size, cleared to 1
-    // as the pass opens and never stored), and each of its draws I with Z_I = 1 - (I + 1) 2^-16 for its depth through
-    // the viewport (znear = zfar = Z_I: the clipping before the viewport is the draw's own). Each draw is one of three
+    // with a depth attachment of the queue's (CommandQueue::hsrDepth: setHsrDepth's kind, the window's size, cleared to
+    // 1 as the pass opens and never stored), and each of its draws I with Z_I = (65533 - 2 I) / 65535 for its depth
+    // through the viewport (znear = zfar = Z_I: the clipping before the viewport is the draw's own). Each draw is one of three
     // classes, from its Program, the pass and the Draw alone (render.cpp: hsrClassOf):
     //   opaque    writes colour 0 alone, blending off and every channel, no discard, no framebuffer fetch, no memory
     //             written or read through IBOs by either stage, no depth, sample mask or stencil from the FS, one
@@ -274,11 +274,27 @@ public:
     // its whole state, tested LEQUAL and writing colour and depth -- the last opaque over a pixel is the first to reach
     // it and the earlier ones fail (larger Z), the primitives of one draw (same Z) land as they come.
     void setHsr(bool on) { hsr_ = on; }
-    static constexpr uint32_t kHsrMaxDraws = 65534;   // (the design's: Z_I > 0 for every I below it)
+    // What setHsr's depth is (the design's version 2, its section 4): the traffic of the depth in memory is what HSR
+    // costs, and with Depth32Float it cost more than it saved (dev-notes/investigacion/03-experimentos-y-datos.md, M52).
+    //   kHsrDepth32F    Depth32Float, version 1's
+    //   kHsrDepth16     Depth16Unorm: half the bytes cleared, written and read (the default)
+    //   kHsrDepth16Ubwc Depth16Unorm compressed (UBWC, as turnip lays a D16 image out on this chip; Mesa's layout, so a
+    //                   build without Mesa has none and the pass goes without HSR)
+    // LRZ: the depth with a low-resolution Z buffer (render::LrzLayout), cleared with it, each draw testing it and the
+    // prepass's writing it (render.cpp: lrzCntl) -- 8 x 8 blocks of hidden fragments rejected before the depth is read.
+    // The A610 alone (render::kLrzServed); whether its LRZ is written in a sysmem pass at all no source says the same
+    // way (turnip turns it off there, fd6 leaves it on), which hakios-metal-hsrcheck measures.
+    enum HsrDepth : uint8_t { kHsrDepth32F = 0, kHsrDepth16 = 1, kHsrDepth16Ubwc = 2 };
+    void setHsrDepth(HsrDepth kind, bool lrz) {
+        hsrKind_ = kind;
+        hsrLrz_ = lrz;
+    }
+    static constexpr uint32_t kHsrMaxDraws = 32767;   // (render.cpp's hsrZ: Z_I's 16-bit level, 65533 - 2 I, at least 1 below it)
     // (for the tests) TWIN: a mutation of the stream the tests' rules must catch -- 1 the prepass left out (the hole
     // stays a NOP, the opaque draws still NOPs), 2 a barrier tested as a hidden draw, 3 an opaque draw that writes
     // another attachment taken as opaque, 4 the shadow and the cursors kept at a segment's hole, 5 the prepass tested
-    // LESS, 6 an opaque draw whose stages have IBOs taken as opaque; 0 the stream as meant. LIMIT: kHsrMaxDraws, or
+    // LESS, 6 an opaque draw whose stages have IBOs taken as opaque, 7 the LRZ buffer not cleared as a pass opens, 8 the
+    // LRZ written by every draw that tests it (the hidden ones too); 0 the stream as meant. LIMIT: kHsrMaxDraws, or
     // fewer to reach it in a test. ANY_TARGET: a pass whose colour 0 is not compressed taken too (the suites without
     // Mesa have no compressed texture).
     void setHsrTest(uint8_t twin, uint32_t limit = kHsrMaxDraws, bool anyTarget = false) {
@@ -333,6 +349,8 @@ private:
     bool hsr_ = false, hsrAnyTarget_ = false;   // setHsr's, setHsrTest's
     uint8_t hsrTwin_ = 0;
     uint32_t hsrLimit_ = kHsrMaxDraws;
+    HsrDepth hsrKind_ = kHsrDepth16;   // setHsrDepth's
+    bool hsrLrz_ = false;
     // setHsr: a segment of the open pass begun (its hole, the shadow and the cursors forgotten), and ended (the hole made
     // the prepass's CP_INDIRECT_BUFFER when the segment had an opaque draw); false with the buffer failed
     void hsrOpenSegment();
@@ -560,13 +578,20 @@ public:
     // the visibility streams' memory binned GMEM passes share (render::vscBytes): one is enough, the GPU running one
     // submission at a time and each pass's binning before its tiles; nullptr with *why
     std::shared_ptr<Buffer> vscBuffer(std::string* why);
-    // The depth attachment of a pass drawn with CommandBuffer::setHsr: a Depth32Float render target of W x H, the queue's,
-    // one for each size asked for lately (kHsrDepthSizes, the least recently asked for let go). Every pass that uses it
-    // clears it as it opens and stores nothing of it, and the GPU runs one submission at a time, so the passes of every
-    // command buffer share it; a command buffer keeps the one it drew with alive. nullptr with *why.
-    std::shared_ptr<Texture> hsrDepth(uint32_t width, uint32_t height, std::string* why);
-    // (the screen's size and the odd other: CoreAnimation's compressed targets are its screens, all of one size)
-    static constexpr size_t kHsrDepthSizes = 2;
+    // The depth attachment of a pass drawn with CommandBuffer::setHsr: a render target of W x H of KIND
+    // (CommandBuffer::setHsrDepth), the queue's, with an LRZ buffer when LRZ asks for one (render::lrzLayout's bytes,
+    // kept beside it), one for each size and kind asked for lately (kHsrDepthSizes, the least recently asked for let
+    // go). Every pass that uses them clears them as it opens and stores nothing of them, and the GPU runs one submission
+    // at a time, so the passes of every command buffer share them; a command buffer keeps the ones it drew with alive.
+    // A null depth with *why.
+    struct HsrTarget {
+        std::shared_ptr<Texture> depth;
+        std::shared_ptr<Buffer> lrz;
+    };
+    HsrTarget hsrDepth(uint32_t width, uint32_t height, std::string* why, uint8_t kind = 1, bool lrz = false);
+    // (the screen's size and the odd other: CoreAnimation's compressed targets are its screens, all of one size; and
+    // as many again for a run that tries the kinds one after another, hakios-metal-hsrcheck's)
+    static constexpr size_t kHsrDepthSizes = 4;
     // K's words in a buffer of their own, made the first time a command buffer of this queue draws with them and kept
     // for the next: copying them into each command buffer was most of a draw's first cost (CoreAnimation's uber shader is
     // 124 KB, into write-combined memory). Found by the words' pointer and taken only when every word is the same -- a
@@ -630,7 +655,11 @@ private:
     Gpu& gpu_;
     std::shared_ptr<Texture> null_;   // (under lock_) nullTexture's
     std::shared_ptr<Buffer> vsc_;     // (under lock_) vscBuffer's
-    std::vector<std::shared_ptr<Texture>> hsrDepths_;   // (under lock_) hsrDepth's, the last asked for at the back
+    struct HsrKept {
+        uint8_t kind;
+        HsrTarget t;
+    };
+    std::vector<HsrKept> hsrDepths_;   // (under lock_) hsrDepth's, the last asked for at the back
     // (under poolLock_, a lock of its own: a command buffer gives its stamps back as it is destroyed, which can be under
     // lock_ -- the queue letting go of the last one in flight -- and lock_ there was the window server hung at boot)
     std::mutex poolLock_;

@@ -2597,8 +2597,22 @@ inline constexpr uint32_t A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH__SCALE = 6;          
 constexpr uint32_t A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t v) {
     return field(v >> A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH__SCALE, A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH__SHIFT, A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH__MASK);
 }
-// the depth flag buffer (UBWC metadata), three words at RB_DEPTH_FLAG_BUFFER_BASE: 0, no UBWC (tu6_emit_zs :450-451)
+// the depth flag buffer (UBWC metadata), three words at RB_DEPTH_FLAG_BUFFER_BASE: 0, no UBWC (tu6_emit_zs :450-451),
+// or a compressed depth's address and pitch word (fd6_view.c:337-339: the flag pitch, the flag layer over 4)
 inline constexpr uint32_t REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE = 0x8900;                     // a6xx.xml.h:6492
+inline constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH__MASK = 0x0000007f;         // a6xx.xml.h:6496
+inline constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH__SHIFT = 0;                 // a6xx.xml.h:6497
+inline constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH__SCALE = 6;                 // a6xx.xml.h:6498  the encoder's val >> 6
+inline constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH__MASK = 0x0ffff800;   // a6xx.xml.h:6509
+inline constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH__SHIFT = 11;          // a6xx.xml.h:6510
+inline constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH__SCALE = 7;           // a6xx.xml.h:6511  the encoder's val >> 7
+constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH(uint32_t v) {
+    return field(v >> A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH__SCALE, A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH__SHIFT, A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH__MASK);
+}
+constexpr uint32_t A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH(uint32_t v) {
+    return field(v >> A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH__SCALE, A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH__SHIFT,
+                 A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH__MASK);
+}
 inline constexpr uint32_t REG_A6XX_RB_DEPTH_BUFFER_BASE = 0x8875;                           // a6xx.xml.h:5992
 inline constexpr uint32_t REG_A6XX_RB_DEPTH_BUFFER_BASE_GMEM = 0x8877;                      // a6xx.xml.h:5995
 

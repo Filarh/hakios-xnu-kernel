@@ -84,6 +84,9 @@ constexpr FormatInfo kFormats[] = {
     // Z32_FLOAT is FMT6_32_FLOAT to the TP and the 2D engine (fd6_format_table.c:330 VT(Z32_FLOAT, 32_FLOAT, WZYX)) and
     // DEPTH6_32 to the RB (fd6_pipe2depth)
     {PixelFormat::kDepth32Float, FMT6_32_FLOAT, 4, WZYX, false, false, kElemFloat, "Depth32Float", true},
+    // Z16_UNORM is FMT6_16_UNORM to the 2D engine (fd6_format_table.c:77 _TC(Z16_UNORM, 16_UNORM, WZYX)) and DEPTH6_16 to
+    // the RB (fd6_pipe2depth)
+    {PixelFormat::kDepth16Unorm, FMT6_16_UNORM, 2, WZYX, false, false, kElemFloat, "Depth16Unorm", true},
     // the S8 plane read as its own image (fdl6_view_init over a stencil layout): FMT6_8_UINT, tiled as the plane is laid
     // out (TILE6_3, its rows to 32, its pitch to 128) -- "depth" here for the tiling, which a stencil view shares
     {PixelFormat::kX32Stencil8, FMT6_8_UINT, 1, WZYX, false, false, kElemUint, "X32_Stencil8", true},
@@ -204,7 +207,9 @@ uint64_t texturePitch(const FormatInfo& format, uint32_t width) {
     // fd6_layout.c:181-201 for a layout the driver chooses: pitchalign = cpp_shift, then pitch0 = align(width * cpp,
     // 1 << (pitchalign + 6)) = align(width * cpp, 64 * cpp); so a row is a multiple of 64 pixels
     // (a block format counts blocks across, as fdl_set_pitchalign does: nblocksx * cpp, cpp the block's bytes)
-    uint64_t unit = 64ull * format.bytesPerPixel;
+    // A depth format is tiled, and fdl6_tile_alignment (fd6_layout.c:84-95) gives cpp 2 a pitchalign of 2, not its
+    // cpp_shift of 1: Depth16Unorm's rows to 256 bytes, 128 pixels (cpp 4 is 256 either way)
+    uint64_t unit = format.depth && format.bytesPerPixel == 2 ? 256 : 64ull * format.bytesPerPixel;
     return (uint64_t(blocksAcross(format, width)) * format.bytesPerPixel + unit - 1) / unit * unit;
 }
 
@@ -358,6 +363,12 @@ bool Texture::plan(const TextureDesc& desc, const FormatInfo** infoOut, uint64_t
                         "samples are not served");
         return false;
     }
+    if (desc.format == PixelFormat::kDepth16Unorm && (desc.type != TextureType::k2D || desc.mipLevels != 1 || desc.samples != 1 || desc.usage != kTextureUsageRenderTarget)) {
+        // (what CommandBuffer::setHsr's depth is: its sampled view, its levels and its samples are not laid out or tried here)
+        refuse(why, "a Depth16Unorm texture of type " + n(uint32_t(desc.type)) + ", " + n(desc.mipLevels) + " level(s), " + n(desc.samples) + " sample(s), usage " +
+                        n(desc.usage) + ": one level of 2D, single-sampled, a render target (4) alone is served");
+        return false;
+    }
     if (info->depth && (desc.usage & ~kTextureUsageRead) != kTextureUsageRenderTarget) {
         // a depth texture is an attachment the RB writes, and may be sampled (a shadow map): the TP reads the tiled layout
         // as fdl6_view_init describes it (sampledDescriptor); a store into it would need the tiled IBO, which is not here
@@ -453,15 +464,16 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         // UBWC as Mesa lays it out for this chip (fdl6_layout with the tile mode and UBWC asked for, as turnip asks when
         // an image is optimal): the flag buffer first, then the tiled data, at offsets fdl gives
 #ifdef HAKIOS_METAL_MESA
+        const bool depth16 = desc.format == PixelFormat::kDepth16Unorm;
         if (desc.type != TextureType::k2D || desc.mipLevels != 1 || desc.samples != 1 ||
-            (desc.format != PixelFormat::kRGBA8Unorm && desc.format != PixelFormat::kBGRA8Unorm)) {
-            refuse(why, std::string("a compressed ") + info->name + " texture: one level of 2D, single-sampled RGBA8Unorm or BGRA8Unorm is what is served");
+            (desc.format != PixelFormat::kRGBA8Unorm && desc.format != PixelFormat::kBGRA8Unorm && !depth16)) {
+            refuse(why, std::string("a compressed ") + info->name + " texture: one level of 2D, single-sampled RGBA8Unorm, BGRA8Unorm or Depth16Unorm is what is served");
             return nullptr;
         }
         // (rows for this processor only for one it does not draw into: a render target's truth is what the GPU drew,
         // in the compressed layout alone, and replace and read refuse it)
         std::shared_ptr<Texture> staging;
-        if ((desc.usage & kTextureUsageRenderTarget) == 0) {
+        if ((desc.usage & kTextureUsageRenderTarget) == 0 && !depth16) {
             TextureDesc linear = desc;
             linear.compressed = false;
             staging = make(gpu, linear, why);
@@ -473,7 +485,12 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         fdl_layout l{};
         l.ubwc = true;
         l.tile_mode = a6xx::TILE6_3;
-        if (dev == nullptr || !fdl6_layout(&l, dev, PIPE_FORMAT_R8G8B8A8_UNORM, 1, desc.width, desc.height, 1, 1, 1, false, false, true, nullptr) || !l.ubwc) {
+        // (a depth one as turnip lays a D16_UNORM image out on this chip: ubwc_possible keeps UBWC for it -- no
+        // broken_ds_ubwc_quirk on the A610 or the A635, freedreno_devices.py -- and fdl6_layout tiles it, tile_all,
+        // 4096-aligned, the flag buffer of its cpp-2 blocks of 16 x 4, fd6_layout.c:27-49 and 100-170)
+        if (dev == nullptr ||
+            !fdl6_layout(&l, dev, depth16 ? PIPE_FORMAT_Z16_UNORM : PIPE_FORMAT_R8G8B8A8_UNORM, 1, desc.width, desc.height, 1, 1, 1, false, false, true, nullptr) ||
+            !l.ubwc) {
             refuse(why, "no UBWC layout for a " + n(desc.width) + " x " + n(desc.height) + " texture on this chip");
             return nullptr;
         }
@@ -487,6 +504,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         t->ubwcOffset_ = fdl_ubwc_offset(&l, 0, 0);
         t->ubwcPitch_ = fdl_ubwc_pitch(&l, 0);
         t->ubwcLayerSize_ = l.ubwc_layer_size;
+        t->ubwcPlaneBytes_ = l.slices[0].size0;   // (a depth one's plane: RB_DEPTH_BUFFER_ARRAY_PITCH, fdl's layer as turnip's tu_cs_image_ref writes it)
         t->ubwcLogW_ = log2ceil((desc.width + bw - 1) / bw);
         t->ubwcLogH_ = log2ceil((desc.height + bh - 1) / bh);
         t->stale_ = staging != nullptr;
@@ -529,7 +547,10 @@ bool regionFits(const Texture& t, uint32_t level, uint32_t x, uint32_t y, uint32
 }
 }  // namespace
 
-uint64_t Texture::depthPlaneBytes() const { return info_->depth ? depthBytes(*info_, desc_.width, desc_.height) : buffer_->length(); }
+uint64_t Texture::depthPlaneBytes() const {
+    if (info_->depth && ubwc_) return ubwcPlaneBytes_;
+    return info_->depth ? depthBytes(*info_, desc_.width, desc_.height) : buffer_->length();
+}
 uint64_t Texture::stencilOffset() const { return info_->stencil ? depthPlaneBytes() : 0; }
 uint64_t Texture::stencilPitch() const { return info_->stencil ? s8Pitch(desc_.width) : 0; }
 uint64_t Texture::stencilPlaneBytes() const { return info_->stencil ? s8Bytes(desc_.width, desc_.height) : 0; }

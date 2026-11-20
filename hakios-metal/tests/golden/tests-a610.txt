@@ -237,6 +237,7 @@ a_draw_samples_a_texture_in_the_vertex_stage submits 2 words 1384 draws 2 loads 
 a_draw_refuses_a_texture_the_fs_cannot_sample submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_fake_refuses_fs_textures_or_a_prefetch_that_do_not_hold_together submits 9 words 5411 draws 9 loads 34 stream df598d74e9615f30 state 1b7d07060e9b0ded names 0 0000000000000000
 a_depth32float_texture_is_tiled_and_an_attachment_only submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_depth16_attachment_and_its_lrz submits 2 words 1371 draws 2 loads 4 stream 859f86bb29bf3037 state b2db15d81d80c4dd names 11 39610622df417a3c
 a_draw_tests_and_writes_depth_through_its_attachment submits 2 words 995 draws 1 loads 2 stream be0ff587bfd611ef state cb137a44d958688c names 8 ef70d5cfa586a8e7
 a_pass_of_depth_alone_draws_depth submits 1 words 659 draws 1 loads 2 stream fc5a84be53722540 state cb137a44d958688c names 4 0223ab1424be5b7c
 a_draw_refuses_a_depth_setup_it_cannot_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
@@ -310,13 +311,15 @@ a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned submits 0 words 0 
 a_fetchs_barrier_runs_where_a_tile_draws_the_fetch submits 5 words 109840 draws 500 loads 1300 stream 003ad3c00efcbda5 state c2bc8fdaa4cf0a01 names 30 7b3e8fd04d1dff98
 draw_states_keep_each_groups_registers_whole submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_fake_runs_draw_state_groups_as_the_microcode_does submits 6 words 3597 draws 8 loads 12 stream f2ceb65085b181a9 state 54e81470edcf5a2d names 0 0000000000000000
-hsr_draws_each_scene_as_the_draws_without_it_by_the_rules submits 60 words 84221 draws 259 loads 680 stream e5ed25a1b7faa9e8 state 1482e2d6b0984dc9 names 549 29441b0376984c0a
-hsr_rules_catch_each_twin submits 48 words 66363 draws 200 loads 517 stream f6720c11edffbe18 state 6a30a6b6ef38613a names 447 ee956281ec61b17e
-hsr_past_its_draw_limit_draws_the_rest_as_barriers submits 4 words 6853 draws 24 loads 58 stream cc8116bf1176a8ae state ec98a4b3be275dc5 names 34 2fc550648417576d
-hsr_kept_states_and_whole_draws_give_the_same_draws submits 20 words 24894 draws 90 loads 258 stream d9cf879eb40e7865 state e915a7ec4dbd0861 names 196 c20aca60c69cad60
+       (no compressed Depth16Unorm in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none)
+hsr_draws_each_scene_as_the_draws_without_it_by_the_rules submits 172 words 241383 draws 735 loads 1912 stream 54513758f5c0adb9 state 4ede2b5a9c5d8c71 names 1581 92b5aa76f9ec9c9b
+hsr_rules_catch_each_twin submits 64 words 89523 draws 268 loads 697 stream 9e23e6541eedc0d1 state c32683cb90f0cd5a names 587 76f8169e85227f6e
+hsr_past_its_draw_limit_draws_the_rest_as_barriers submits 4 words 6853 draws 24 loads 58 stream 66b5260673ec1838 state ec98a4b3be275dc5 names 34 2fc550648417576d
+hsr_kept_states_and_whole_draws_give_the_same_draws submits 20 words 24894 draws 90 loads 258 stream a1bda0d50a216711 state e915a7ec4dbd0861 names 196 c20aca60c69cad60
        (no Mesa in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none; no compressed target to draw)
 hsr_serves_the_passes_into_a_compressed_target_alone submits 1 words 1857 draws 3 loads 6 stream 7016c79e6c3b249c state 6daed77ff6dca4f4 names 6 cdd4ee2570085dc3
 texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_depth16_texture_is_tiled_as_fdl6_lays_cpp_2_out submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_make_lays_the_memory_out_and_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_replace_and_read_convert_the_callers_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_replace_of_a_sub_region_leaves_everything_else_alone submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

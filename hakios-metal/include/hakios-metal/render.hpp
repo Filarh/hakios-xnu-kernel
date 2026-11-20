@@ -306,6 +306,10 @@ struct RenderPass {
     LoadAction depthLoad = LoadAction::kDontCare;
     StoreAction depthStore = StoreAction::kDontCare;
     double clearDepth = 1.0;
+    // the depth's low-resolution Z buffer (LRZ), laid out by lrzLayout for the depth texture's size, or none: what
+    // CommandBuffer::setHsrDepth's LRZ gives its passes alone. With one, a Clear of the depth clears it too, and each draw
+    // tests it and writes it as its depth state allows (render.cpp: lrzCntl)
+    const Buffer* depthLrz = nullptr;
     // the stencil attachment (MTLRenderPassStencilAttachmentDescriptor): the depth texture itself when it is a
     // Depth32Float_Stencil8 one (its S8 plane), or none; Metal's defaults DontCare / DontCare / 0
     const Texture* stencil = nullptr;
@@ -415,6 +419,11 @@ constexpr uint32_t kBlitFlushValue = 11;
 // the binning pass's cache flush, before the tiles read the visibility streams (fd6's FD6_FLUSH_CACHE after it)
 constexpr uint32_t kTableBinFlushAt = 76;
 constexpr uint32_t kBinFlushValue = 12;
+// the LRZ buffer's Clear (RenderPass::depthLrz): the cache clean before its fill and the colour CCU's flush after it
+constexpr uint32_t kTableLrzCleanAt = 80;
+constexpr uint32_t kLrzCleanValue = 13;
+constexpr uint32_t kTableLrzClearFlushAt = 84;
+constexpr uint32_t kLrzClearFlushValue = 14;
 constexpr uint32_t kTableZeroedBytes = 96;        // what tableStart zeroes from kTableTimestampsAt: every word above
 static_assert(kTableMoreClearFlushAt + 4 * (kMaxColorOutputs - 1) <= kTableZeroedBytes, "the Clears' words are zeroed");
 // an occlusion query's two snapshots of the running sample count (RB_SAMPLE_COUNT_ADDR), begin and end, 64 bits each
@@ -447,7 +456,10 @@ struct Options {
     bool msaaOff = true;         // SP_TP/GRAS/RB RAS_MSAA_CNTL 0 and DEST_MSAA_CNTL MSAA_DISABLE, RB_BLIT_GMEM_MSAA_CNTL 0
     bool renderCntl = true;      // RB_RENDER_CNTL = CCUSINGLECACHELINESIZE(2) (r3d writes 0: renderCntlZero)
     bool renderCntlZero = false;
-    bool lrzOff = true;          // GRAS_LRZ_CNTL 0, RB_LRZ_CNTL 0, GRAS_LRZ_BUFFER_BASE/PITCH/FAST_CLEAR_BUFFER_BASE 0
+    bool lrzOff = true;          // GRAS_LRZ_CNTL 0, RB_LRZ_CNTL 0, GRAS_LRZ_BUFFER_BASE/PITCH/FAST_CLEAR_BUFFER_BASE 0 (with a depth
+                                 // that has an LRZ buffer, RenderPass::depthLrz: its base and pitch, the two LRZ_CNTL the draw's)
+    bool lrzClear = true;        // ...that LRZ buffer cleared with the depth (off: CommandBuffer::setHsrTest's twin 7)
+    bool lrzWriteAll = false;    // ...written by every draw that tests it (CommandBuffer::setHsrTest's twin 8)
     bool programConfig = true;   // HLSQ_INVALIDATE_CMD (vs..fs, gfx_ibo), SP_xS_CONFIG and HLSQ_xS_CNTL for the five stages, SP_IBO_COUNT 0
     bool programVs = true;       // SP_VS_CTRL_REG0, INSTRLEN, the OBJ_START block, HW_STACK_OFFSET, the preload, the immediates
     bool programFs = true;       // the same for the FS
@@ -507,6 +519,23 @@ struct Options {
 // member wider than a byte the struct had padding, which a stack-made Options leaves as garbage, and draws that should
 // have joined each opened a pass of their own -- some runs, not others. Bytes only, so there is no padding.
 static_assert(alignof(Options) == 1, "render::Options holds bools and bytes only: no padding for the join's memcmp to read");
+
+// The LRZ buffer of a depth of W x H (one layer, one sample), as fdl6_lrz_layout_init lays it out for this chip
+// (freedreno_lrz_layout.h:33-88): a 16-bit value an 8 x 8 block, PITCH values a row (the blocks across to 32) and
+// HEIGHT rows (the blocks down to 32); no fast-clear or direction part, which the A610 has neither of (its templates
+// a6xx_base and a6xx_gen1_low set no enable_lrz_fast_clear or has_lrz_dir_tracking, freedreno_devices.py:327-368 and
+// 447-452). Served on the A610 alone (kLrzServed): the A635 is a6xx_gen4, whose LRZ turnip drives with the direction
+// byte and the fast-clear buffer this driver does not write
+struct LrzLayout {
+    uint32_t pitch, height;   // in 16-bit values
+    uint64_t bytes() const { return uint64_t(pitch) * height * 2; }
+};
+#if defined(HAKIOS_CHIP_A610)
+constexpr bool kLrzServed = true;
+#else
+constexpr bool kLrzServed = false;
+#endif
+constexpr LrzLayout lrzLayout(uint32_t W, uint32_t H) { return LrzLayout{((W + 7) / 8 + 31) / 32 * 32, ((H + 7) / 8 + 31) / 32 * 32}; }
 
 // Tiled rendering (GMEM). Sysmem rendering sends every blended pixel of every draw through the colour CCU to memory and
 // back: CoreAnimation's full-screen layers then cost a read and a write of the whole target each (8 blended layers at
