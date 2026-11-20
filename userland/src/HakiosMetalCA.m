@@ -7537,10 +7537,6 @@ hm_fps_draws(void)
 	return on != 0;
 }
 
-/* boot-arg metal_gmem_off=N: GMEM's refinements off by the bits of N (hakios_metal_cb_set_gmem_off; 8: the choice of GMEM
- * or sysmem by what each costs, hakios_metal_cb_set_gmem_tuned; 16: the hardware's binning,
- * hakios_metal_cb_set_gmem_binning; 32: every fragment texture the null one, wrong pictures but each draw's time without
- * its texture reads, hakios_metal_cb_set_null_fs_textures), for a bisect */
 /*
  * metal_perf=1 (/var/tmp/metal.args or a boot-arg; off by default): with metal_fps=passes or metal_trace=frame, the
  * GPU's own counters of memory traffic and caches read around each timed pass (hakios_metal_cb_set_perf: the GBIF's
@@ -7586,6 +7582,10 @@ hm_perf_text(hakios_metal_cb *cb, unsigned i, char *buf, size_t size)
 	return buf;
 }
 
+/* boot-arg metal_gmem_off=N: GMEM's refinements off by the bits of N (hakios_metal_cb_set_gmem_off; 8: the choice of GMEM
+ * or sysmem by what each costs, hakios_metal_cb_set_gmem_tuned; 16: the hardware's binning,
+ * hakios_metal_cb_set_gmem_binning; 32: every fragment texture the null one, wrong pictures but each draw's time without
+ * its texture reads, hakios_metal_cb_set_null_fs_textures), for a bisect */
 static unsigned
 hm_gmem_off(void)
 {
