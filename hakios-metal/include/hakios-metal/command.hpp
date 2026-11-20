@@ -243,6 +243,13 @@ public:
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
     // says what its shader costs without its texture reads -- a measurement switch, as setGmemOff is a bisect's
     void setNullFsTextures(bool on) { nullFsTextures_ = on; }
+    // A measurement instrument (the plug-in's metal_hsrprobe): TAG names the next draw; cancelDraw(TAG) makes that
+    // draw's draw packet a CP_NOP of the same length in every stream it went into, while its pass is still open -- its
+    // state words stay, so what later draws inherit is unchanged. False when the draw is not in the open pass. What the
+    // GPU then draws is no longer what was asked: for timing what a draw that cannot be seen costs, never in use.
+    void setDrawTag(uint32_t tag) { drawTag_ = tag; }
+    bool cancelDraw(uint32_t tag);
+    uint32_t cancelledDraws() const { return cancelled_; }
     // why the last pass that could not be drawn in GMEM was not (gmemPlan's or gmemDrawOk's reason), empty when none was refused
     const std::string& gmemRefusal() const { return gmemWhy_; }
     // the words recorded so far (what the command processor will read; once it is done, what it was given)
@@ -278,6 +285,15 @@ private:
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;
+    // setDrawTag / cancelDraw: where each tagged draw of the open pass put its draw packet (SIZE_MAX: not in that stream)
+    struct DrawMark {
+        uint32_t tag;
+        pm4::Stream* into;
+        size_t at;
+        size_t atSys;
+    };
+    uint32_t drawTag_ = 0, cancelled_ = 0;
+    std::vector<DrawMark> drawMarks_;
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)
     std::string gmemWhy_;
     std::unordered_map<uint64_t, uint32_t> ordinals_;   // passes opened so far into each kind of target

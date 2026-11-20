@@ -1524,6 +1524,10 @@ HM_REFUSES_OUT_LOUD
 	struct hm_ft_rec *_ftrace;                  /* metal_trace=frame: the command buffer's recorder, else NULL */
 	unsigned _ftEnc;                            /* ...and this encoder's number in it */
 	unsigned _ftDraws;                          /* ...and the draws it has recorded */
+	/* metal_hsrprobe: this encoder's draws that a later opaque rectangle may still cover (no draw that reads the
+	 * framebuffer or writes another attachment since), by tag and pixel box */
+	struct { unsigned tag; int x0, y0, x1, y1; } _hsr[256];
+	unsigned _hsrCount;
 }
 - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandBuffer pass:(const struct hakios_metal_render_pass *)pass
 			       colorTexture:(HakiosMetalTexture *)texture;
@@ -1660,6 +1664,10 @@ struct hm_ft_pipe {
 	char *lines;                       /* its pipe line and a pblend line per colour attachment */
 	unsigned vdFormat, vdOffset, vdBuffer, vdStride;   /* attribute 0 of its vertex descriptor; vdFormat 0: none */
 	BOOL fixedVert, baseColor;         /* CoreAnimation's fixed_vert_*_gen, which reads its vertices itself; its fc_base_color */
+	/* metal_hsrprobe: writes colour attachment 0 alone (no other attachment's write mask); covers what is under it
+	 * (attachment 0 written whole with blending off, no discard, no framebuffer fetch, one sample, no alpha to coverage);
+	 * reads the framebuffer */
+	BOOL c0Only, occludes, fetches;
 };
 
 static void *hm_ft_watch(void *unused);
@@ -2321,6 +2329,35 @@ hm_ft_geometry(const struct hm_ft_pipe *p, hakios_metal_buffer *const *vs, const
 }
 
 /* the size of the attachment a pass draws into: colour 0's level, or the first other colour attachment's, or depth's */
+
+/*
+ * metal_hsrprobe=1 (with metal_trace=frame, whose pipeline descriptions and vertex reading it uses; off by default): A
+ * MEASUREMENT INSTRUMENT, never for use. A GPU of Apple's does not shade what a later opaque layer covers (hidden surface
+ * removal in its tiles); this GPU shades all of it. To time what that costs here, a draw of an encoder that writes
+ * colour attachment 0 alone is cancelled (hakios_metal_cb_cancel_draw: its draw packet a NOP, its state kept) when a
+ * later draw of the same encoder covers its whole pixel box with an opaque axis-aligned rectangle and no draw between
+ * them reads the framebuffer or writes another attachment. Where the draws land comes from CoreAnimation's own
+ * convention (hm_ft_geometry), which is why this is an instrument and not the driver's answer.
+ */
+static unsigned hm_hsr_next;
+static unsigned long long hm_hsr_cancelled, hm_hsr_pixels, hm_hsr_draws;
+static double hm_hsr_printed;
+static BOOL
+hm_hsr_on(void)
+{
+	static dispatch_once_t once;
+	static BOOL on;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_hsrprobe=1") != NULL && strstr(args, "metal_trace=frame") != NULL;
+		if (on) hm_print("metal_hsrprobe=1: draws under a later opaque rectangle are cancelled -- a measurement, the picture may differ\n");
+	});
+	return on;
+}
+
 static void
 hm_ft_window(const struct hakios_metal_render_pass *pass, unsigned *w, unsigned *h)
 {
@@ -2514,7 +2551,17 @@ hm_ft_pipe_new(MTLRenderPipelineDescriptor *d, id vs, id fs, hakios_metal_progra
 	p->baseColor = hm_ft_constant_named(vs, @"fc_base_color", vsConstants, vsCount) > 0;
 	if (hm_ft_fs_traits != NULL) {
 		const unsigned traits = hm_ft_fs_traits(program);
+		MTLRenderPipelineColorAttachmentDescriptor *c0 = [[d colorAttachments] objectAtIndexedSubscript:0];
 
+		p->fetches = (traits & 0xff) != 0;
+		p->c0Only = YES;
+		for (NSUInteger i = 1; i < 8; i++) {
+			MTLRenderPipelineColorAttachmentDescriptor *c = [[d colorAttachments] objectAtIndexedSubscript:i];
+			if (c != nil && [c pixelFormat] != MTLPixelFormatInvalid && [c writeMask] != MTLColorWriteMaskNone) p->c0Only = NO;
+		}
+		p->occludes = c0 != nil && [c0 pixelFormat] != MTLPixelFormatInvalid && ![c0 isBlendingEnabled] && [c0 writeMask] == MTLColorWriteMaskAll &&
+			      ((traits >> 8) & 1) == 0 && !p->fetches && [d rasterSampleCount] <= 1 && ![d isAlphaToCoverageEnabled] &&
+			      [d depthAttachmentPixelFormat] == MTLPixelFormatInvalid && [d stencilAttachmentPixelFormat] == MTLPixelFormatInvalid;
 		snprintf(fb, sizeof(fb), "0x%x", traits & 0xff);
 		snprintf(discard, sizeof(discard), "%u", (traits >> 8) & 1);
 	} else {
@@ -10842,6 +10889,12 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	}
 	const double coreBegan = hm_fps_on() ? hm_now() : 0;
 	if (_ftrace != NULL) ftBefore = hm_ft_total(cb);
+	unsigned hsrTag = 0;
+	if (hm_hsr_on() && _pipeline != nil && [_pipeline hakiosFtPipe] != NULL) {
+		hsrTag = ++hm_hsr_next;
+		if (hsrTag == 0) hsrTag = ++hm_hsr_next;
+		hakios_metal_cb_set_draw_tag(cb, hsrTag);
+	}
 	if (indexBuffer != nil) {
 		drawn = hakios_metal_cb_draw_indexed(cb, program, &_pass, _hasViewport ? &_viewport : NULL, _hasScissor ? &_scissor : NULL,
 						     (unsigned)primitive, (unsigned)count, (unsigned)indexType, [(HakiosMetalBuffer *)indexBuffer hakiosBuffer],
@@ -10868,8 +10921,95 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 		return;
 	}
 	hm_spend_clears(&_pass);   /* the fills are recorded: the pass's later draws load what they left */
+	if (hsrTag != 0) {
+		[self hakiosHsrDrawn:hsrTag vs:vs start:(unsigned)start count:(unsigned)count instances:(unsigned)instances indexBuffer:indexBuffer
+			   indexType:(unsigned)indexType indexOffset:(uint64_t)indexOffset baseVertex:(long)baseVertex indirect:indirectArgs != nil];
+	}
 	HM_FT_DRAW("ok");
 #undef HM_FT_DRAW
+}
+
+/* metal_hsrprobe (hm_hsr_on): the draw just recorded as TAG -- an occluder cancels what it covers, then it may be covered */
+- (void)hakiosHsrDrawn:(unsigned)tag vs:(hakios_metal_buffer *const *)vs start:(unsigned)start count:(unsigned)count instances:(unsigned)instances
+	   indexBuffer:(id)indexBuffer indexType:(unsigned)indexType indexOffset:(uint64_t)indexOffset baseVertex:(long)baseVertex
+	      indirect:(BOOL)indirect
+{
+	const struct hm_ft_pipe *p = [_pipeline hakiosFtPipe];
+	struct hakios_metal_viewport vp;
+	unsigned w = 0, h = 0, positions = 0, read = 0;
+	float box[4], pos[12];
+	const char *source = "";
+	BOOL known;
+	int x0, y0, x1, y1;
+
+	hm_hsr_draws++;
+	/* what this draw does to the ones before it: a framebuffer read, another attachment written or a depth or stencil
+	 * state ends every chance of covering them */
+	if (p == NULL || !p->c0Only || p->fetches || _pass.depth_state_set || _pass.stencil_state_set || _pass.visibility_mode != 0) {
+		_hsrCount = 0;
+		return;
+	}
+	hm_ft_window(&_pass, &w, &h);
+	vp = _hasViewport ? _viewport : (struct hakios_metal_viewport){ 0, 0, (double)w, (double)h, 0, 1 };
+	known = !indirect && w != 0 && h != 0 &&
+		hm_ft_geometry(p, vs, _vsOffsets, _vsHighest, &vp, start, count,
+			       [indexBuffer isKindOfClass:[HakiosMetalBuffer class]] ? [(HakiosMetalBuffer *)indexBuffer hakiosBuffer] : NULL, indexType,
+			       indexOffset, baseVertex, box, pos, &positions, &read, &source);
+	if (!known || instances > 1) return;   /* (not to be covered and not covering: it writes colour 0 alone, so nothing ends) */
+	{
+		/* the pixels whose centres the box holds, in the scissor and the target */
+		int sx0 = 0, sy0 = 0, sx1 = (int)w - 1, sy1 = (int)h - 1;
+
+		if (_hasScissor && _scissor.width != 0 && _scissor.height != 0) {
+			sx0 = (int)_scissor.x, sy0 = (int)_scissor.y;
+			sx1 = MIN(sx1, (int)(_scissor.x + _scissor.width) - 1), sy1 = MIN(sy1, (int)(_scissor.y + _scissor.height) - 1);
+		}
+		x0 = MAX(sx0, (int)floorf(box[0])), y0 = MAX(sy0, (int)floorf(box[1]));
+		x1 = MIN(sx1, (int)ceilf(box[2]) - 1), y1 = MIN(sy1, (int)ceilf(box[3]) - 1);
+		if (x0 > x1 || y0 > y1) return;
+		if (p->occludes && read == positions && (positions == 4 || positions == 6)) {
+			/* an axis-aligned rectangle: two x and two y among its corners; it covers the pixels whose centres lie inside */
+			float xs[2] = { pos[0], pos[0] }, ys[2] = { pos[1], pos[1] };
+			unsigned nx = 1, ny = 1;
+			BOOL rect = YES;
+
+			for (unsigned i = 1; i < positions && rect; i++) {
+				const float x = pos[2 * i], y = pos[2 * i + 1];
+				if (x != xs[0] && (nx == 1 || x != xs[1])) { if (nx == 2) rect = NO; else xs[nx++] = x; }
+				if (y != ys[0] && (ny == 1 || y != ys[1])) { if (ny == 2) rect = NO; else ys[ny++] = y; }
+			}
+			if (rect && nx == 2 && ny == 2) {
+				const int cx0 = MAX(sx0, (int)ceilf(MIN(xs[0], xs[1]) - 0.5f)), cy0 = MAX(sy0, (int)ceilf(MIN(ys[0], ys[1]) - 0.5f));
+				const int cx1 = MIN(sx1, (int)ceilf(MAX(xs[0], xs[1]) - 0.5f) - 1), cy1 = MIN(sy1, (int)ceilf(MAX(ys[0], ys[1]) - 0.5f) - 1);
+				unsigned kept = 0;
+
+				for (unsigned i = 0; i < _hsrCount; i++) {
+					if (_hsr[i].x0 >= cx0 && _hsr[i].y0 >= cy0 && _hsr[i].x1 <= cx1 && _hsr[i].y1 <= cy1) {
+						hakios_metal_cb_cancel_draw([self hakiosCb], _hsr[i].tag);
+						hm_hsr_cancelled++;
+						hm_hsr_pixels += (unsigned long long)(_hsr[i].x1 - _hsr[i].x0 + 1) * (unsigned long long)(_hsr[i].y1 - _hsr[i].y0 + 1);
+					} else {
+						_hsr[kept++] = _hsr[i];
+					}
+				}
+				_hsrCount = kept;
+			}
+		}
+	}
+	if (_hsrCount == sizeof(_hsr) / sizeof(_hsr[0])) {
+		memmove(&_hsr[0], &_hsr[1], sizeof(_hsr[0]) * (_hsrCount - 1));
+		_hsrCount--;
+	}
+	_hsr[_hsrCount].tag = tag, _hsr[_hsrCount].x0 = x0, _hsr[_hsrCount].y0 = y0, _hsr[_hsrCount].x1 = x1, _hsr[_hsrCount].y1 = y1;
+	_hsrCount++;
+	{
+		const double now = hm_now();
+		if (now - hm_hsr_printed > 5) {
+			hm_hsr_printed = now;
+			hm_print("metal_hsrprobe: %llu of %llu draws cancelled so far, %.1f Mpx under opaque rectangles\n", hm_hsr_cancelled, hm_hsr_draws,
+				 hm_hsr_pixels / 1e6);
+		}
+	}
 }
 
 - (void)drawPrimitives:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count

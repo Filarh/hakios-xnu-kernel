@@ -185,6 +185,7 @@ long_register_writes_are_cut submits 0 words 0 draws 0 loads 0 stream 0000000000
 memcpy_layout_is_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 render_refuses_what_the_first_draw_does_not_serve_by_name submits 2 words 1380 draws 2 loads 8 stream 4087634dec79238d state 81caf134c68aec65 names 8 05d20adef5c3adcc
 an_empty_scissor_passes_no_fragment_and_is_no_refusal submits 3 words 7567 draws 40 loads 32 stream 4c9bc8763db2659d state 425d40b6b65398e5 names 13 93db06bbb02e6679
+a_tagged_draw_cancelled_in_its_open_pass_is_not_drawn submits 2 words 2778 draws 4 loads 12 stream 338c69a95c39b6fd state 54e81470edcf5a2d names 10 2b42e6c90a09a738
 render_encodes_the_first_triangles_registers submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 render_encodes_the_varying_link_of_tri_color submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 render_options_switch_each_group_and_each_alternative submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

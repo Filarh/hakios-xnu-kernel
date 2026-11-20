@@ -560,6 +560,11 @@ void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb *cb, unsigned draws);
 void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
 /* every fragment texture of CB's draws the null texture (CommandBuffer::setNullFsTextures): for measuring only */
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
+/* A measurement instrument (metal_hsrprobe): TAG (non-zero) names the next draw; cancel_draw(TAG) makes that draw's
+ * draw packet a CP_NOP while its pass is still open, its state left in place (CommandBuffer::setDrawTag, cancelDraw).
+ * What is then drawn is not what was asked: for timing the draws nobody sees, never in use. */
+void hakios_metal_cb_set_draw_tag(hakios_metal_cb *cb, unsigned tag);
+void hakios_metal_cb_cancel_draw(hakios_metal_cb *cb, unsigned tag);
 /* How the process's command buffers take their draws from now on (CommandBuffer::keepStates, verifyDraws). KEEP 0:
  * each draw judged and written whole, as the first with its program is -- the stream is the same either way, so this is
  * a bisect's switch and a measurement's. VERIFY 1: each draw taken from its program's kept state is also written whole

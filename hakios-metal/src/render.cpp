@@ -4769,6 +4769,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     }
 
     // --- the draw's words, straight onto the pass's stream (and onto its sysmem side, for a pass recorded both ways) ---
+    const size_t markInto = into.size(), markSys = open_->dual ? open_->sysStream.size() : SIZE_MAX;
     RegShadow& shadow = open_->gmem ? open_->bodyRegs : open_->regs;
     render::Cursor& cursor = open_->cache->cur[open_->gmem ? 1 : 0];
     if (options.dedupRegs && open_->options.dedupRegs) {
@@ -4885,6 +4886,13 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
         open_->cache->cur[0].forget();
         open_->cache->cur[1].forget();
+    }
+    if (drawTag_ != 0) {
+        // (setDrawTag: where this draw's draw packet went, for a cancelDraw while the pass is open)
+        DrawMark m{drawTag_, &into, into.lastPacket(markInto, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI), SIZE_MAX};
+        if (markSys != SIZE_MAX) m.atSys = open_->sysStream.lastPacket(markSys, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI);
+        drawMarks_.push_back(m);
+        drawTag_ = 0;
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
     // A pass recorded both ways is recorded for tiles alone from the draw at which closePass's choice can no longer
@@ -5135,7 +5143,20 @@ bool CommandBuffer::append(CommandBuffer& other) {
     return true;
 }
 
+bool CommandBuffer::cancelDraw(uint32_t tag) {
+    for (const DrawMark& m : drawMarks_) {
+        if (m.tag != tag || open_ == nullptr) continue;
+        bool done = false;
+        if (m.at != SIZE_MAX) done = m.into->nopPacket(m.at, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI) || done;
+        if (m.atSys != SIZE_MAX && open_->dual) done = open_->sysStream.nopPacket(m.atSys, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI) || done;
+        if (done) cancelled_++;
+        return done;
+    }
+    return false;
+}
+
 void CommandBuffer::closePass(const RenderPass* next, bool kept) {
+    drawMarks_.clear();
     if (open_ == nullptr) {
         return;
     }

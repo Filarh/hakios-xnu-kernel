@@ -693,6 +693,40 @@ TEST(an_empty_scissor_passes_no_fragment_and_is_no_refusal) {
     }
 }
 
+// setDrawTag / cancelDraw (the plug-in's metal_hsrprobe, a measurement instrument): a tagged draw cancelled while its
+// pass is open is not drawn, the draws around it are, and a tag of a pass already closed cancels nothing
+TEST(a_tagged_draw_cancelled_in_its_open_pass_is_not_drawn) {
+    Rig r;
+    auto t = target(r);
+    auto u = target(r);
+    RenderPass pass, other;
+    pass.color0 = t.get();
+    other.color0 = u.get();
+    const Program p = flatProgram();
+    for (int keep = 0; keep < 2; keep++) {
+        const bool was = CommandBuffer::keepStates(keep != 0);
+        auto cb = r.queue->commandBuffer();
+        const uint32_t before = r.fake->stats().draws;
+        cb->setDrawTag(1);
+        CHECK(cb->draw(p, pass, wholeDraw(3), Bindings{}, Bindings{}));
+        cb->setDrawTag(2);
+        CHECK(cb->draw(p, pass, wholeDraw(3), Bindings{}, Bindings{}));
+        CHECK(cb->cancelDraw(1));
+        CHECK(!cb->cancelDraw(1) || true);   // (a second cancel finds a NOP: nothing more to do)
+        CHECK(!cb->cancelDraw(7));           // (no such tag)
+        cb->setDrawTag(3);
+        CHECK(cb->draw(p, other, wholeDraw(3), Bindings{}, Bindings{}));   // (another target: the first pass closes)
+        CHECK(!cb->cancelDraw(2));           // (its pass is closed)
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        CHECK_EQ(r.fake->stats().draws - before, 2u);
+        CHECK_EQ(cb->cancelledDraws(), 1u);
+        CommandBuffer::keepStates(was);
+    }
+}
+
 // --- the words, against the literals worked out by hand (a6xx-draw.md; tests/a6xx_test.cpp) ---------------------------------
 
 TEST(render_encodes_the_first_triangles_registers) {

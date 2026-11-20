@@ -83,6 +83,11 @@ public:
 
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }
+    // the header of the last type-7 packet with OPCODE_A or OPCODE_B among the whole packets from FROM on (FROM a
+    // header), or SIZE_MAX; and that packet made a CP_NOP of the same length, so the CP skips its words (false if the word
+    // at AT is no longer such a header: the stream changed under it)
+    size_t lastPacket(size_t from, uint32_t opcodeA, uint32_t opcodeB) const;
+    bool nopPacket(size_t at, uint32_t opcodeA, uint32_t opcodeB);
     void clear() { words_.clear(); }
 
 private:

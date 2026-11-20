@@ -1,6 +1,7 @@
 #include "hakios-metal/pm4.hpp"
 
 #include <cassert>
+#include <cstdint>
 
 namespace hakios::metal::pm4 {
 
@@ -25,6 +26,25 @@ Header decode(uint32_t word) {
         break;
     }
     return h;
+}
+
+size_t Stream::lastPacket(size_t from, uint32_t opcodeA, uint32_t opcodeB) const {
+    size_t found = SIZE_MAX;
+    for (size_t at = from; at < words_.size();) {
+        const Header h = decode(words_[at]);
+        if (h.kind == Header::kBad) break;   // (not a header: the walk stops, what was found stands)
+        if (h.kind == Header::kCommand && (h.opcode == opcodeA || h.opcode == opcodeB)) found = at;
+        at += 1 + size_t(h.count);
+    }
+    return found;
+}
+
+bool Stream::nopPacket(size_t at, uint32_t opcodeA, uint32_t opcodeB) {
+    if (at >= words_.size()) return false;
+    const Header h = decode(words_[at]);
+    if (h.kind != Header::kCommand || (h.opcode != opcodeA && h.opcode != opcodeB) || at + h.count >= words_.size()) return false;
+    words_[at] = type7(kNop, h.count);
+    return true;
 }
 
 void Stream::command(uint32_t opcode, uint32_t count) {
