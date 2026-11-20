@@ -653,6 +653,29 @@ hakios_metal_texture* hakios_metal_texture_new_iosurface2(hakios_metal_device* d
     return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, &chroma);
 }
 
+hakios_metal_texture* hakios_metal_texture_new_ycbcr(hakios_metal_device* d, unsigned surfaceId, unsigned width, unsigned height, uint64_t chromaOffset,
+                                                     unsigned chromaRowBytes, unsigned siting) {
+    Texture::SurfacePlane chroma{chromaOffset, chromaRowBytes};
+    chroma.midpoint = uint8_t(siting & 3);
+    TextureDesc desc;
+    desc.format = PixelFormat::kYCbCr8_420_2P;
+    desc.width = width;
+    desc.height = height;
+    desc.usage = kTextureUsageRead;
+    std::string why;
+    std::shared_ptr<Texture> planes = Texture::wrapSurface(*d->gpu, surfaceId, desc, &why, &chroma);
+    // (Cr, Y, Cb, 1): R8_G8B8_420 returns Y in x, Cb in y, Cr in z (texture.cpp's format table)
+    const uint8_t crYCb1[4] = {4, 2, 3, 1};
+    std::shared_ptr<Texture> t = planes != nullptr ? Texture::swizzled(planes, crYCb1, &why) : nullptr;
+    if (t == nullptr) {
+        failed(why);
+        return nullptr;
+    }
+    auto* r = new hakios_metal_texture;
+    r->texture = std::move(t);
+    return r;
+}
+
 hakios_metal_texture* hakios_metal_texture_new_buffer(hakios_metal_buffer* b, unsigned type, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage,
                                                       uint64_t offset, uint64_t bytesPerRow) {
     TextureDesc desc;

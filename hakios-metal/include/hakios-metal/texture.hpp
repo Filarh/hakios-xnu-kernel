@@ -240,10 +240,13 @@ public:
     // a multiple of 64 bytes, or rows shorter than the width), a FourCC that is not the format's ('BGRA' for the BGRA8
     // pair, 'RGBA' for the RGBA8 pair; 0 is taken as any), a depth format.
     // A two-plane format (YCbCr8_420_2P) takes the surface's second plane too: CHROMA its offset in the surface's memory
-    // and its row bytes, which the caller reads off the surface (the kernel describes plane 0 alone).
+    // and its row bytes, which the caller reads off the surface (the kernel describes plane 0 alone), and where its
+    // samples lie against the luma's: MIDPOINT bit 0 halfway between two luma columns, bit 1 between two rows (the
+    // TP's CHROMA_MIDPOINT_X/Y, fdl6_view_init); 0, cosited with the top-left luma sample, as Metal's default.
     struct SurfacePlane {
         uint64_t offset;
         uint32_t rowBytes;
+        uint8_t midpoint = 0;
     };
     static std::shared_ptr<Texture> wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why,
                                                 const SurfacePlane* chroma = nullptr);

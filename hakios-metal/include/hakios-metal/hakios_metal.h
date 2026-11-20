@@ -187,6 +187,13 @@ hakios_metal_texture *hakios_metal_texture_new_iosurface(hakios_metal_device *de
  * CHROMA_ROW_BYTES its rows; both planes are sampled as one texture. */
 hakios_metal_texture *hakios_metal_texture_new_iosurface2(hakios_metal_device *device, unsigned surface_id, unsigned plane,
     unsigned pixel_format, unsigned width, unsigned height, unsigned usage, uint64_t chroma_offset, unsigned chroma_row_bytes);
+/* A '420f' or '420v' surface read by the GPU as its planes' values, (Cr, Y, Cb, 1) in (red, green, blue, alpha): the
+ * two-plane texture of hakios_metal_texture_new_iosurface2 (500, read by shaders) seen through the swizzle
+ * (blue, red, green, one). That is Metal's private 540 as it is; a fragment stage compiled with the slot's YCbCr code
+ * (hakios_metal_program_specialize_ycbcr) samples it as 500, RGB. SITING bit 0: the chroma samples lie halfway between
+ * two luma columns, bit 1 between two rows; 0 cosited with the top-left luma sample. NULL with the reason. */
+hakios_metal_texture *hakios_metal_texture_new_ycbcr(hakios_metal_device *device, unsigned surface_id, unsigned width, unsigned height,
+    uint64_t chroma_offset, unsigned chroma_row_bytes, unsigned siting);
 /* -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a texture over BUFFER's bytes from OFFSET, BYTES_PER_ROW apart
  * (the same memory). NULL with the reason: a pitch or start that is not a multiple of 64 bytes, rows past the buffer, a
  * format, type or level count a buffer does not take. */

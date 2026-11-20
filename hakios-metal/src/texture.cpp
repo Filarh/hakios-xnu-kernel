@@ -844,7 +844,10 @@ a6xx::TexConst Texture::sampledDescriptor() const {
     }
     if (info_->twoPlane) {
         // the second plane as fdl6_view_init gives it (fd6_view.c:255-289): its pitch over MIN_LOD_CLAMP's dword and its
-        // address in dwords 7 and 8; MIPLVLS 0, its bits being the chroma siting there (cosited, Metal's default)
+        // address in dwords 7 and 8; MIPLVLS 0, its bits being the chroma siting there (cosited, Metal's default,
+        // unless the surface says its chroma lies between the luma samples: fd6_view.c:258-263)
+        if (chroma_.midpoint & 1) d.dword[0] |= A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X;
+        if (chroma_.midpoint & 2) d.dword[0] |= A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y;
         const uint64_t chroma = buffer_->gpuAddress() + chroma_.offset;
         d.dword[6] = A6XX_TEX_CONST_6_PLANE_PITCH(chroma_.rowBytes);
         d.dword[7] = uint32_t(chroma);

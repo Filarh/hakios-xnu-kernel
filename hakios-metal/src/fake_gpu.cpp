@@ -55,6 +55,7 @@ uint32_t bytesPerPixel(uint32_t fmt) {
     case a6xx::FMT6_A8_UNORM: return 1;
     case a6xx::FMT6_8_UINT: return 1;
     case a6xx::FMT6_8_UNORM: return 1;
+    case a6xx::FMT6_R8_G8B8_2PLANE_420_UNORM: return 1;   // (the luma plane's; the chroma plane is checked apart: check2d)
     case a6xx::FMT6_16_FLOAT: return 2;
     case a6xx::FMT6_16_UNORM: return 2;
     case a6xx::FMT6_16_UINT: return 2;
@@ -585,9 +586,26 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
               text(" at %#llx: outside every buffer or not 64-byte aligned", base));
         return false;
     }
-    if (sampled && fieldOf(d[0], A6XX_TEX_CONST_0_MIPLVLS__MASK, A6XX_TEX_CONST_0_MIPLVLS__SHIFT) != 0) {
+    // NV12 (fdl6_view_init, fd6_view.c:255-289): MIPLVLS's bits 0 and 2 are the chroma siting there, and the second
+    // plane -- interleaved CbCr at half the size, 2 bytes a sample -- is PLANE_PITCH apart a row from the address in
+    // dwords 7 and 8: a pitch that holds a row and is a multiple of 64, a 64-byte aligned start, its rows inside a buffer
+    const bool nv12 = fmt == FMT6_R8_G8B8_2PLANE_420_UNORM;
+    const uint32_t levelBits = nv12 ? A6XX_TEX_CONST_0_MIPLVLS__MASK & ~(A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X | A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y)
+                                    : A6XX_TEX_CONST_0_MIPLVLS__MASK;
+    if (sampled && (d[0] & levelBits) != 0) {
         fault(who + ": more than one level: not what this GPU model runs");
         return false;
+    }
+    if (nv12) {
+        const uint64_t cpitch = fieldOf(d[6], A6XX_TEX_CONST_6_PLANE_PITCH__MASK, A6XX_TEX_CONST_6_PLANE_PITCH__SHIFT);
+        const uint64_t cbase = uint64_t(d[7]) | uint64_t(d[8] & 0x1ffff) << 32;
+        const uint64_t cw = (uint64_t(width) + 1) / 2, ch = (uint64_t(height) + 1) / 2;
+        if (!sampled || cpitch < 2 * cw || cpitch % 64 != 0 || cbase % 64 != 0 || at(cbase, (ch - 1) * cpitch + 2 * cw) == nullptr) {
+            fault(who + text(": an NV12 chroma plane of pitch %llu at %#llx", cpitch, cbase) +
+                  text(" for %llu x %llu samples: not sampled, a pitch short of a row or not a multiple of 64, ", cw, ch) +
+                  "a start not 64-byte aligned, or rows outside every buffer");
+            return false;
+        }
     }
     // more than one layer (a 2D array, or a 3D view's slices): each its rows ARRAY_PITCH after the last, as fdl6_layout
     // lays them out 4 KiB aligned (fd6_layout.c:245-262), and the last layer inside the same buffer as the first

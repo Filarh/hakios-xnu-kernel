@@ -3832,6 +3832,73 @@ TEST(a_two_plane_surface_is_one_ycbcr_texture) {
     CHECK(has(why, "two planes of different sizes"));
 }
 
+// Format 540, and 500 sampled by a stage with the slot's YCbCr code: the same two-plane texture seen through the
+// swizzle (blue, red, green, one), so that a sample is (Cr, Y, Cb, 1) -- SWIZ_X..W Z, X, Y, ONE in dword 0 -- with
+// the chroma plane where it was (dwords 6-8), the surface named for the submit, and the chroma siting in MIPLVLS's
+// bits when the surface asks for it. Drawn by tri_tex on the fake, which takes the descriptor and completes.
+TEST(a_ycbcr_texture_is_the_two_planes_read_as_cr_y_cb_one) {
+    using namespace a6xx;
+    Rig r;
+    const uint32_t k420v = 0x34323076u;
+    r.fake->addSurface(21, 64, 64, 128, k420v, 0, 2);
+    TextureDesc d;
+    d.format = PixelFormat::kYCbCr8_420_2P;
+    d.width = d.height = 64;
+    d.usage = kTextureUsageRead;
+    Texture::SurfacePlane chroma{128 * 64, 128};
+    std::string why;
+    auto planes = Texture::wrapSurface(*r.gpu, 21, d, &why, &chroma);
+    CHECK(planes != nullptr);
+    if (planes == nullptr) {
+        std::fprintf(stderr, "  %s\n", why.c_str());
+        return;
+    }
+    const uint8_t crYCb1[4] = {4, 2, 3, 1};
+    auto t = Texture::swizzled(planes, crYCb1, &why);
+    CHECK(t != nullptr);
+    if (t == nullptr) return;
+    const TexConst p = planes->sampledDescriptor(), c = t->sampledDescriptor();
+    auto swiz = [](uint32_t w, int k) { return (w >> (A6XX_TEX_CONST_0_SWIZ_X__SHIFT + 3 * k)) & 7; };
+    CHECK_EQ(swiz(c.dword[0], 0), uint32_t(A6XX_TEX_Z));
+    CHECK_EQ(swiz(c.dword[0], 1), uint32_t(A6XX_TEX_X));
+    CHECK_EQ(swiz(c.dword[0], 2), uint32_t(A6XX_TEX_Y));
+    CHECK_EQ(swiz(c.dword[0], 3), uint32_t(A6XX_TEX_ONE));
+    const uint32_t swizFields = A6XX_TEX_CONST_0_SWIZ_X__MASK | A6XX_TEX_CONST_0_SWIZ_Y__MASK | A6XX_TEX_CONST_0_SWIZ_Z__MASK | A6XX_TEX_CONST_0_SWIZ_W__MASK;
+    CHECK_EQ(c.dword[0] & ~swizFields, p.dword[0] & ~swizFields);
+    for (int w = 1; w < 16; w++) CHECK_EQ(c.dword[w], p.dword[w]);
+    CHECK_EQ(c.dword[0] & (A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X | A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y), 0u);
+    CHECK_EQ(t->surface(), 21u);
+    // the siting: the chroma between two luma columns, then also between two rows
+    chroma.midpoint = 1;
+    auto left = Texture::wrapSurface(*r.gpu, 21, d, &why, &chroma);
+    chroma.midpoint = 3;
+    auto centre = Texture::wrapSurface(*r.gpu, 21, d, &why, &chroma);
+    CHECK(left != nullptr && centre != nullptr);
+    if (left != nullptr && centre != nullptr) {
+        CHECK_EQ(left->sampledDescriptor().dword[0] & (A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X | A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y),
+                 A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X);
+        CHECK_EQ(centre->sampledDescriptor().dword[0] & (A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X | A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y),
+                 A6XX_TEX_CONST_0_CHROMA_MIDPOINT_X | A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y);
+        auto swizzledCentre = Texture::swizzled(centre, crYCb1, &why);
+        CHECK(swizzledCentre != nullptr && (swizzledCentre->sampledDescriptor().dword[0] & A6XX_TEX_CONST_0_CHROMA_MIDPOINT_Y) != 0);
+    }
+    // sampled by a draw: the fake takes it and the draw completes, the surface's buffer among the submit's
+    auto out = target(r);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = out.get();
+    Bindings fsb;
+    fsb.textures = {t.get()};
+    fsb.samplers = {&smp};
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::fprintf(stderr, "  %s\n", cb->error().c_str());
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 TEST(a_texture_over_an_iosurface_refuses_what_the_gpu_cannot_take) {
     Rig r;
     const uint32_t kBGRA = 0x42475241u, kRGBA = 0x52474241u;

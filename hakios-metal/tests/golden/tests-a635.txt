@@ -102,6 +102,15 @@ a_stage_compiled_without_the_preamble_is_taken_only_when_it_spills_less submits 
 a_stage_that_writes_its_device_buffers_is_told_from_one_that_reads_them submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the cache did not run)
 a_compiled_stage_comes_back_from_the_cache_and_from_a_seed submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+       code 1: at most 1 apart from the processor's, 866 channels of 5680128 differ
+       code 2: at most 1 apart from the processor's, 25 channels of 5680128 differ
+       code 3: at most 1 apart from the processor's, 167 channels of 5680128 differ
+       code 4: at most 1 apart from the processor's, 25 channels of 5680128 differ
+       code 5: at most 0 apart from the processor's, 0 channels of 5680128 differ
+       code 6: at most 1 apart from the processor's, 19 channels of 5680128 differ
+a_ycbcr_slots_matrix_is_the_processors_conversion_within_one_step submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+       (no compiler in this build: the YCbCr lowering did not run)
+a_ycbcr_slot_is_converted_after_its_sample_and_filed_apart submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets submits 1 words 112 draws 0 loads 2 stream 0459b476d8d32e2f state 73d60166aefc2a51 names 4 94a18d98463af819
 an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 181 draws 0 loads 4 stream 514a751e163e70ec state 65ad89869881ce17 names 5 55c16b327fc26836
 a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 112 draws 0 loads 2 stream efb1320aababb718 state 73d60166aefc2a51 names 3 56e6c080795c4956
@@ -231,6 +240,7 @@ a_draw_refuses_a_depth_setup_it_cannot_serve submits 0 words 0 draws 0 loads 0 s
 the_fake_refuses_a_depth_draw_that_does_not_hold_together submits 6 words 3612 draws 6 loads 12 stream c4340e836b3eeee9 state 54e81470edcf5a2d names 0 0000000000000000
 a_texture_over_an_iosurface_draws_into_the_surfaces_memory submits 2 words 624 draws 0 loads 0 stream 5ab1b1a1cde14512 state cbf29ce484222325 names 4 6ef4ef7bbfd7fb74
 a_two_plane_surface_is_one_ycbcr_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_ycbcr_texture_is_the_two_planes_read_as_cr_y_cb_one submits 1 words 699 draws 1 loads 4 stream 2d08a60e10be5db9 state fc0919292643f43a names 5 75a6c75c2ecf170b
 a_texture_over_an_iosurface_refuses_what_the_gpu_cannot_take submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 an_indexed_draw_is_the_seven_word_form_with_primitive_restart submits 3 words 2079 draws 3 loads 6 stream 59553d81950982ce state af1beff45cf71e23 names 18 9efb005cbdc4ec8c
 an_indexed_or_instanced_draw_refuses_what_it_cannot_serve submits 1 words 689 draws 1 loads 2 stream 27af40ab9bfe7c67 state 58699d5de9f40f97 names 5 b4e454c540a07906
