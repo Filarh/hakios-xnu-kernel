@@ -1094,6 +1094,16 @@ std::shared_ptr<Texture> Texture::wrapTwoPlanes(std::shared_ptr<Buffer> buffer, 
         refuse(why, "a " + n(desc.width) + " x " + n(desc.height) + " texture over the " + n(s.width) + " x " + n(s.height) + " " + name);
         return nullptr;
     }
+    // An odd width or height: the plane holds ceil(n / 2) chroma samples, and the TP scales the coordinate to floor(n / 2)
+    // of them -- the chroma for luma x at x * floor(n/2) / n + 1/4 (cosited), which reaches the right sample only by a
+    // margin of (n / 2 - k) / n that the TP's fixed-point coordinate loses near the far edge. On the phone (ycbcrcheck,
+    // 751x1625) luma column 746 got chroma 372 for 373, and 7128 bytes of 540 differed; even sizes read every sample
+    // right. Such a surface is read through the copy.
+    if (((desc.width | desc.height) & 1) != 0 && !chroma->oddForCheck) {
+        refuse(why, "a " + n(desc.width) + " x " + n(desc.height) + " two-plane texture over " + name +
+                        ": an odd size, whose last chroma samples the texture unit reads one sample short");
+        return nullptr;
+    }
     const uint64_t cw = (uint64_t(desc.width) + 1) / 2, ch = (uint64_t(desc.height) + 1) / 2;
     // plane 0 as the caller gives it; the kernel's rows are the surface's, four bytes a pixel for a planar surface
     // made without IOSurfaceBytesPerElement (on the phone the TP read every luma row 4x too far apart)

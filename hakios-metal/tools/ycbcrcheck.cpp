@@ -10,7 +10,8 @@
 //
 //   1. layout: for each size, a surface with the planes IOSurface lays out by itself (its own pitches and offsets: are
 //      they the 64 bytes the texture unit needs?) and one with both planes' rows and starts set to 64 bytes
-//   2. correctness, per size (64x64, 751x1625, 750x1624 -- the app snapshot's --, 1920x1080), FourCC ('420f', '420v')
+//   2. correctness, per size (64x64, 751x1625, 750x1624 -- the app snapshot's --, 1920x1080; 751x1625, odd, is
+//      checked to be refused by the core and read through the copy), FourCC ('420f', '420v')
 //      and picture (ramps of Y, Cb and Cr, random, both planes zero, chroma 0, chroma 255, the probe's 20/60/a0):
 //      sampled with a nearest sampler at each pixel's own texel by tri_ptex into a linear target and compared with the
 //      processor's conversion:
@@ -35,9 +36,10 @@
 // --diag, instead of the above: where the texture unit reads each pixel from. Both planes are filled with their own
 // byte offsets (the luma byte at offset k holds k's low byte in one draw and its high byte in the next; the chroma
 // sample m, row by row in the plane's own pitch, holds m in Cb and Cr), so every pixel drawn says which luma byte and
-// which chroma sample it was given. At 64x64 (pitch = width) and 96x64 (pitch 128), for the two-plane texture as the
-// plug-in makes it, unswizzled, with TILE_ALL, with SWAP XYZW, and for the two planes read as plain R8 and RG8 textures
-// over the same memory: the descriptor's sixteen words, how many pixels read their own luma byte and their own chroma
+// which chroma sample it was given. At 64x64 (pitch = width), 96x64 (pitch 128), and the odd 65x33 and 751x33 (taken
+// anyway, with their last columns and rows decoded against x / 2 and the TP's floor(n / 2) scaling), for the two-plane
+// texture as the plug-in makes it, unswizzled, with the kernel's rows, with TILE_ALL, with SWAP XYZW, and for the two
+// planes read as plain R8 and RG8 textures over the same memory: the descriptor's sixteen words, how many pixels read their own luma byte and their own chroma
 // sample, rows 0-2 and column 0 decoded, and a row of 540's wanted and obtained values on the ramps.
 #include <algorithm>
 #include <chrono>
@@ -256,9 +258,10 @@ std::vector<uint8_t> pixelsOf(const Texture& t) {
 
 // the surface as the plug-in makes it under metal_ycbcrgpu=1 (hakios_metal_texture_new_ycbcr): both planes as one
 // R8_G8B8_2PLANE_420_UNORM texture, swizzled to (Cr, Y, Cb, 1)
-std::shared_ptr<Texture> ycbcrTexture(Gpu& gpu, IOSurfaceRef s, uint8_t siting, std::string* why) {
+std::shared_ptr<Texture> ycbcrTexture(Gpu& gpu, IOSurfaceRef s, uint8_t siting, std::string* why, bool odd = false) {
     const Layout l = layoutOf(s);
     Texture::SurfacePlane chroma{l.chromaOffset, uint32_t(l.row1)};
+    chroma.oddForCheck = odd;
     chroma.midpoint = siting;
     chroma.lumaOffset = l.offset0;
     chroma.lumaRowBytes = uint32_t(l.row0);
@@ -422,7 +425,8 @@ void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& near
     struct Size {
         uint32_t w, h;
     };
-    for (const Size sz : {Size{64, 64}, Size{96, 64}}) {
+    // (65x33 and 751x33: odd sizes, which the core reads through the copy -- taken here anyway, to see why)
+    for (const Size sz : {Size{64, 64}, Size{96, 64}, Size{65, 33}, Size{751, 33}}) {
         IOSurfaceRef s = makeSurface(sz.w, sz.h, k420f, true);
         if (s == nullptr) {
             report(false, "diag: a two-plane surface of " + std::to_string(sz.w) + "x" + std::to_string(sz.h));
@@ -440,7 +444,7 @@ void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& near
         };
         auto nv12 = [&](bool swizzled) {
             std::string w;
-            auto t = ycbcrTexture(gpu, s, 0, &w);
+            auto t = ycbcrTexture(gpu, s, 0, &w, true);
             if (t != nullptr && !swizzled) {
                 const uint8_t rgba[4] = {2, 3, 4, 5};
                 t = Texture::swizzled(t, rgba, &w);   // (over the swizzled one: identity on top of it is not what is wanted)
@@ -453,6 +457,7 @@ void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& near
             Texture::SurfacePlane chroma{ll.chromaOffset, uint32_t(ll.row1)};
             chroma.lumaOffset = ll.offset0;
             chroma.lumaRowBytes = uint32_t(ll.row0);
+            chroma.oddForCheck = true;
             TextureDesc d;
             d.format = PixelFormat::kYCbCr8_420_2P;
             d.width = W;
@@ -489,6 +494,7 @@ void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& near
             {"nv12 unswizzled, plane 0's rows as the kernel describes the surface (ycbcr-1)", 1, [&] {
                  std::string w;
                  Texture::SurfacePlane chroma{l.chromaOffset, uint32_t(l.row1)};
+                 chroma.oddForCheck = true;
                  TextureDesc d;
                  d.format = PixelFormat::kYCbCr8_420_2P;
                  d.width = W;
@@ -550,6 +556,29 @@ void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& near
             std::string col;
             for (uint32_t y = 0; y < 8; y++) col += at(0, y);
             std::printf("ycbcrcheck: diag   column 0:%s\n", col.c_str());
+            if (((W | H) & 1) != 0 && v.kind != 2) {
+                // the last columns of the first and last rows: the chroma column read, the plane's (x / 2), and what a
+                // coordinate scaled to floor(W / 2) samples with the cosited quarter gives, x * floor(W/2) / W + 1/4
+                for (const uint32_t y : {0u, H - 1}) {
+                    std::string row;
+                    for (uint32_t x = W - 10; x < W; x++) {
+                        const Decoded d = decodeAt(lo, hi, size_t(y) * W + x, v.kind);
+                        const double model = (x + 0.5) * (W / 2) / W + 0.25;
+                        char t[64];
+                        std::snprintf(t, sizeof t, " %u:%d/%u/%.3f", x, d.chroma < 0 ? -1 : d.chroma % int(p1c), x / 2, model);
+                        row += t;
+                    }
+                    std::printf("ycbcrcheck: diag   row %u, last columns (x: chroma read / x/2 / floor(W/2) model):%s\n", y, row.c_str());
+                }
+                std::string col;
+                for (uint32_t y = H - 6; y < H; y++) {
+                    const Decoded d = decodeAt(lo, hi, size_t(y) * W, v.kind);
+                    char t[64];
+                    std::snprintf(t, sizeof t, " %u:%d/%u/%.3f", y, d.chroma < 0 ? -1 : d.chroma / int(p1c), y / 2, (y + 0.5) * (H / 2) / H + 0.25);
+                    col += t;
+                }
+                std::printf("ycbcrcheck: diag   column 0, last rows (y: chroma row read / y/2 / model):%s\n", col.c_str());
+            }
             if (v.kind == 0 && W == 64) {
                 // 540 on the ramps, as the check compares it: a row of wanted and obtained values
                 fill(s, kRamps, 0);
@@ -647,8 +676,12 @@ int main(int argc, char** argv) {
                 char lay[200];
                 std::snprintf(lay, sizeof lay, "plane 0 at +%lu, %zu bytes a row; plane 1 at +%llu, %zu bytes a row; %zu bytes", (unsigned long)l.offset0, l.row0,
                               (unsigned long long)l.chromaOffset, l.row1, IOSurfaceGetAllocSize(s));
-                const bool fits = l.row0 % 64 == 0 && l.row1 % 64 == 0 && l.offset0 % 64 == 0 && l.chromaOffset % 64 == 0;
-                info(at + ": " + lay + (fits ? ": the texture unit can read it where it lies" : ": NOT 64-byte rows and starts: read through the copy"));
+                const bool aligned64 = l.row0 % 64 == 0 && l.row1 % 64 == 0 && l.offset0 % 64 == 0 && l.chromaOffset % 64 == 0;
+                const bool even = ((sz.w | sz.h) & 1) == 0;
+                const bool fits = aligned64 && even;
+                info(at + ": " + lay + (fits ? ": the texture unit can read it where it lies"
+                                             : !aligned64 ? ": NOT 64-byte rows and starts: read through the copy"
+                                                          : ": an odd size: read through the copy (the TP reads the last chroma samples one short)"));
                 std::string twhy;
                 auto t = ycbcrTexture(gpu, s, 0, &twhy);
                 if (!fits) {

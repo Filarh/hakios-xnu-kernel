@@ -3825,6 +3825,17 @@ TEST(a_two_plane_surface_is_one_ycbcr_texture) {
     refusedWith(11, rt, &chroma, "one level, read by shaders, is what it serves");
     const Texture::SurfacePlane far{128 * 64 * 2, 128};
     refusedWith(11, d, &far, "chroma rows of 128 from 16384");
+    // an odd width or height: read through the copy (the TP reads the last chroma samples one short), unless a check
+    // tool asks for it anyway
+    TextureDesc odd = d;
+    odd.width = 63;
+    refusedWith(11, odd, &chroma, "an odd size");
+    odd.width = 64;
+    odd.height = 63;
+    refusedWith(11, odd, &chroma, "an odd size");
+    Texture::SurfacePlane anyway = chroma;
+    anyway.oddForCheck = true;
+    CHECK(Texture::wrapSurface(*r.gpu, 11, odd, &why, &anyway) != nullptr);
     CHECK(Texture::make(*r.gpu, d, &why) == nullptr);
     CHECK(has(why, "served over a two-plane IOSurface alone"));
     uint8_t px[4] = {};

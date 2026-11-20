@@ -253,6 +253,7 @@ public:
         uint8_t midpoint = 0;
         uint64_t lumaOffset = 0;
         uint32_t lumaRowBytes = 0;
+        bool oddForCheck = false;   // an odd width or height taken anyway (ycbcrcheck --diag's alone: see wrapTwoPlanes)
     };
     static std::shared_ptr<Texture> wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why,
                                                 const SurfacePlane* chroma = nullptr);
