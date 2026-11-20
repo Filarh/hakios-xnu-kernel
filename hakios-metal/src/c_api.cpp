@@ -990,6 +990,8 @@ void hakios_metal_draw_states(int keep, int verify) {
     CommandBuffer::verifyDraws(verify != 0);
 }
 
+void hakios_metal_same_program_loads(int skip) { CommandBuffer::skipSameProgramLoads(skip != 0); }
+
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setProfileDraws(on != 0); });
     cb->cb->setProfileDraws(on != 0);

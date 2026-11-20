@@ -546,6 +546,9 @@ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
  * and the two compared; a difference ends the command buffer in error, saying what differs (a draw's cost more than
  * twice over: for a check on the device, not for use). 1 and 0 when never called. */
 void hakios_metal_draw_states(int keep, int verify);
+/* SKIP 1: a draw of a sysmem pass whose draw before it was of the same program leaves out the program's invalidate and
+ * its stages' preloads (CommandBuffer::skipSameProgramLoads); 0, the default, writes them for every draw */
+void hakios_metal_same_program_loads(int skip);
 /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
  * has completed, draw I's program name (valid while CB lives) and microseconds; the count is returned, -1 past them */
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb *cb, int on);
