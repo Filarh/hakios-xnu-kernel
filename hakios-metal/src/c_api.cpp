@@ -988,6 +988,31 @@ void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb* cb, int on) {
     cb->cb->setGmemTuned(on != 0);
 }
 
+void hakios_metal_cb_set_light_passes(hakios_metal_cb* cb, int on, int keepFill) {
+    if (deferring(cb)) {
+        return cb->deferrer->post(&cb->pending, [cb, on, keepFill] {
+            cb->cb->setLightPasses(on != 0);
+            cb->cb->setLightKeepAcrossFill(keepFill != 0);
+        });
+    }
+    cb->cb->setLightPasses(on != 0);
+    cb->cb->setLightKeepAcrossFill(keepFill != 0);
+}
+
+void hakios_metal_cb_light_counts(hakios_metal_cb* cb, unsigned* light, unsigned* full, unsigned* barriers, unsigned* writeWaits) {
+    syncOne(cb);
+    const CommandBuffer::LightCounts c = cb->cb->lightCounts();
+    if (light) *light = c.light;
+    if (full) *full = c.full;
+    if (barriers) *barriers = c.barriers;
+    if (writeWaits) *writeWaits = c.writeWaits;
+}
+
+void hakios_metal_cb_memory_barrier(hakios_metal_cb* cb) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb] { cb->cb->memoryBarrier(); });
+    cb->cb->memoryBarrier();
+}
+
 void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb* cb, unsigned draws) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, draws] { cb->cb->setGmemMinDraws(draws); });
     cb->cb->setGmemMinDraws(draws);

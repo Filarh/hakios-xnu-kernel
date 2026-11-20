@@ -684,7 +684,8 @@ hm_nocopy_buffer(HakiosMetalDevice *device, void *bytes, NSUInteger length, void
 - (void)hakiosSetTurned:(hakios_metal_texture *)surface rotation:(unsigned)rotation;
 - (void)hakiosWriteBackShadow;
 static void hm_fps_shadow(BOOL in, double seconds);   /* metal_fps's count of the copies below */
-static void hm_fps_encoded(double seconds, BOOL held);   /* metal_fps: a buffer's making to its commit */
+static void hm_fps_encoded(double seconds, BOOL held, BOOL light);   /* metal_fps: a buffer's making to its commit */
+static int hm_lightpass_mode(void);                    /* metal_lightpass: 0 off, 1 every buffer, 2 every other; | 4 metal_lightfill */
 static BOOL hm_timeline_on(void);   /* metal_fps=timeline */
 static void hm_fps_waited(double seconds);   /* metal_fps: time in -waitUntilCompleted */
 static void hm_fps_drew(double seconds, unsigned cpu);   /* metal_fps: our time in a draw call */
@@ -712,9 +713,10 @@ static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled ren
  * looks inside one on this road (the encoder that binds it is ours), and _MTLDepthStencilState's initialiser is not one
  * this plug-in knows the contract of. */
 /* A fence: a name for an ordering this device already keeps. Every encoder of a command buffer runs in the order it
- * was encoded and every command buffer of the queue in commit order, each dispatch and pass flushing what it wrote
- * before the next begins, so -updateFence: and -waitForFence: have nothing to add and the encoders take them as
- * no-ops. What Metal requires of the object is a device and a label. */
+ * was encoded and every command buffer of the queue in commit order, each dispatch and copy flushing what it wrote
+ * before the next begins and each pass too unless light passes are on (metal_lightpass), so -updateFence: has nothing
+ * to add, a compute or blit encoder's -waitForFence: neither, and a render encoder's is the read barrier before its
+ * next draw. What Metal requires of the object is a device and a label. */
 @interface HakiosMetalFence : NSObject <MTLFence> {
 	id<MTLDevice> _device;
 	NSString *_label;
@@ -1426,11 +1428,13 @@ HM_REFUSES_OUT_LOUD
 	dispatch_semaphore_t _sent;              /* a held commit: signalled once it has reached the GPU */
 	NSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */
 	struct hm_ft_rec *_ftrace;               /* metal_trace=frame: this buffer being recorded, else NULL */
+	BOOL _light;                             /* metal_lightpass: this buffer has light passes */
 }
 - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue;
 - (void)hakiosTurnAtCommit:(id)texture;
 - (hakios_metal_cb *)hakiosCommandBuffer;
 - (double)hakiosCreatedAt;
+- (BOOL)hakiosLight;                     /* metal_lightpass: this buffer has light passes */
 - (struct hm_ft_rec *)hakiosFrameTrace;
 - (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
 - (void)hakiosFtFinish;
@@ -6948,6 +6952,14 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
 		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
+		{
+			/* metal_lightpass (=2: the buffers made 0, 2, 4, ... of the process) */
+			static unsigned made;
+			const int lp = hm_lightpass_mode();
+
+			_light = (lp & 3) == 1 || ((lp & 3) == 2 && __atomic_fetch_add(&made, 1, __ATOMIC_RELAXED) % 2 == 0);
+			if (_light) hakios_metal_cb_set_light_passes(_cb, 1, (lp & 4) != 0);
+		}
 	}
 	_owesSlot = YES;
 	return self;
@@ -7016,6 +7028,7 @@ HM_REFUSES_OUT_LOUD
 {
 	struct hm_ft_rec *ft = _ftrace;
 	unsigned passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, skipped = 0;
+	unsigned lightPasses = 0, lightBarriers = 0, lightWaits = 0;
 	const char *last = "";
 	char label[300], queue[300], error[600], skip[600], refusal[600], *head = NULL, *record;
 	int n;
@@ -7025,18 +7038,21 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_counts(_cb, &passes, &draws, &dispatches, &copies, &clears);
 		hakios_metal_cb_gmem_counts(_cb, &gmemPasses, &tiles);
 		skipped = hakios_metal_cb_skipped(_cb, &last);
+		hakios_metal_cb_light_counts(_cb, &lightPasses, NULL, &lightBarriers, &lightWaits);
 		hm_ft_gpasses(ft, _cb);
 	}
 	hm_ft_line(ft, "endcb seq=%u\n", ft->seq);
 	n = asprintf(&head, "cb seq=%u capture=%u serial=%u label=%s queue=%s qid=%p created=%.6f committed=%.6f scheduled=%.6f completed=%.6f "
 		     "gpu_us=%.1f status=%s error=%s held=%d encoders=%u draws=%u ops=%u core_passes=%u core_draws=%u core_dispatches=%u "
-		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s\n", ft->seq, ft->capture->number,
+		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s light=%d light_passes=%u "
+		     "light_barriers=%u light_waits=%u\n", ft->seq, ft->capture->number,
 		     ft->serial, hm_ft_qs(label, sizeof(label), [self label]), hm_ft_qs(queue, sizeof(queue), [_queue label]), (void *)_queue,
 		     ft->created, ft->committed, ft->scheduled, ft->completed, _cb != NULL ? (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e3 : 0.0,
 		     _cb != NULL ? HM_FT_STATUS(hakios_metal_cb_status(_cb)) : "nocb",
 		     hm_ft_q(error, sizeof(error), _cb != NULL ? hakios_metal_cb_error(_cb) : "no command buffer"), ft->held ? 1 : 0, ft->encoders,
 		     ft->draws, ft->ops, passes, draws, dispatches, copies, clears, gmemPasses, tiles, skipped,
-		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""));
+		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""),
+		     _light ? 1 : 0, lightPasses, lightBarriers, lightWaits);
 	record = n > 0 ? malloc((size_t)n + ft->len) : NULL;
 	if (record != NULL) {
 		memcpy(record, head, (size_t)n);
@@ -7094,6 +7110,7 @@ HM_REFUSES_OUT_LOUD
  * there is no separate kernel scheduler clock to read on this port. */
 - (CFTimeInterval)GPUStartTime    { return _committedAt; }
 - (double)hakiosCreatedAt         { return _createdAt; }
+- (BOOL)hakiosLight               { return _light; }
 - (CFTimeInterval)GPUEndTime      { return _committedAt + (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e9; }
 - (CFTimeInterval)kernelStartTime { return [self GPUStartTime]; }
 - (CFTimeInterval)kernelEndTime   { return [self GPUEndTime]; }
@@ -7514,6 +7531,9 @@ static struct {
 	double sampledBytes[6];   /* metal_fps=timeline: the bound fragment textures' sizes, by hakiosStorageKind */
 	struct { unsigned w, h, origin; double bytes; } bySize[16];
 	unsigned ycbcrGpu, ycbcrCopies;   /* metal_ycbcrgpu=1: YCbCr textures drawn from their surfaces, and through their copies */
+	/* metal_lightpass: the buffers without [0] and with [1] light passes apart -- how many, their making to their commit,
+	 * their GPU time, their passes, and of those the light ones and the read barriers and waits before a write */
+	struct { unsigned buffers, encoded, passes, light, barriers, waits; double encode, gpu; } lp[2];
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}}, 0, 0 };
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
@@ -7548,6 +7568,37 @@ hm_fps_draws(void)
 		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=draws") != NULL;
 	}
 	return on != 0;
+}
+
+/*
+ * boot-arg metal_lightpass=1: light passes (hakios_metal_cb_set_light_passes; dev-notes anexos/32-interfaz-telegram
+ * §4.3): a sysmem pass after another of the same command buffer begins without the batch start and ends without the
+ * tail's waits; the caches are flushed, invalidated and waited for where a pass reads what an earlier one wrote or
+ * writes what one read, and the render encoder's memoryBarrier and waitForFence are that read barrier. =2: in every
+ * other command buffer alone (by the order they are made), an A/B within one run: metal_fps then prints each half's
+ * encoding and GPU time apart, and metal_trace=frame's cb lines say light=0 or 1. metal_lightfill=1 besides: a light
+ * pass's Clear taken as leaving the 3D registers as they were. Off by default.
+ */
+static int
+hm_lightpass_mode(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		int m = 0;
+
+		if (hm_bootargs(args, &size) == 0) {
+			m = strstr(args, "metal_lightpass=1") != NULL ? 1 : strstr(args, "metal_lightpass=2") != NULL ? 2 : 0;
+			if (m != 0 && strstr(args, "metal_lightfill=1") != NULL) m |= 4;
+		}
+		if ((m & 3) == 1) hm_print("metal_lightpass=1: light passes in every command buffer%s\n", (m & 4) ? ", a Clear keeping the registers" : "");
+		if ((m & 3) == 2) hm_print("metal_lightpass=2: light passes in every other command buffer (an A/B within one run)%s\n",
+					   (m & 4) ? ", a Clear keeping the registers" : "");
+		mode = m;
+	}
+	return mode;
 }
 
 /* boot-arg metal_gmem_off=N: GMEM's refinements off by the bits of N (hakios_metal_cb_set_gmem_off; 8: the choice of GMEM
@@ -7901,6 +7952,19 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 hm_fps.ycbcrCopies);
 			hm_fps.ycbcrGpu = hm_fps.ycbcrCopies = 0;
 		}
+		if (hm_lightpass_mode() != 0) {
+			/* (metal_lightpass: each half of the buffers on its own -- with =2, alternate buffers of the same frames) */
+			for (int k = 1; k >= 0; k--) {
+				const double n = hm_fps.lp[k].buffers ? (double)hm_fps.lp[k].buffers : 1.0;
+				const double e = hm_fps.lp[k].encoded ? (double)hm_fps.lp[k].encoded : 1.0;
+
+				hm_print("fps: ... %s light passes: %u buffers, made to committed %.2f ms, GPU %.2f ms each; %.1f passes a buffer, %.1f of "
+					 "them light, %.1f read barriers, %.1f waits before a write\n", k ? "with" : "without", hm_fps.lp[k].buffers,
+					 hm_fps.lp[k].encode * 1e3 / e, hm_fps.lp[k].gpu * 1e3 / n, hm_fps.lp[k].passes / n, hm_fps.lp[k].light / n,
+					 hm_fps.lp[k].barriers / n, hm_fps.lp[k].waits / n);
+			}
+			memset(hm_fps.lp, 0, sizeof(hm_fps.lp));
+		}
 		hm_fps.passes = hm_fps.draws = hm_fps.dispatches = hm_fps.copies = hm_fps.gmemPasses = hm_fps.tiles = 0;
 		hm_fps.shadowIn = hm_fps.shadowOut = 0;
 		hm_fps.shadowIns = hm_fps.shadowOuts = 0;
@@ -8100,7 +8164,7 @@ hm_fps_waited(double seconds)
 /* a command buffer's life from its making to -commit (the client's encoding, ours included), and whether it was held
  * for an event it waits on */
 static void
-hm_fps_encoded(double seconds, BOOL held)
+hm_fps_encoded(double seconds, BOOL held, BOOL light)
 {
 	if (!hm_fps_on()) {
 		return;
@@ -8109,6 +8173,29 @@ hm_fps_encoded(double seconds, BOOL held)
 	hm_fps.encode += seconds;
 	if (seconds > hm_fps.encodeMax) hm_fps.encodeMax = seconds;
 	hm_fps.held += held ? 1 : 0;
+	hm_fps.lp[light ? 1 : 0].encode += seconds;
+	hm_fps.lp[light ? 1 : 0].encoded++;
+	pthread_mutex_unlock(&hm_fps.lock);
+}
+
+/* metal_lightpass with metal_fps: one buffer done, its GPU time and what it held, with light passes or without */
+static void
+hm_fps_light(BOOL light, double gpu, hakios_metal_cb *cb)
+{
+	unsigned passes = 0, dispatches = 0, copies = 0, clears = 0, lit = 0, barriers = 0, waits = 0;
+
+	if (!hm_fps_on() || hm_lightpass_mode() == 0 || cb == NULL) {
+		return;
+	}
+	hakios_metal_cb_counts(cb, &passes, NULL, &dispatches, &copies, &clears);
+	hakios_metal_cb_light_counts(cb, &lit, NULL, &barriers, &waits);
+	pthread_mutex_lock(&hm_fps.lock);
+	hm_fps.lp[light ? 1 : 0].buffers++;
+	hm_fps.lp[light ? 1 : 0].gpu += gpu;
+	hm_fps.lp[light ? 1 : 0].passes += passes;
+	hm_fps.lp[light ? 1 : 0].light += lit;
+	hm_fps.lp[light ? 1 : 0].barriers += barriers;
+	hm_fps.lp[light ? 1 : 0].waits += waits;
 	pthread_mutex_unlock(&hm_fps.lock);
 }
 
@@ -8185,6 +8272,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 		}
 	}
 	hm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);
+	hm_fps_light([self hakiosLight], (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, cb);
 	if (hm_ft_enabled) {
 		struct hm_ft_rec *ft = [self hakiosFrameTrace];
 
@@ -8257,7 +8345,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 	for (NSArray *w in _waits) {
 		met = met && [[w objectAtIndex:0] hakiosReached:[[w objectAtIndex:1] unsignedLongLongValue]];
 	}
-	hm_fps_encoded(_committedAt - _createdAt, !met || [_queue hakiosDeferring]);
+	hm_fps_encoded(_committedAt - _createdAt, !met || [_queue hakiosDeferring], _light);
 	if (!met || [_queue hakiosDeferring]) {
 		/* held: committed to the GPU from the queue's own serial queue once every value it waits for has come */
 		NSArray *waits = [_waits copy];
@@ -11032,20 +11120,28 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 }
 
 /*
- * Served by construction, as in the compute encoder: each draw here is a whole pass whose tail flushes the CCU and the
- * caches (PC_CCU_FLUSH_COLOR_TS, CACHE_FLUSH_TS) and whose head invalidates them, one queue runs its command buffers
- * in commit order, and every allocation is resident for its whole life. A barrier, a fence or a residency request asks
- * for an ordering that is already the only one there is.
+ * By default served by construction, as in the compute encoder: every pass's tail flushes the CCU and the caches
+ * (PC_CCU_FLUSH_COLOR_TS, CACHE_FLUSH_TS) and waits, and its head invalidates them, one queue runs its command buffers
+ * in commit order, and every allocation is resident for its whole life. With light passes (metal_lightpass) a pass ends
+ * without the wait, and a barrier or a wait for a fence is the read barrier before the next draw
+ * (hakios_metal_cb_memory_barrier: CACHE_INVALIDATE and a wait for idle); the driver orders on its own what it sees a
+ * pass read of an earlier one's writes. Updating a fence asks for nothing the wait does not do.
  */
 - (void)updateFence:(id)fence afterStages:(MTLRenderStages)stages  { (void)fence; (void)stages; }
-- (void)waitForFence:(id)fence beforeStages:(MTLRenderStages)stages { (void)fence; (void)stages; }
+- (void)waitForFence:(id)fence beforeStages:(MTLRenderStages)stages
+{
+	(void)fence; (void)stages;
+	hakios_metal_cb_memory_barrier([self hakiosCb]);
+}
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before
 {
 	(void)scope; (void)after; (void)before;
+	hakios_metal_cb_memory_barrier([self hakiosCb]);
 }
 - (void)memoryBarrierWithResources:(const id *)resources count:(NSUInteger)count afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before
 {
 	(void)resources; (void)count; (void)after; (void)before;
+	hakios_metal_cb_memory_barrier([self hakiosCb]);
 }
 - (void)useResource:(id)resource usage:(MTLResourceUsage)usage { (void)resource; (void)usage; }
 - (void)useResource:(id)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages { (void)resource; (void)usage; (void)stages; }

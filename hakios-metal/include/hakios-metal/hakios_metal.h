@@ -554,6 +554,17 @@ void hakios_metal_cb_set_gmem(hakios_metal_cb *cb, int on);
 void hakios_metal_cb_set_gmem_off(hakios_metal_cb *cb, unsigned bits);
 /* GMEM or sysmem for each of CB's passes by what such passes cost the queue before (CommandBuffer::setGmemTuned) */
 void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb *cb, int on);
+/* Light passes for CB from now on (CommandBuffer::setLightPasses): a sysmem pass after another of CB without the batch
+ * start and without the tail's waits, the caches flushed, invalidated and waited for where a pass reads what an earlier
+ * one wrote or writes what one read. KEEP_FILL: a light pass's Clear taken as leaving the 3D registers as they were
+ * (CommandBuffer::setLightKeepAcrossFill). Off by default. */
+void hakios_metal_cb_set_light_passes(hakios_metal_cb *cb, int on, int keep_fill);
+/* what CB holds of them so far: passes opened light and with the full head, read barriers, waits before a write; any
+ * pointer NULL */
+void hakios_metal_cb_light_counts(hakios_metal_cb *cb, unsigned *light, unsigned *full, unsigned *barriers, unsigned *write_waits);
+/* Metal's memoryBarrier or waitForFence in a render encoder (CommandBuffer::memoryBarrier): with light passes the read
+ * barrier before CB's next draw; without them nothing */
+void hakios_metal_cb_memory_barrier(hakios_metal_cb *cb);
 /* GMEM only for a pass whose like had at least DRAWS draws the last time (CommandBuffer::setGmemMinDraws); 0: off */
 void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb *cb, unsigned draws);
 /* CB's GMEM passes binned by the hardware first, each tile drawing only the draws that reach it (CommandBuffer::setGmemBinning) */
