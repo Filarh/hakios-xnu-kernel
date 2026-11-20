@@ -537,6 +537,13 @@ struct GmemPlan {
 // (FLAGS: kGmemPlanOld, the shares and the one column of bins this had before turnip's -- for a bisect on the phone)
 enum : uint32_t { kGmemPlanOld = 1 };
 bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t flags = 0);
+// (PROTOTYPE, dev-notes anexos/32) A pass after a sysmem pass of the same command buffer: its head without the batch
+// start (once a buffer), its tail without the waits (once a buffer), and the barrier of a draw that samples what an
+// earlier pass wrote.
+bool encodeBeginLight(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o);
+void encodeEndLight(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o);
+void encodeReadBarrier(pm4::Stream& stream);
+void lightKeepAcrossFill(bool on);
 // PLAN's bins for a W x H window out of its attachments' rooms: turnip's layout (render.cpp). WIDTH 0, or the one
 // bin width allowed. False when the rooms hold no bin.
 bool gmemBins(GmemPlan* plan, uint32_t W, uint32_t H, uint32_t width);

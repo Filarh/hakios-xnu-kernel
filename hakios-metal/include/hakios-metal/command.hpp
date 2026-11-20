@@ -231,6 +231,14 @@ public:
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
     void setGmemTuned(bool on) { tuning_ = on; }
+    // (PROTOTYPE, dev-notes anexos/32-interfaz-telegram) A pass that follows a sysmem pass of this same buffer begins
+    // with what changed and ends without waiting: the batch start, the static tables and the tail's waits once a
+    // command buffer; the caches flushed and invalidated where a pass reads what an earlier one wrote. Off by default.
+    void setLightPasses(bool on) { lightPasses_ = on; }
+    // ...with a 2D fill (a Clear) taken as leaving the 3D registers as the stream wrote them (bit 2 of the switch)
+    void setLightKeepAcrossFill(bool on) { lightKeepAcrossFill_ = on; }
+    struct LightCounts { uint32_t light = 0, full = 0, barriers = 0; };
+    LightCounts lightCounts() const { return lightCounts_; }
     // GMEM for a pass of at least DRAWS draws, sysmem for one of fewer; 0: not by the draws. The draws are counted as
     // they come, so the pass is recorded both ways until it closes -- and DRAWS is then the bar of a pass that loads
     // and stores all it touches: one that reads its target, or whose tiles need load or store less, is tiled with
@@ -274,6 +282,8 @@ private:
     std::shared_ptr<Buffer> drawStamps_;
     void drawStamp(uint32_t slot);
     bool gmem_ = true;
+    bool lightPasses_ = false, lightKeepAcrossFill_ = false;
+    LightCounts lightCounts_;
     uint32_t gmemOff_ = 0;
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
@@ -389,6 +399,7 @@ private:
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
+        bool light = false;         // (PROTOTYPE) opened with the light head: its reads of earlier passes' targets are barred as they come
         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
         std::shared_ptr<render::PassCache> cache;
     };
@@ -397,6 +408,18 @@ private:
     // when NEXT has the same texture attached with Load, the caller's one pass goes on in a second one here.
     // KEPT: stored whatever follows (a command buffer appended to another: what follows is not known here).
     void closePass(const RenderPass* next = nullptr, bool kept = false);
+    // (PROTOTYPE: light passes) what a sysmem pass closed by the draw that opens the next leaves it: the registers as
+    // its stream left them, and the options it was recorded with
+    struct Carry {
+        bool valid = false;
+        RegShadow regs;
+        render::Options options;
+    } carry_;
+    // the passes and fills recorded so far, the one at which the texture caches were last invalidated in the stream,
+    // and the last at which each buffer was written by the GPU in this command buffer
+    uint32_t writeSeq_ = 0, ucheSeq_ = 0;
+    std::unordered_map<const Buffer*, uint32_t> gpuWritten_;
+    void noteWritten(const RenderPass& pass);
     void useAttachments(const RenderPass& pass);
     // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
