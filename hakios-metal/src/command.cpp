@@ -720,6 +720,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         return;
     }
     cb->closePass();   // the last pass's tail
+    const int64_t closed = gpu_.transport().nowNs();
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
     cb->stream_.waitForIdle();
@@ -733,6 +734,10 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     }
     // the stream is written in order, as write-combined memory wants it, and read back by nobody
     memcpy(cb->commands_->cpu(), w.data(), 4 * w.size());
+    const int64_t copied = gpu_.transport().nowNs();
+    cb->submitCost_.closeNs = closed - cb->committedAt_;
+    cb->submitCost_.copyNs = copied - closed;
+    cb->submitCost_.words = uint32_t(w.size());
     std::unique_lock<std::mutex> g(lock_);  // the fences of one queue are handed out in commit order
     cb->status_ = CommandBuffer::kCommitted;
     cb->faultsAtCommit_ = gpu_.faults();
@@ -745,6 +750,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         return;
     }
     cb->status_ = CommandBuffer::kScheduled;
+    cb->submitCost_.submitNs = gpu_.transport().nowNs() - cb->committedAt_;
     inFlight_.push_back(std::move(cb));
     changed_.notify_all();
 }

@@ -139,6 +139,8 @@ struct Result {
     std::vector<double> usPerDraw;       // one a measured frame
     double allocsPerDraw = 0, allocBytesPerDraw = 0;
     std::vector<double> commitUs;        // closing the last pass, the submission
+    uint32_t samePrograms = 0;           // draws whose draw before them in the pass was of the same program, taken from kept state
+    std::vector<double> closeUs;         // ...of it, the last pass's tail and the copy of the stream (SubmitCost: not the fake GPU's run)
     golden::Sums sums;                   // the last measured frame's submissions
     FakeGpu::Stats gpu;                  // ...and what the fake GPU did for them (--gpu): the counters' growth over the frame
     uint32_t refused = 0;
@@ -401,6 +403,13 @@ void runCore(const Scene& s) {
             res.draws = clock.draws;
             res.usPerDraw.push_back((double(clock.ns) / clock.draws - clockNs()) / 1e3);
             res.commitUs.push_back(double(c1 - c0) / 1e3);
+            {
+                int64_t ns = 0;
+                for (auto& b : cbs) ns += b->submitCost().closeNs + b->submitCost().copyNs;
+                res.samePrograms = 0;
+                for (auto& b : cbs) res.samePrograms += b->counts().sameProgramDraws;
+                res.closeUs.push_back(double(ns) / 1e3);
+            }
             res.allocsPerDraw = double(clock.allocs) / clock.draws;
             res.allocBytesPerDraw = double(clock.allocBytes) / clock.draws;
             res.sums = gSums;
@@ -522,12 +531,18 @@ void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
     const uint64_t c1 = nowNs();
     hakios_metal_cb_wait(cb);
     if (hakios_metal_cb_status(cb) != HAKIOS_METAL_COMPLETED) res.error = std::string("the command buffer ended in error: ") + hakios_metal_cb_error(cb);
+    int64_t closeNs = 0, copyNs = 0;
+    hakios_metal_cb_submit_cost(cb, &closeNs, &copyNs, nullptr, nullptr);
+    unsigned samePrograms = 0;
+    hakios_metal_cb_kept_counts(cb, nullptr, &samePrograms);
     hakios_metal_cb_free(cb);
     settle();
     if (measured) {
         res.draws = clock.draws;
         res.usPerDraw.push_back((double(clock.ns) / clock.draws - clockNs()) / 1e3);
         res.commitUs.push_back(double(c1 - c0) / 1e3);
+        res.closeUs.push_back(double(closeNs + copyNs) / 1e3);
+        res.samePrograms = samePrograms;
         res.allocsPerDraw = double(clock.allocs) / clock.draws;
         res.allocBytesPerDraw = double(clock.allocBytes) / clock.draws;
         res.sums = gSums;
@@ -1128,11 +1143,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (asked.csv) {
-        std::printf("scene,draws,us_min,us_median,us_max,allocs_per_draw,alloc_bytes_per_draw,words_per_draw,commit_us_median,runs,cold_kb\n");
+        std::printf("scene,draws,us_min,us_median,us_max,allocs_per_draw,alloc_bytes_per_draw,words_per_draw,commit_us_median,runs,cold_kb,close_us_median,same_program_draws\n");
         for (const Result& r : gResults) {
-            std::printf("%s,%u,%.3f,%.3f,%.3f,%.2f,%.0f,%.1f,%.1f,%zu,%zu\n", r.letter.c_str(), r.draws, *std::min_element(r.usPerDraw.begin(), r.usPerDraw.end()),
+            std::printf("%s,%u,%.3f,%.3f,%.3f,%.2f,%.0f,%.1f,%.1f,%zu,%zu,%.1f,%u\n", r.letter.c_str(), r.draws, *std::min_element(r.usPerDraw.begin(), r.usPerDraw.end()),
                         median(r.usPerDraw), *std::max_element(r.usPerDraw.begin(), r.usPerDraw.end()), r.allocsPerDraw, r.allocBytesPerDraw,
-                        double(r.sums.words) / r.draws, median(r.commitUs), r.usPerDraw.size(), asked.coldBytes / 1024);
+                        double(r.sums.words) / r.draws, median(r.commitUs), r.usPerDraw.size(), asked.coldBytes / 1024,
+                        r.closeUs.empty() ? 0.0 : median(r.closeUs), r.samePrograms);
         }
         return 0;
     }

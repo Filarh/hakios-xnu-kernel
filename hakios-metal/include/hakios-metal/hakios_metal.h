@@ -524,6 +524,9 @@ void hakios_metal_cb_set_profile_samples(hakios_metal_cb *cb, int on);
 long long hakios_metal_cb_pass_samples(hakios_metal_cb *cb, unsigned i);
 /* what CB holds so far (CommandBuffer::counts): passes opened, draws, dispatches, copies and clears; any pointer NULL */
 void hakios_metal_cb_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *draws, unsigned *dispatches, unsigned *copies, unsigned *clears);
+/* of CB's draws, those taken from their program's kept state, and of those the ones whose draw before them in the pass
+ * was of the same program (CommandBuffer::Counts::keptDraws, sameProgramDraws); either pointer may be NULL */
+void hakios_metal_cb_kept_counts(hakios_metal_cb *cb, unsigned *kept, unsigned *same_program);
 /* tiled rendering (render::Options::gmem) for CB's passes from now on, on by default; and of what CB holds, the passes
  * drawn in GMEM and their tiles, and pass I's tiles as profiled (0: in sysmem, -1 past them) */
 void hakios_metal_cb_set_gmem(hakios_metal_cb *cb, int on);
@@ -611,6 +614,13 @@ enum hakios_metal_status hakios_metal_cb_status(hakios_metal_cb *cb);
 const char *hakios_metal_cb_error(hakios_metal_cb *cb);
 /* how long the GPU had it, in nanoseconds (commit to fence), once completed */
 int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb *cb);
+/* what -commit cost the caller's thread, once committed (nanoseconds): the last pass's tail (in tiles: its draw-state
+ * groups and the tiles' stream), the copy of the stream into its command buffer object, the whole submission up to the
+ * kernel's answer; and the words handed to the GPU. Any pointer may be NULL. */
+void hakios_metal_cb_submit_cost(hakios_metal_cb *cb, int64_t *close_ns, int64_t *copy_ns, int64_t *submit_ns, unsigned *words);
+/* the processor's accesses to IOSurface memory told to the kernel (GEM_CPU_PREP) since the process began, and the
+ * nanoseconds they took: the kernel waits there for the GPU to be done with the surface */
+void hakios_metal_cpu_prep_counts(unsigned long long *count, unsigned long long *ns);
 
 #ifdef __cplusplus
 }

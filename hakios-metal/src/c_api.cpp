@@ -948,6 +948,13 @@ void hakios_metal_cb_counts(hakios_metal_cb* cb, unsigned* passes, unsigned* dra
     if (clears) *clears = c.clears;
 }
 
+void hakios_metal_cb_kept_counts(hakios_metal_cb* cb, unsigned* kept, unsigned* sameProgram) {
+    syncOne(cb);
+    const CommandBuffer::Counts& c = cb->cb->counts();
+    if (kept) *kept = c.keptDraws;
+    if (sameProgram) *sameProgram = c.sameProgramDraws;
+}
+
 void hakios_metal_cb_set_gmem(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmem(on != 0); });
     cb->cb->setGmem(on != 0);
@@ -1843,6 +1850,22 @@ const char* hakios_metal_cb_error(hakios_metal_cb* cb) {
 int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb* cb) {
     syncOne(cb);
     return cb->cb->gpuNanoseconds();
+}
+
+void hakios_metal_cb_submit_cost(hakios_metal_cb* cb, int64_t* closeNs, int64_t* copyNs, int64_t* submitNs, unsigned* words) {
+    syncOne(cb);
+    const CommandBuffer::SubmitCost& c = cb->cb->submitCost();
+    if (closeNs) *closeNs = c.closeNs;
+    if (copyNs) *copyNs = c.copyNs;
+    if (submitNs) *submitNs = c.submitNs;
+    if (words) *words = c.words;
+}
+
+void hakios_metal_cpu_prep_counts(unsigned long long* count, unsigned long long* ns) {
+    uint64_t n = 0, t = 0;
+    cpuPrepCounts(&n, &t);
+    if (count) *count = n;
+    if (ns) *ns = t;
 }
 
 }  // extern "C"
