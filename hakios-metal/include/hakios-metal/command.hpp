@@ -231,14 +231,32 @@ public:
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
     void setGmemTuned(bool on) { tuning_ = on; }
-    // (PROTOTYPE, dev-notes anexos/32-interfaz-telegram) A pass that follows a sysmem pass of this same buffer begins
-    // with what changed and ends without waiting: the batch start, the static tables and the tail's waits once a
-    // command buffer; the caches flushed and invalidated where a pass reads what an earlier one wrote. Off by default.
+    // Light passes (dev-notes anexos/32-interfaz-telegram §4.3; the plug-in's metal_lightpass). A sysmem pass of colour
+    // attachments that follows another such pass of this buffer begins with what changed and ends without waiting: the
+    // batch start, the static tables and the tail's waits are the buffer's first and last pass's, as turnip's tu_init_hw
+    // and render ends are. In between the driver orders what Metal's hazard tracking orders (MTLHazardTrackingModeTracked:
+    // "delay write operations until previous read operations finish, and prevent subsequent commands from running
+    // until write operations complete"), every buffer tracked whatever its mode:
+    //   a draw that reads memory a pass of this buffer wrote since the texture caches were last dropped: CACHE_INVALIDATE
+    //   and a WFI before it (a read after a write);
+    //   a pass that writes memory a draw read since the last WFI: a WFI before it begins (a write after a read);
+    //   a pass's tail: the colour cache flushed, not waited for; the next pass's head: the colour cache invalidated.
+    // With profiling (setProfile) a light pass keeps a WFI before its end stamp, so that the stamps still time it;
+    // without it, a pass is stamped only when the queue's choice of GMEM or sysmem reads its time (a tuned pass).
+    // Off by default.
     void setLightPasses(bool on) { lightPasses_ = on; }
-    // ...with a 2D fill (a Clear) taken as leaving the 3D registers as the stream wrote them (bit 2 of the switch)
+    // ...with a 2D fill (a light pass's Clear) taken as leaving the 3D registers as the stream wrote them: turnip's
+    // r2d_* write the A2D registers alone (tu_clear_blit.cc). Its own switch (metal_lightfill), off by default.
     void setLightKeepAcrossFill(bool on) { lightKeepAcrossFill_ = on; }
-    struct LightCounts { uint32_t light = 0, full = 0, barriers = 0; };
+    struct LightCounts { uint32_t light = 0, full = 0, barriers = 0, writeWaits = 0; };   // passes opened light and full; read barriers; WFIs before a write
     LightCounts lightCounts() const { return lightCounts_; }
+    bool lightPasses() const { return lightPasses_; }
+    // (for the tests) every command buffer made from now on with light passes from the start (tests --light)
+    static void lightPassesByDefault(bool on);
+    // Metal's memoryBarrier and waitForFence inside a render encoder: with light passes, the read barrier
+    // (CACHE_INVALIDATE and a WFI) before the next draw, whatever it reads; without them every pass already begins with
+    // its caches invalidated after a wait, and this does nothing
+    void memoryBarrier();
     // GMEM for a pass of at least DRAWS draws, sysmem for one of fewer; 0: not by the draws. The draws are counted as
     // they come, so the pass is recorded both ways until it closes -- and DRAWS is then the bar of a pass that loads
     // and stores all it touches: one that reads its target, or whose tiles need load or store less, is tiled with
@@ -283,6 +301,8 @@ private:
     void drawStamp(uint32_t slot);
     bool gmem_ = true;
     bool lightPasses_ = false, lightKeepAcrossFill_ = false;
+    bool barrierPending_ = false;   // memoryBarrier's, for the next draw
+    bool stampOpen_ = false;        // (light passes) the pass being recorded has its start stamp, and so wants its end one
     LightCounts lightCounts_;
     uint32_t gmemOff_ = 0;
     uint32_t gmemMinDraws_ = 0;
@@ -298,7 +318,9 @@ private:
     void sampleStamp(uint32_t slot);
     // the counter into stamp slot SLOT (two a pass: start, end), when profiling and there is room
     void stamp(uint32_t slot);
-    void stampStart(PassKind kind, uint32_t width, uint32_t height);
+    // (TUNE_KEY: the pass's CommandQueue::preferGmem key, 0 for none -- with light passes and no profile, what alone
+    // has a pass stamped)
+    void stampStart(PassKind kind, uint32_t width, uint32_t height, uint64_t tuneKey = 0);
     void stampEnd();
     uint32_t skipped_ = 0;
     std::string lastSkipped_;
@@ -399,7 +421,8 @@ private:
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
-        bool light = false;         // (PROTOTYPE) opened with the light head: its reads of earlier passes' targets are barred as they come
+        bool light = false;         // opened with the light head (setLightPasses): its reads of earlier passes' writes are barred as they come
+        std::vector<const Buffer*> writes;   // (light passes) the buffers its draws may store to besides its attachments
         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
         std::shared_ptr<render::PassCache> cache;
     };
@@ -408,18 +431,28 @@ private:
     // when NEXT has the same texture attached with Load, the caller's one pass goes on in a second one here.
     // KEPT: stored whatever follows (a command buffer appended to another: what follows is not known here).
     void closePass(const RenderPass* next = nullptr, bool kept = false);
-    // (PROTOTYPE: light passes) what a sysmem pass closed by the draw that opens the next leaves it: the registers as
-    // its stream left them, and the options it was recorded with
+    // (light passes) what a sysmem pass closed by the draw that opens the next leaves it: the registers as its stream
+    // left them, and the options it was recorded with
     struct Carry {
         bool valid = false;
         RegShadow regs;
         render::Options options;
     } carry_;
-    // the passes and fills recorded so far, the one at which the texture caches were last invalidated in the stream,
-    // and the last at which each buffer was written by the GPU in this command buffer
-    uint32_t writeSeq_ = 0, ucheSeq_ = 0;
-    std::unordered_map<const Buffer*, uint32_t> gpuWritten_;
-    void noteWritten(const RenderPass& pass);
+    // (light passes) The passes closed so far (WRITE_SEQ: pass N's writes are numbered N, the open pass's reads
+    // WRITE_SEQ + 1); the last pass whose writes the texture caches were dropped after (UCHE_SEQ: CACHE_INVALIDATE after a
+    // WFI, or the full head's batch start), and the last whose reads a WFI came after (WFI_SEQ); and by buffer, the last
+    // pass that wrote it and the last that read it in this command buffer.
+    uint32_t writeSeq_ = 0, ucheSeq_ = 0, wfiSeq_ = 0;
+    std::unordered_map<const Buffer*, uint32_t> gpuWritten_, gpuRead_;
+    void noteWritten(const OpenPass& pass);
+    // a draw's bindings: whether one reads what a pass wrote after UCHE_SEQ; noted as read by the open pass; the
+    // buffers its stages may store to, noted for the open pass
+    bool readsWritten(const Bindings& b) const;
+    void noteAccess(const Program& program, const Bindings& vs, const Bindings& fs);
+    // whether a pass with these attachments writes memory read after WFI_SEQ; whether a draw may store to memory an
+    // earlier pass read after it
+    bool writesRead(const RenderPass& pass) const;
+    bool storesOverRead(const Program& program, const Bindings& vs, const Bindings& fs) const;
     void useAttachments(const RenderPass& pass);
     // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those

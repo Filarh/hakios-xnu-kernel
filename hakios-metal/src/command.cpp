@@ -363,15 +363,25 @@ void CommandQueue::tuned(uint64_t key, bool gmem, double us) {
     avg = t.runs[gmem ? 1 : 0]++ == 0 ? us : 0.75 * avg + 0.25 * us;
 }
 
-void CommandBuffer::stampStart(PassKind kind, uint32_t width, uint32_t height) {
+void CommandBuffer::stampStart(PassKind kind, uint32_t width, uint32_t height, uint64_t tuneKey) {
     if (!(profile_ || tuning_) || profiled_.size() >= kMaxProfiled) return;
+    // (with light passes, stamps for whoever reads them: the profile, or the queue's choice for a tuned pass -- the
+    // plug-in asks for tuning by default, and with metal_gmem_draws no pass of its has a tuning key: two CP_REG_TO_MEM a
+    // pass that nobody read)
+    if (lightPasses_ && !profile_ && tuneKey == 0) return;
     { PassTime t{}; t.kind = kind, t.width = width, t.height = height; profiled_.push_back(std::move(t)); }
     stamp(uint32_t(2 * (profiled_.size() - 1)));
     if (profileSamples_) sampleStamp(uint32_t(2 * (profiled_.size() - 1)));
+    stampOpen_ = true;
 }
 
 void CommandBuffer::stampEnd() {
     if (!(profile_ || tuning_) || profiled_.empty()) return;
+    if (lightPasses_) {
+        // (the end of the pass whose start was stamped, and of no other)
+        if (!stampOpen_) return;
+        stampOpen_ = false;
+    }
     stamp(uint32_t(2 * (profiled_.size() - 1) + 1));
     if (profileSamples_) sampleStamp(uint32_t(2 * (profiled_.size() - 1) + 1));
 }
@@ -443,6 +453,10 @@ std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
         }
     }
     return out;
+}
+
+void CommandBuffer::memoryBarrier() {
+    if (lightPasses_) barrierPending_ = true;
 }
 
 bool CommandBuffer::refuseWork(const std::string& why) {
@@ -628,8 +642,15 @@ CommandQueue::~CommandQueue() {
     gpu_.closeQueue(id_);
 }
 
+namespace {
+std::atomic<bool> gLightByDefault{false};
+}  // namespace
+
+void CommandBuffer::lightPassesByDefault(bool on) { gLightByDefault = on; }
+
 std::shared_ptr<CommandBuffer> CommandQueue::commandBuffer() {
     std::shared_ptr<CommandBuffer> cb(new CommandBuffer(*this));
+    if (gLightByDefault.load(std::memory_order_relaxed)) cb->setLightPasses(true);
     Spare spare;
     if (takeSpare(&spare)) {
         cb->stream_ = std::move(spare.stream);

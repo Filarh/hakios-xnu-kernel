@@ -500,6 +500,10 @@ struct Options {
                                  // over it (gmemTouched), 7 a fetch's barrier let go at the next draw though that one fetches
                                  // too, 8 no group DIRTY but the loads' (each left to the command processor's memory of
                                  // what it last ran); 0 the stream as it is meant)
+    // (the fake's twins of the light passes' ordering, CommandBuffer::setLightPasses: 1 no read barrier, 2 no colour
+    // flush in a light tail, 3 no colour invalidate in a light head, 4 no WFI before a pass that writes what was read;
+    // 0 the stream as it is meant)
+    uint8_t lightTwin = 0;
     uint8_t rotate2d = 0;        // encodeBlit's RB_2D_BLIT_CNTL.ROTATE (a6xx_rotation: 0, 90, 180, 270, hflip, vflip as 0..5);
                                  // a quarter turn takes a destination rectangle of the source's sides swapped
 };
@@ -537,13 +541,13 @@ struct GmemPlan {
 // (FLAGS: kGmemPlanOld, the shares and the one column of bins this had before turnip's -- for a bisect on the phone)
 enum : uint32_t { kGmemPlanOld = 1 };
 bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t flags = 0);
-// (PROTOTYPE, dev-notes anexos/32) A pass after a sysmem pass of the same command buffer: its head without the batch
-// start (once a buffer), its tail without the waits (once a buffer), and the barrier of a draw that samples what an
-// earlier pass wrote.
-bool encodeBeginLight(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o);
+// Light passes (CommandBuffer::setLightPasses; dev-notes anexos/32-interfaz-telegram §4.3): a sysmem pass after a
+// sysmem pass of the same command buffer. Its head without the batch start (once a buffer) -- WAIT_FIRST: a WFI before
+// anything, the pass writing memory a draw read since the last one --, its tail without the waits (once a buffer), and
+// the barrier of a draw that reads what an earlier pass wrote.
+bool encodeBeginLight(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, bool waitFirst);
 void encodeEndLight(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o);
 void encodeReadBarrier(pm4::Stream& stream);
-void lightKeepAcrossFill(bool on);
 // PLAN's bins for a W x H window out of its attachments' rooms: turnip's layout (render.cpp). WIDTH 0, or the one
 // bin width allowed. False when the rooms hold no bin.
 bool gmemBins(GmemPlan* plan, uint32_t W, uint32_t H, uint32_t width);

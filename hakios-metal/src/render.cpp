@@ -1320,17 +1320,27 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth 
     }
 }
 
-// ---- PROTOTYPE (dev-notes anexos/32-interfaz-telegram): a pass that follows a sysmem pass of the same command buffer ----
-// Its head: no batch start (the caches' invalidates, HLSQ_INVALIDATE_CMD, the static tables, the draw-state groups let
-// go and the border colours are the command buffer's first pass's, as turnip's tu_init_hw is a command buffer's:
-// tu_cmd_buffer.cc:2464-2513, called from tu_BeginCommandBuffer :4521-4533), no RB_CCU_CNTL (it is the sysmem value
-// already: no pass leaves it otherwise). The colour cache invalidated -- the pass before it flushed it in its tail --
-// since this pass comes to the cache with other attachments (tu_cmd_buffer.h:108-124: "the CCU needs to be flushed and
-// possibly invalidated when accessing memory with a different attachment state"; tu6_emit_flushes :381-390 flushes
-// before it invalidates). Then the pass begin as passStart writes it, which the register shadow carried from the pass
-// before cuts down to what changed.
-void passStartLight(pm4::Stream& stream, uint32_t W, uint32_t H, const Options& o) {
-    event(stream, PC_CCU_INVALIDATE_COLOR);
+// ---- Light passes (CommandBuffer::setLightPasses; dev-notes anexos/32-interfaz-telegram §4.3) ----
+// A sysmem pass that follows a sysmem pass of the same command buffer. Its head: no batch start (the caches'
+// invalidates, HLSQ_INVALIDATE_CMD, the static tables, the draw-state groups let go and the border colours are the
+// command buffer's first pass's, as turnip's tu_init_hw is a command buffer's: mesa:tu_cmd_buffer.cc:2466, called from
+// tu_BeginCommandBuffer), no RB_CCU_CNTL (it is the sysmem value already: no pass in between leaves it otherwise). The
+// colour cache invalidated -- the pass before it cleaned it in its tail -- since this pass comes to the cache with other
+// attachments (tu_cmd_buffer.h:108-124: "the CCU needs to be flushed and possibly invalidated when accessing memory
+// with a different attachment state"; a render pass's access is _INCOHERENT, and tu_flush_for_access's
+// DST_INCOHERENT_FLUSH, :5852-5860, invalidates the colour CCU for every one; tu6_emit_flushes, :374-386, cleans before
+// it invalidates). Then the pass begin as passStart writes it, which the register shadow carried from the pass before
+// cuts down to what changed.
+// WAIT_FIRST: a WFI before all of it -- the pass writes memory that a draw read since the last WFI, and Metal delays a
+// write until the reads before it finish (CommandBuffer::setLightPasses); the WFI is the A6XX's way for a pipeline
+// stage to wait for another (tu_flush_for_stage, :6285)
+void passStartLight(pm4::Stream& stream, uint32_t W, uint32_t H, const Options& o, bool waitFirst) {
+    if (waitFirst && o.lightTwin != 4) {
+        stream.waitForIdle();
+    }
+    if (o.lightTwin != 3) {
+        event(stream, PC_CCU_INVALIDATE_COLOR);
+    }
     if (o.lrzOff) {
         event(stream, LRZ_FLUSH);
     }
@@ -1345,7 +1355,8 @@ void passStartLight(pm4::Stream& stream, uint32_t W, uint32_t H, const Options& 
         reg(stream, REG_A6XX_RB_BIN_CONTROL, binControlSysmem(o.binControlLrzFeedback));
         reg(stream, REG_A6XX_RB_BIN_CONTROL2, 0);
     }
-    // (the marker, the skip, the override and the mode as tu6_sysmem_render_begin sends them at every pass, :3376-3388)
+    // (the marker, the skip, the override and the mode as tu6_sysmem_render_begin sends them at every pass,
+    // tu_cmd_buffer.cc:3342-3402)
     if (o.marker) {
         command1(stream, CP_SET_MARKER, setMarker0(RM6_DIRECT_RENDER));
     }
@@ -1357,7 +1368,7 @@ void passStartLight(pm4::Stream& stream, uint32_t W, uint32_t H, const Options& 
 }
 
 // A Clear in such a pass: the fill, then what tu_clear_sysmem_attachment does after it and no more
-// (tu_clear_blit.cc:5436-5441: FD_CCU_CLEAN_COLOR, FD_CCU_INVALIDATE_COLOR, a WFI) -- the flush is not waited for
+// (mesa:tu_clear_blit.cc:5437-5441: FD_CCU_CLEAN_COLOR, FD_CCU_INVALIDATE_COLOR, a WFI) -- the flush is not waited for
 void clearStreamLight(pm4::Stream& stream, const Texture& target, const ClearWords& c, uint64_t ts, uint32_t level = 0, uint32_t slice = 0) {
     fillStream(stream, target, c, TILE6_LINEAR, level, slice);
     eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, ts, kClearFlushValue, false);
@@ -1367,7 +1378,7 @@ void clearStreamLight(pm4::Stream& stream, const Texture& target, const ClearWor
 
 }  // namespace
 
-bool encodeBeginLight(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
+bool encodeBeginLight(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, bool waitFirst) {
     if (!checkTarget(pass, why)) {
         return false;
     }
@@ -1376,7 +1387,7 @@ bool encodeBeginLight(pm4::Stream& stream, const RenderPass& pass, uint64_t tabl
         return false;
     }
     tableStart(tableCpu);
-    passStartLight(stream, windowOf(pass).first, windowOf(pass).second, o);
+    passStartLight(stream, windowOf(pass).first, windowOf(pass).second, o, waitFirst);
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         const Attachment a = attachmentOf(pass, i);
         if (a.texture != nullptr && a.load == LoadAction::kClear) clearStreamLight(stream, *a.texture, clears[i], clearFlushAt(table, i), a.level, a.slice);
@@ -1385,11 +1396,13 @@ bool encodeBeginLight(pm4::Stream& stream, const RenderPass& pass, uint64_t tabl
 }
 
 // Its tail: the colour out of the cache (PC_CCU_FLUSH_COLOR_TS in the 4-word form A6XX takes it in, its value written
-// and waited for by nobody: turnip's seqno_dummy, tu_cmd_buffer.cc:168-190) and LRZ_FLUSH as tu_lrz_sysmem_end ends a
-// sysmem pass (tu_lrz.cc:972-981). No CP_WAIT_FOR_IDLE, no wait on the flush, no CACHE_FLUSH_TS: tu6_sysmem_render_end
-// has none (tu_cmd_buffer.cc:3402-3451); the command buffer's last pass has the full tail (passTail).
+// and waited for by nobody: turnip's seqno_dummy, mesa:tu_cmd_buffer.cc:186) -- a render pass's write is "incoherent",
+// cleaned at once by the barrier that follows it (tu_flush_for_access's SRC_INCOHERENT_FLUSH, :5818-5827) -- and
+// LRZ_FLUSH as tu_lrz_sysmem_end ends a sysmem pass (tu_lrz.cc:972-981). No CP_WAIT_FOR_IDLE, no wait on the flush, no
+// CACHE_FLUSH_TS: tu6_sysmem_render_end has none (tu_cmd_buffer.cc:3404-3451); the command buffer's last pass, and the
+// one before a copy or a dispatch, has the full tail (passTail).
 void encodeEndLight(pm4::Stream& stream, const RenderPass&, uint64_t table, const Options& o) {
-    if (o.tailCcuFlush) {
+    if (o.tailCcuFlush && o.lightTwin != 2) {
         eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, table + kTableTimestampsAt, 1, false);
     }
     if (o.tailLrzFlush) {
@@ -1397,18 +1410,15 @@ void encodeEndLight(pm4::Stream& stream, const RenderPass&, uint64_t table, cons
     }
 }
 
-// Before a draw that samples what an earlier pass of this command buffer drew: the texture caches dropped and the
-// writes waited for -- what turnip emits for a barrier from a colour attachment's writes to a shader's reads
-// (tu_flush_for_access, tu_cmd_buffer.cc:5786-5915: CCU_CLEAN_COLOR at once for the writer, which the writer's tail
-// was, and CACHE_INVALIDATE for the reader; tu_flush_for_stage :6283-6321: a WFI on A6XX; in tu6_emit_flushes' order,
-// :381-466, the event and then the wait)
+// Before a draw that reads what an earlier pass of this command buffer wrote: the texture caches dropped and the writes
+// waited for -- what turnip emits for a barrier from a colour attachment's writes to a shader's reads
+// (tu_flush_for_access, mesa:tu_cmd_buffer.cc:5788-5917: CCU_CLEAN_COLOR at once for the writer, which the writer's
+// tail was, and CACHE_INVALIDATE for the reader, DST_FLUSH(UCHE) :5846; tu_flush_for_stage :6285: a WFI when both run
+// on the GPU; in tu6_emit_flushes' order the event and then the wait, :391-392 and :463-464)
 void encodeReadBarrier(pm4::Stream& stream) {
     event(stream, CACHE_INVALIDATE);
     stream.waitForIdle();
 }
-
-std::atomic<bool> gLightKeepAcrossFill{false};
-void lightKeepAcrossFill(bool on) { gLightKeepAcrossFill = on; }
 
 namespace {
 // A draw is encoded in two halves. drawFacts judges it -- every refusal by name, in the order they always came -- and
@@ -3209,7 +3219,9 @@ namespace {
 
 // which packets leave the registers as the stream wrote them: the waits, loads, draws, events and markers a draw is made
 // of. Any other (CP_SET_DRAW_STATE, a memory write the command processor may act on) and the shadow forgets what it knew.
-bool leavesRegisters(uint32_t opcode) {
+// (KEEP_FILL: a light pass's head with CommandBuffer::setLightKeepAcrossFill -- a Clear's 2D fill writes none of the 3D
+// registers: turnip's r2d_setup_common, r2d_dst and r2d_run write the A2D set alone, tu_clear_blit.cc)
+bool leavesRegisters(uint32_t opcode, bool keepFill = false) {
     switch (opcode) {
     case pm4::kNop: case CP_WAIT_MEM_GTE: case CP_SKIP_IB2_ENABLE_GLOBAL: case CP_WAIT_FOR_IDLE: case CP_LOAD_STATE6_GEOM:
     case CP_LOAD_STATE6_FRAG: case CP_LOAD_STATE6: case CP_DRAW_INDX_OFFSET: case CP_DRAW_INDIRECT_MULTI: case CP_WAIT_REG_MEM:
@@ -3217,9 +3229,7 @@ bool leavesRegisters(uint32_t opcode) {
     case pm4::kMemcpy: case pm4::kWaitMemWrites: case pm4::kWaitForMe:
         return true;
     case CP_BLIT:
-        // (PROTOTYPE: the 2D engine's run writes none of the 3D registers -- turnip's r2d ops write the A2D set alone,
-        // tu_clear_blit.cc r2d_setup_common/r2d_dst/r2d_run -- so a Clear's fill leaves the shadow's as they are)
-        return gLightKeepAcrossFill.load(std::memory_order_relaxed);
+        return keepFill;
     default:
         return false;
     }
@@ -4314,7 +4324,7 @@ void appendStream(pm4::Stream& to, const pm4::Stream& from) {
 // time for a draw (12.4 us measured, probe "pass cost") goes on reading them. Written whatever it holds: a register
 // that is a command (HLSQ_INVALIDATE_CMD). Forgotten: everything, at a packet that may change registers behind the
 // stream's back -- anything but the waits, loads, draws, events and markers a draw is made of.
-bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegShadow& regs) {
+bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegShadow& regs, bool keepFill = false) {
     bool forgot = false;
     using namespace a6xx;
     const std::vector<uint32_t>& w = from.words();
@@ -4336,7 +4346,7 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
             }
             if (runLen != 0) to.registers(h.reg + runStart, &w[i + 1 + runStart], runLen);
         } else {
-            if (!render::leavesRegisters(h.opcode)) {
+            if (!render::leavesRegisters(h.opcode, keepFill)) {
                 regs.clear();   // (CP_SET_DRAW_STATE and the like: what the registers hold is no longer known here)
                 forgot = true;
             }
@@ -4656,13 +4666,15 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             gmem = queue_.preferGmem(tuneKey);
         }
     }
-    // (PROTOTYPE) light: this pass follows a sysmem pass of this buffer that the draw just closed (carry_), is itself
-    // recorded for sysmem alone, has colour attachments only and the options of the pass before
-    bool light = false;
+    // (setLightPasses) light: this pass follows a sysmem pass of this buffer that the draw just closed (carry_), is itself
+    // recorded for sysmem alone, has colour attachments only and the options of the pass before. WAIT_FIRST: it writes
+    // memory a draw read since the last WFI
+    bool light = false, waitFirst = false;
     if (!joins) {
         light = lightPasses_ && carry_.valid && !gmem && !dual && pass.depth == nullptr && pass.stencil == nullptr && options.dedupRegs &&
                 std::memcmp(&carry_.options, &options, sizeof options) == 0;
         carry_.valid = false;
+        waitFirst = light && writesRead(pass);
     }
     Piece passTable;
     pm4::Stream& head = dc.head;
@@ -4683,7 +4695,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
                 if (t != nullptr && la == LoadAction::kClear && render::gmemClearWords(t->info(), cc, gmemClearWords_[i])) gmemClears_ |= 1u << i;
             }
         }
-        if (light ? !render::encodeBeginLight(head, pass, passTable.gpuAddress(), passTable.contents(), &why, options)
+        if (light ? !render::encodeBeginLight(head, pass, passTable.gpuAddress(), passTable.contents(), &why, options, waitFirst)
                   : (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, options, gmemClears_) ||
                      (dual && !render::encodeBegin(headSys, pass, passTable.gpuAddress(), passTable.contents(), &why, options)))) {
             gmemClears_ = 0;
@@ -4794,7 +4806,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         {
             const Texture* first = pass.color0 != nullptr ? pass.color0 : pass.depth;
             const size_t stamped = profiled_.size();
-            stampStart(kPassDraw, first ? first->width() : 0, first ? first->height() : 0);
+            stampStart(kPassDraw, first ? first->width() : 0, first ? first->height() : 0, tuneKey);
             if (profiled_.size() > stamped) {
                 profiled_.back().tuneKey = tuneKey;
                 // (why not GMEM, pass by pass: the last reason alone named whichever pass came last, and the heavy
@@ -4819,9 +4831,18 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             open_->cache->cur[0] = dc.carryCur;
             open_->light = true;
             lightCounts_.light++;
-        } else {
-            // (the batch start invalidates the texture caches after a WFI: whatever was written before is read fresh)
-            ucheSeq_ = writeSeq_;
+            // (its head's WFIs -- the one before it all, a Clear's after its fill -- come before any read of this pass)
+            bool clears = pass.color0 != nullptr && pass.load == LoadAction::kClear;
+            for (const ColorAttachment& a : pass.more) clears = clears || (a.texture != nullptr && a.load == LoadAction::kClear);
+            if (waitFirst) lightCounts_.writeWaits++;
+            if (waitFirst || clears) wfiSeq_ = writeSeq_;
+        } else if (lightPasses_) {
+            // (the batch start invalidates the texture caches after a WFI: whatever was written before is read fresh,
+            // and every read before has finished)
+            if (options.batchStart) {
+                ucheSeq_ = wfiSeq_ = writeSeq_;
+                barrierPending_ = false;
+            }
             lightCounts_.full++;
         }
         if (dual) {
@@ -4829,8 +4850,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             open_->headGmem.clear();
             open_->headGmem.append(head.words().data(), head.size());
         } else if (options.dedupRegs) {
-            // (PROTOTYPE: a head whose fill made the shadow forget leaves the carried cursor nothing to stand on either)
-            if (appendDeduped(stream_, head, open_->regs) && light) open_->cache->cur[0].forget();
+            // (a light head whose fill made the shadow forget leaves the carried cursor nothing to stand on either)
+            if (appendDeduped(stream_, head, open_->regs, light && lightKeepAcrossFill_) && light) open_->cache->cur[0].forget();
         } else {
             appendStream(stream_, head);
         }
@@ -4886,23 +4907,25 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)));
     }
 
-    // (PROTOTYPE) a light pass's draw that samples memory the GPU wrote since the texture caches were last invalidated
-    // in this stream: the barrier first, once -- Metal has the driver order a read after the write it follows
-    // (MTLHazardTrackingModeTracked), and here every buffer is tracked, whatever its mode
-    if (open_->light && writeSeq_ != ucheSeq_ && !gpuWritten_.empty()) {
-        bool reads = false;
-        for (const Bindings* b : {&vsBindings, &fsBindings}) {
-            for (const Texture* t : b->textures) {
-                if (t == nullptr) continue;
-                auto it = gpuWritten_.find(t->buffer().get());
-                if (it != gpuWritten_.end() && it->second > ucheSeq_) reads = true;
+    // (setLightPasses) A light pass's draw that reads memory a pass of this buffer wrote since the texture caches were
+    // last dropped -- a texture or a buffer it binds, whatever its hazard tracking mode -- or any sysmem draw after a
+    // memoryBarrier: the read barrier first, once, the caches then fresh for every pass closed so far (Metal has a read
+    // wait for the write before it: MTLHazardTrackingModeTracked). (A tiled pass's draws are replayed tile by tile from
+    // its recorded bodies: a barrier asked for there waits for the next sysmem draw, or for the next full head, which
+    // has it.) Then what the draw reads, and may store to, noted for the passes after it.
+    if (lightPasses_) {
+        if (!open_->gmem && !open_->dual) {
+            const bool reads = open_->light && writeSeq_ != ucheSeq_ && (readsWritten(vsBindings) || readsWritten(fsBindings));
+            // (and one that may store to a buffer an earlier pass read since the last WFI: the WFI is the barrier's too)
+            const bool overwrites = open_->light && storesOverRead(program, vsBindings, fsBindings);
+            if (((reads || overwrites) && options.lightTwin != 1) || barrierPending_) {
+                render::encodeReadBarrier(stream_);
+                ucheSeq_ = wfiSeq_ = writeSeq_;
+                barrierPending_ = false;
+                lightCounts_.barriers++;
             }
         }
-        if (reads) {
-            render::encodeReadBarrier(stream_);
-            ucheSeq_ = writeSeq_;
-            lightCounts_.barriers++;
-        }
+        noteAccess(program, vsBindings, fsBindings);
     }
 
     // --- the draw's words, straight onto the pass's stream (and onto its sysmem side, for a pass recorded both ways) ---
@@ -5495,9 +5518,10 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
             profiled_.back().stored = uint8_t(store);
         }
     }
-    // (PROTOTYPE) what this pass wrote, for the passes after it: every attachment's memory, at this pass's number
+    // (setLightPasses) what this pass wrote, for the passes after it: its attachments' memory and what its draws may
+    // store to, at this pass's number
     writeSeq_++;
-    noteWritten(open_->pass);
+    noteWritten(*open_);
     // a sysmem pass closed by the draw that opens the next one, colour only: the light tail, and its registers carried
     const bool lightTail = lightPasses_ && next != nullptr && !kept && !open_->gmem && !open_->dual && open_->pass.depth == nullptr &&
                            open_->pass.stencil == nullptr && open_->options.dedupRegs && open_->cache != nullptr;
@@ -5511,6 +5535,14 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
             render::encodeEnd(tail, open_->pass, open_->table, open_->options);
         }
         appendStream(stream_, tail);
+    }
+    if (lightPasses_ && !lightTail) {
+        wfiSeq_ = writeSeq_;   // (the full tail's WFI: every read so far has finished)
+    }
+    if (lightTail && stampOpen_) {
+        // (profiled: the pass done before its end stamp, as the full tail's WFI has it, so that the stamps still time it)
+        stream_.waitForIdle();
+        wfiSeq_ = writeSeq_;
     }
     if (lightTail) {
         // (the shadow and the cursor as they are: the next pass's stream goes on from this one's)
@@ -5528,14 +5560,91 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
     open_.reset();
 }
 
-void CommandBuffer::noteWritten(const RenderPass& pass) {
+void CommandBuffer::noteWritten(const OpenPass& open) {
     if (!lightPasses_) return;
+    const RenderPass& pass = open.pass;
     for (const Texture* t : {pass.color0, pass.depth, pass.stencil}) {
         if (t != nullptr) gpuWritten_[t->buffer().get()] = writeSeq_;
     }
     for (const ColorAttachment& a : pass.more) {
         if (a.texture != nullptr) gpuWritten_[a.texture->buffer().get()] = writeSeq_;
     }
+    for (const Buffer* b : open.writes) gpuWritten_[b] = writeSeq_;
+}
+
+bool CommandBuffer::readsWritten(const Bindings& b) const {
+    auto after = [&](const Buffer* x) {
+        auto it = gpuWritten_.find(x);
+        return it != gpuWritten_.end() && it->second > ucheSeq_;
+    };
+    for (const Texture* t : b.textures) {
+        if (t != nullptr && after(t->buffer().get())) return true;
+    }
+    for (const Binding& x : b.buffers) {
+        if (x.buffer != nullptr && after(x.buffer)) return true;
+    }
+    return false;
+}
+
+// What a draw reads (every texture and buffer it binds) at the open pass's number, and what it may store to: the buffers
+// of a stage the compiler found storing to its device buffers or not looked at (Program::ssboWrites), and the textures
+// such a stage declares written
+void CommandBuffer::noteAccess(const Program& program, const Bindings& vs, const Bindings& fs) {
+    const uint32_t at = writeSeq_ + 1;
+    for (const Bindings* b : {&vs, &fs}) {
+        for (const Texture* t : b->textures) {
+            if (t != nullptr) gpuRead_[t->buffer().get()] = at;
+        }
+        for (const Binding& x : b->buffers) {
+            if (x.buffer != nullptr) gpuRead_[x.buffer] = at;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (((program.ssboWrites >> i) & 1) == 0) continue;
+        const Bindings& b = i == 0 ? vs : fs;
+        const Kernel& k = i == 0 ? program.vs.k : program.fs.k;
+        for (const Binding& x : b.buffers) {
+            if (x.buffer != nullptr && std::find(open_->writes.begin(), open_->writes.end(), x.buffer) == open_->writes.end()) open_->writes.push_back(x.buffer);
+        }
+        for (uint32_t j = 0; j < b.textures.size() && j < kMaxTextureSlots && j < k.numTextureSlots; j++) {
+            const Texture* t = b.textures[j];
+            if (t != nullptr && k.textures[j].write && std::find(open_->writes.begin(), open_->writes.end(), t->buffer().get()) == open_->writes.end()) {
+                open_->writes.push_back(t->buffer().get());
+            }
+        }
+    }
+}
+
+bool CommandBuffer::storesOverRead(const Program& program, const Bindings& vs, const Bindings& fs) const {
+    auto readBefore = [&](const Buffer* x) {
+        auto it = gpuRead_.find(x);
+        return it != gpuRead_.end() && it->second > wfiSeq_ && it->second <= writeSeq_;
+    };
+    for (int i = 0; i < 2; i++) {
+        if (((program.ssboWrites >> i) & 1) == 0) continue;
+        const Bindings& b = i == 0 ? vs : fs;
+        const Kernel& k = i == 0 ? program.vs.k : program.fs.k;
+        for (const Binding& x : b.buffers) {
+            if (x.buffer != nullptr && readBefore(x.buffer)) return true;
+        }
+        for (uint32_t j = 0; j < b.textures.size() && j < kMaxTextureSlots && j < k.numTextureSlots; j++) {
+            if (b.textures[j] != nullptr && k.textures[j].write && readBefore(b.textures[j]->buffer().get())) return true;
+        }
+    }
+    return false;
+}
+
+bool CommandBuffer::writesRead(const RenderPass& pass) const {
+    auto after = [&](const Texture* t) {
+        if (t == nullptr) return false;
+        auto it = gpuRead_.find(t->buffer().get());
+        return it != gpuRead_.end() && it->second > wfiSeq_;
+    };
+    if (after(pass.color0) || after(pass.depth) || after(pass.stencil)) return true;
+    for (const ColorAttachment& a : pass.more) {
+        if (after(a.texture)) return true;
+    }
+    return false;
 }
 
 bool CommandBuffer::clear(const RenderPass& pass, const render::Options& options) {
