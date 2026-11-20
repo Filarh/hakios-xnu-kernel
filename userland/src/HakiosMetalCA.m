@@ -2331,7 +2331,7 @@ hm_ft_geometry(const struct hm_ft_pipe *p, hakios_metal_buffer *const *vs, const
 /* the size of the attachment a pass draws into: colour 0's level, or the first other colour attachment's, or depth's */
 
 /*
- * metal_hsrprobe=1 (with metal_trace=frame, whose pipeline descriptions and vertex reading it uses; off by default): A
+ * metal_hsrprobe=1 (or =2: only in the recorded command buffers of even seq, an A/B within one trace; with metal_trace=frame, whose pipeline descriptions and vertex reading it uses; off by default): A
  * MEASUREMENT INSTRUMENT, never for use. A GPU of Apple's does not shade what a later opaque layer covers (hidden surface
  * removal in its tiles); this GPU shades all of it. To time what that costs here, a draw of an encoder that writes
  * colour attachment 0 alone is cancelled (hakios_metal_cb_cancel_draw: its draw packet a NOP, its state kept) when a
@@ -2342,20 +2342,23 @@ hm_ft_geometry(const struct hm_ft_pipe *p, hakios_metal_buffer *const *vs, const
 static unsigned hm_hsr_next;
 static unsigned long long hm_hsr_cancelled, hm_hsr_pixels, hm_hsr_draws;
 static double hm_hsr_printed;
-static BOOL
-hm_hsr_on(void)
+static int
+hm_hsr_mode(void)
 {
 	static dispatch_once_t once;
-	static BOOL on;
+	static int mode;
 
 	dispatch_once(&once, ^{
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 
-		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_hsrprobe=1") != NULL && strstr(args, "metal_trace=frame") != NULL;
-		if (on) hm_print("metal_hsrprobe=1: draws under a later opaque rectangle are cancelled -- a measurement, the picture may differ\n");
+		if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_trace=frame") != NULL) {
+			mode = strstr(args, "metal_hsrprobe=1") != NULL ? 1 : strstr(args, "metal_hsrprobe=2") != NULL ? 2 : 0;
+		}
+		if (mode == 1) hm_print("metal_hsrprobe=1: draws under a later opaque rectangle are cancelled -- a measurement, the picture may differ\n");
+		if (mode == 2) hm_print("metal_hsrprobe=2: as 1, in the recorded command buffers of even seq alone (an A/B within one trace)\n");
 	});
-	return on;
+	return mode;
 }
 
 static void
@@ -10890,7 +10893,8 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	const double coreBegan = hm_fps_on() ? hm_now() : 0;
 	if (_ftrace != NULL) ftBefore = hm_ft_total(cb);
 	unsigned hsrTag = 0;
-	if (hm_hsr_on() && _pipeline != nil && [_pipeline hakiosFtPipe] != NULL) {
+	const int hsrMode = hm_hsr_mode();
+	if ((hsrMode == 1 || (hsrMode == 2 && _ftrace != NULL && _ftrace->seq % 2 == 0)) && _pipeline != nil && [_pipeline hakiosFtPipe] != NULL) {
 		hsrTag = ++hm_hsr_next;
 		if (hsrTag == 0) hsrTag = ++hm_hsr_next;
 		hakios_metal_cb_set_draw_tag(cb, hsrTag);
@@ -10929,7 +10933,7 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 #undef HM_FT_DRAW
 }
 
-/* metal_hsrprobe (hm_hsr_on): the draw just recorded as TAG -- an occluder cancels what it covers, then it may be covered */
+/* metal_hsrprobe (hm_hsr_mode): the draw just recorded as TAG -- an occluder cancels what it covers, then it may be covered */
 - (void)hakiosHsrDrawn:(unsigned)tag vs:(hakios_metal_buffer *const *)vs start:(unsigned)start count:(unsigned)count instances:(unsigned)instances
 	   indexBuffer:(id)indexBuffer indexType:(unsigned)indexType indexOffset:(uint64_t)indexOffset baseVertex:(long)baseVertex
 	      indirect:(BOOL)indirect
