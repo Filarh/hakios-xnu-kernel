@@ -5033,6 +5033,32 @@ hm_gmem_ubwc(void)
 	return on == 1;
 }
 
+/*
+ * metal_p5=1 (/var/tmp/metal.args or a boot-arg; off by default): a pass one of whose draws reads its target through
+ * framebuffer fetch is tiled whatever its number of draws when its render area is 64 K pixels or more, and its like is
+ * recorded both ways whatever its history (hakios_metal_cb_set_gmem_fetch_first) -- turnip's order, the feedback loop
+ * before the count of draws. Meant for the blur's capture with its in-place filter and its full-size vertical pass,
+ * which otherwise read their target from memory behind a barrier a draw (dev-notes 25-blur/03 §1). It acts on passes
+ * recorded both ways, that is with metal_gmem_draws=N (the plug-in's default bar); a pass into a compressed target
+ * also needs metal_gmemubwc=1.
+ */
+static BOOL
+hm_p5(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_p5=1") != NULL;
+		if (on) {
+			hm_print("metal_p5=1: a pass that reads its target is tiled whatever its draws\n");
+		}
+	}
+	return on == 1;
+}
+
 static int
 hm_tile_for(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 {
@@ -6894,6 +6920,7 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
 		hakios_metal_cb_set_gmem_compressed(_cb, hm_gmem_ubwc());   /* metal_gmemubwc=1 */
+		hakios_metal_cb_set_gmem_fetch_first(_cb, hm_p5());   /* metal_p5=1 */
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
 		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
 	}

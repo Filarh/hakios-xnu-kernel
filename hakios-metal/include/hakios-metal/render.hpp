@@ -572,12 +572,20 @@ bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY);
 //     bytes: 9 D = 22 TOUCHED px there). So tiles when DRAWS * 22 TOUCHED >= BAR * (11 (LOADED + STORED) - 10 CLEARED):
 //     at BAR draws for such a pass as before, at half of it when nothing need be loaded (DontCare, or a Clear the
 //     tiles do themselves), at kGmemFewDraws when the sysmem pass would fill what the tiles store anyway.
+//   - With FETCH_FIRST (CommandBuffer::setGmemFetchFirst, the plug-in's metal_p5=1), a pass one of whose draws reads its
+//     target is tiled whatever its draws, when its render area is kGmemFetchMinPixels or more: turnip's order, the
+//     feedback loop before the count of draws (get_optimal_mode: "SINGLE_PRIM_MODE ... GMEM" ahead of "too few draws to
+//     tune"). The blur's capture with its in-place filter (4 draws) and its vertical pass at full resolution (2 draws)
+//     read their target with a barrier a draw in sysmem (dev-notes 25-blur/03 §1). A small one stays where the draws say.
 // WHY: when sysmem, the reason in words (for the pass's profile).
 constexpr uint32_t kGmemFewDraws = 5;
+constexpr uint32_t kGmemFetchMinPixels = 64 * 1024;
 struct GmemChoice {
     uint32_t draws = 0, bar = 0;
     bool fetch = false;
     uint32_t touched = 0, loaded = 0, stored = 0, cleared = 0;   // bytes a pixel
+    bool fetchFirst = false;   // FETCH_FIRST above
+    uint64_t pixels = 0;       // the render area's (the tiles'), for FETCH_FIRST
 };
 bool gmemWorth(const GmemChoice& c, std::string* why);
 // PLAN's bins over the render area AREA (X0 Y0 X1 Y1 inclusive, inside the window): the bins of the plan's own grid

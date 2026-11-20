@@ -2549,6 +2549,7 @@ bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY) {
 }
 
 bool gmemWorth(const GmemChoice& c, std::string* why) {
+    if (c.fetchFirst && c.fetch && c.pixels >= kGmemFetchMinPixels) return true;
     const uint32_t few = std::min(c.bar, kGmemFewDraws);
     const std::string bar = "metal_gmem_draws=" + std::to_string(c.bar);
     if (c.draws < few) {
@@ -4577,7 +4578,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             kind = render::tuneKeyOf(pass);
             ordinal = ordinals_[kind]++;
             const uint32_t peak = queue_.peakDraws(kind, ordinal);
-            if (peak != 0 && peak < gmemMinDraws_ / 2) {
+            // (setGmemFetchFirst: a like that read its target is recorded both ways, its few draws notwithstanding)
+            if (peak != 0 && peak < gmemMinDraws_ / 2 && !(gmemFetchFirst_ && queue_.peakFetched(kind, ordinal))) {
                 gmem = false;
                 gmemWhy_ = "its like had " + std::to_string(peak) + " draws at most lately";
             } else {
@@ -4777,6 +4779,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
     }
     open_->lastFetched = program.fs.fbRead != 0;
+    open_->fetched |= open_->lastFetched;
     open_->draws++;
     pm4::Stream& into = open_->gmem ? open_->bodies : stream_;
     const bool timed = profileDraws_ && !open_->gmem && drawsProfiled_.size() < kMaxProfiledDraws;
@@ -4933,6 +4936,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         bool certain = false;
         if (gmemOff_ & kGmemByDrawsAlone) {
             certain = open_->draws >= gmemMinDraws_;
+        } else if (gmemFetchFirst_ && open_->read != 0 && openAreaPixels() >= render::kGmemFetchMinPixels) {
+            certain = true;   // (setGmemFetchFirst: a draw reads its target over an area that clears the minimum -- and the area only grows)
         } else if (open_->draws >= std::min(gmemMinDraws_, render::kGmemFewDraws)) {
             if (open_->read != 0) {
                 certain = true;   // (a draw reads its target: tiles)
@@ -5171,6 +5176,13 @@ bool CommandBuffer::append(CommandBuffer& other) {
     return true;
 }
 
+uint64_t CommandBuffer::openAreaPixels() const {
+    const uint32_t* a = open_->area;
+    if (a[0] <= a[2] && a[1] <= a[3]) return uint64_t(a[2] - a[0] + 1) * (a[3] - a[1] + 1);
+    const auto [W, H] = render::windowOf(open_->pass);
+    return uint64_t(W) * H;
+}
+
 void CommandBuffer::closePass(const RenderPass* next, bool kept) {
     if (open_ == nullptr) {
         return;
@@ -5225,6 +5237,8 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
             c.draws = open_->draws;
             c.bar = gmemMinDraws_;
             c.fetch = open_->read != 0;
+            c.fetchFirst = gmemFetchFirst_;
+            c.pixels = openAreaPixels();
             uint32_t load = 0, store = 0;
             const uint32_t H = render::windowOf(open_->pass).second;
             loadStore(overArea ? open_->area[3] : H - 1, H, &load, &store);
@@ -5256,7 +5270,7 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
         noted = std::max(noted, gmemMinDraws_);
         belowBar = open_->draws < gmemMinDraws_;
     }
-    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted);
+    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted, open_->fetched);
     if (open_->gmem && open_->bodies.size() != 0) {
         Piece ib;
         std::string why;

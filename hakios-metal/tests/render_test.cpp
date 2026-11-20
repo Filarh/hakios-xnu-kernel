@@ -5987,6 +5987,67 @@ TEST(a_pass_whose_like_was_light_is_recorded_for_sysmem_alone) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// setGmemFetchFirst (the plug-in's metal_p5=1): a pass one of whose draws reads its target is tiled whatever its draws
+// when its area is kGmemFetchMinPixels or more -- render::gmemWorth before the count of draws, as turnip's
+// get_optimal_mode -- and its like is recorded both ways whatever its history. At a bar of 56: two fetching draws over
+// 752 x 1626 are tiled with it and not without (the twin), two over 64 x 64 are not either way, two that do not fetch
+// are not; a pass of the kind whose like was light (one draw) is recorded for sysmem alone the first time it fetches,
+// and tiled from the next time on with the switch, never without.
+TEST(a_pass_that_reads_its_target_is_tiled_first_behind_its_switch) {
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    {
+        render::GmemChoice c;
+        c.draws = 2;
+        c.bar = 56;
+        c.fetch = true;
+        c.touched = c.loaded = c.stored = 4;
+        c.pixels = 752 * 1626;
+        std::string why;
+        CHECK(!render::gmemWorth(c, &why) && has(why, "too few for tiles"));
+        c.fetchFirst = true;
+        CHECK(render::gmemWorth(c, &why));
+        c.pixels = 64 * 64;
+        CHECK(!render::gmemWorth(c, &why));
+        c.pixels = 752 * 1626;
+        c.fetch = false;
+        CHECK(!render::gmemWorth(c, &why));
+    }
+    auto pass = [&](Rig& r, const Texture* t, int draws, bool fetch, bool first, std::string* refusal = nullptr) {
+        RenderPass p;
+        p.color0 = const_cast<Texture*>(t);
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemMinDraws(56);
+        cb->setGmemFetchFirst(first);
+        for (int i = 0; i < draws; i++) CHECK(cb->draw(fetch ? fb : flatProgram(), p, wholeDraw(6, t->width(), t->height()), Bindings{}, Bindings{}));
+        if (refusal != nullptr) *refusal = cb->gmemRefusal();
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+        return cb->counts().gmemPasses;
+    };
+    for (int first = 0; first < 2; first++) {
+        Rig r;
+        auto big = target(r, 752, 1626, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto small = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        for (int time = 0; time < 3; time++) CHECK_EQ(pass(r, big.get(), 2, true, first != 0), first ? 1u : 0u);
+        CHECK_EQ(pass(r, small.get(), 2, true, first != 0), 0u);
+    }
+    for (int first = 0; first < 2; first++) {
+        Rig r;
+        auto big = target(r, 752, 1626, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        CHECK_EQ(pass(r, big.get(), 2, false, first != 0), 0u);
+        // (its like had one draw: the first fetching one is recorded for sysmem alone, and says so)
+        std::string refusal;
+        CHECK_EQ(pass(r, big.get(), 1, false, first != 0), 0u);
+        CHECK_EQ(pass(r, big.get(), 2, true, first != 0, &refusal), 0u);
+        CHECK(has(refusal, "draws at most lately"));
+        CHECK_EQ(pass(r, big.get(), 2, true, first != 0, &refusal), first ? 1u : 0u);
+        CHECK_EQ(has(refusal, "draws at most lately"), first == 0);
+    }
+}
+
 // A DontCare attachment is not loaded when the granules past its edge stay in its rows: 100 x 36 (the right edge in the
 // rows' padding, 36 rows a multiple of 4) -- stored, not loaded; 100 x 37 (a granule row past the last) -- loaded too
 TEST(a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row) {

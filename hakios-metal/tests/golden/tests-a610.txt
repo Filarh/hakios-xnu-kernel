@@ -280,6 +280,7 @@ gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11
 tiles_or_sysmem_by_what_a_pass_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream 73b4f87849ebc26c state 54785826781f23a5 names 90 37f5855db810e49c
 a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 741acb79b011181f state 179f28010791cba5 names 20 8e8d1b2d6669327e
+a_pass_that_reads_its_target_is_tiled_first_behind_its_switch submits 16 words 81191 draws 334 loads 1324 stream 144c9879d1352ef6 state c2185469e9e70705 names 64 842179cde1ab320a
 a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 1e58b9a3b387a29f state b2db15d81d80c4dd names 8 05d20adef5c3adcc
 a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 2cf84b6de3102d2e state 29f464ce110bdd85 names 32 17482b7bd70eb730
 a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams submits 2 words 11914 draws 78 loads 52 stream e1fde86d5d1822fa state 83cd0a9911a4f0fd names 10 943c5dc4edf77a16

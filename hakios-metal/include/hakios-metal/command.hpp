@@ -240,6 +240,10 @@ public:
     // the flag buffer (render::kGmemPlanCompressed); off by default, when such a pass runs in sysmem: the plug-in's
     // metal_gmemubwc=1, an A/B on the phone (dev-notes 25-blur/04)
     void setGmemCompressed(bool on) { gmemCompressed_ = on; }
+    // A pass one of whose draws reads its target (framebuffer fetch) is tiled whatever its draws when its render area is
+    // render::kGmemFetchMinPixels or more, and its like is recorded both ways whatever its history -- turnip's order
+    // (render.hpp, gmemWorth's FETCH_FIRST); off by default: the plug-in's metal_p5=1 (dev-notes 25-blur/03 §1, /04)
+    void setGmemFetchFirst(bool on) { gmemFetchFirst_ = on; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
     void setGmemTuned(bool on) { tuning_ = on; }
@@ -288,6 +292,7 @@ private:
     bool gmem_ = true;
     uint32_t gmemOff_ = 0;
     bool gmemCompressed_ = false;
+    bool gmemFetchFirst_ = false;
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;
@@ -405,6 +410,7 @@ private:
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
+        bool fetched = false;       // ...and any draw did, in tiles or in sysmem (READ is a tiled pass's): CommandQueue::noteDraws'
         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
         std::shared_ptr<render::PassCache> cache;
     };
@@ -413,6 +419,7 @@ private:
     // when NEXT has the same texture attached with Load, the caller's one pass goes on in a second one here.
     // KEPT: stored whatever follows (a command buffer appended to another: what follows is not known here).
     void closePass(const RenderPass* next = nullptr, bool kept = false);
+    uint64_t openAreaPixels() const;   // the open pass's render area so far in pixels (its window's before a draw)
     void useAttachments(const RenderPass& pass);
     // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
@@ -541,7 +548,10 @@ public:
     // ...and the most it had in the times since its peak, the peak let go after 16 times below it: a pass that is heavy
     // only now and then (CoreAnimation's: light frames between the heavy ones of an animation) counts as heavy
     uint32_t peakDraws(uint64_t kind, uint32_t ordinal);
-    void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws);
+    // ...and whether a draw of it read its target the last time (FETCHED): a pass of few draws that does is still
+    // recorded both ways under setGmemFetchFirst, for render::gmemWorth to tile it
+    bool peakFetched(uint64_t kind, uint32_t ordinal);
+    void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws, bool fetched = false);
     // what the queue keeps of the programs drawn with it, from one command buffer to the next (render.cpp: StateCache;
     // under its own lock)
     render::StateCache& states();
@@ -589,7 +599,7 @@ private:
     struct Tune { double us[2] = {0, 0}; uint32_t runs[2] = {0, 0}; uint32_t passes = 0; };
     std::unordered_map<uint64_t, Tune> tune_;   // (under lock_) preferGmem's, by target
     std::unordered_map<uint64_t, uint32_t> lastDraws_;   // (under lock_) noteDraws', by kind and ordinal
-    struct Peak { uint32_t draws = 0, below = 0; };
+    struct Peak { uint32_t draws = 0, below = 0; bool fetched = false; };
     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
     std::shared_ptr<render::StateCache> states_;   // (made by states() at the first ask, under lock_)
     std::condition_variable changed_;

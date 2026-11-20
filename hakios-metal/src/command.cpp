@@ -409,11 +409,18 @@ uint32_t CommandQueue::lastDraws(uint64_t kind, uint32_t ordinal) {
     return it == lastDraws_.end() ? 0 : it->second;
 }
 
-void CommandQueue::noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws) {
+void CommandQueue::noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws, bool fetched) {
     std::lock_guard<std::mutex> g(lock_);
     lastDraws_[kindKey(kind, ordinal)] = draws;
     Peak& p = peakDraws_[kindKey(kind, ordinal)];
     if (draws >= p.draws || ++p.below >= 16) p.draws = draws, p.below = 0;
+    p.fetched = fetched;
+}
+
+bool CommandQueue::peakFetched(uint64_t kind, uint32_t ordinal) {
+    std::lock_guard<std::mutex> g(lock_);
+    auto it = peakDraws_.find(kindKey(kind, ordinal));
+    return it != peakDraws_.end() && it->second.fetched;
 }
 
 uint32_t CommandQueue::peakDraws(uint64_t kind, uint32_t ordinal) {

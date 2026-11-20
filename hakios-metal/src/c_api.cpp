@@ -981,6 +981,11 @@ void hakios_metal_cb_set_gmem_compressed(hakios_metal_cb* cb, int on) {
     cb->cb->setGmemCompressed(on != 0);
 }
 
+void hakios_metal_cb_set_gmem_fetch_first(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmemFetchFirst(on != 0); });
+    cb->cb->setGmemFetchFirst(on != 0);
+}
+
 void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmemTuned(on != 0); });
     cb->cb->setGmemTuned(on != 0);

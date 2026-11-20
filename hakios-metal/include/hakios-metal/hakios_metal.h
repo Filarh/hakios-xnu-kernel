@@ -540,6 +540,9 @@ void hakios_metal_cb_set_gmem_off(hakios_metal_cb *cb, unsigned bits);
 /* a pass with a compressed (UBWC) colour attachment in GMEM too, loaded and stored in its layout (CommandBuffer::
  * setGmemCompressed); off by default, when such a pass runs in sysmem */
 void hakios_metal_cb_set_gmem_compressed(hakios_metal_cb *cb, int on);
+/* a pass one of whose draws reads its target (framebuffer fetch) tiled whatever its draws when its area is large enough,
+ * and its like recorded both ways whatever its history (CommandBuffer::setGmemFetchFirst); off by default */
+void hakios_metal_cb_set_gmem_fetch_first(hakios_metal_cb *cb, int on);
 /* GMEM or sysmem for each of CB's passes by what such passes cost the queue before (CommandBuffer::setGmemTuned) */
 void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb *cb, int on);
 /* GMEM only for a pass whose like had at least DRAWS draws the last time (CommandBuffer::setGmemMinDraws); 0: off */
