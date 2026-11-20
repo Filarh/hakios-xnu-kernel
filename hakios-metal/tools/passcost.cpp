@@ -1,13 +1,13 @@
 // passcost: what a pass costs beside its draws -- the words, registers, waits and events the command processor is
 // given for it, and the processor time of opening and closing it -- on the fake GPU, with the chip's constants.
-// (A host prototype's tool, for dev-notes/investigacion/anexos/32-interfaz-telegram: not part of the driver.)
+// (A host tool, for dev-notes/investigacion/anexos/32-interfaz-telegram: not part of the driver.)
 //
 //   passcost chain N [--clear] [--runs R]      N passes of one textured draw each, each sampling the one before (a blur chain)
 //   passcost same N [--runs R]                 the same N draws into one target: one pass (what the draws alone cost)
 //   passcost frame CSV CB [--runs R]           the passes of command buffer CB of a frame trace's pasadas-*.csv
 //                                              (trace-frame.py / clasifica.py): each pass its target's size, load action
 //                                              and number of draws, as the phone's window server recorded them
-//   --light                                    CommandBuffer::setLightPasses(true), when the build has it (the prototype)
+//   --light                                    CommandBuffer::setLightPasses(true); --keep: and setLightKeepAcrossFill(true)
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -47,7 +47,7 @@ struct Hist {
 };
 Hist gHist;
 bool gLight = false, gKeep = false, gUntuned = false, gSysmem = false;
-uint32_t gLightPasses = 0, gFullPasses = 0, gBarriers = 0;
+uint32_t gLightPasses = 0, gFullPasses = 0, gBarriers = 0, gWriteWaits = 0;
 
 const char* opcodeName(uint32_t op) {
     using namespace a6xx;
@@ -157,10 +157,8 @@ std::shared_ptr<CommandBuffer> pluginBuffer(Rig& r) {
     cb->setGmemOff(0);
     cb->setGmemTuned(!gUntuned);
     cb->setProfileDraws(false);
-#ifdef HAKIOS_METAL_LIGHT_PASSES
     cb->setLightPasses(gLight);
-    render::lightKeepAcrossFill(gKeep);
-#endif
+    cb->setLightKeepAcrossFill(gKeep);
     return cb;
 }
 
@@ -246,9 +244,8 @@ Totals runFrames(const std::vector<PassSpec>& specs, uint32_t runs) {
         cb->waitUntilCompleted();
         if (cb->status() != CommandBuffer::kCompleted) t.error = "a command buffer ended in error: " + cb->error() + " | " + r.fake->stats().lastFault;
         if (r.fake->stats().faults != 0 && t.error.empty()) t.error = "the fake GPU: " + r.fake->stats().lastFault;
-#ifdef HAKIOS_METAL_LIGHT_PASSES
         gLightPasses = cb->lightCounts().light, gFullPasses = cb->lightCounts().full, gBarriers = cb->lightCounts().barriers;
-#endif
+        gWriteWaits = cb->lightCounts().writeWaits;
         if (frame != 0) {
             t.firstUs.push_back(firsts ? firstNs / firsts / 1e3 : 0);
             t.joinUs.push_back(joins ? joinNs / joins / 1e3 : 0);
@@ -267,7 +264,7 @@ Totals runFrames(const std::vector<PassSpec>& specs, uint32_t runs) {
 void print(const char* name, const Totals& t) {
     std::printf("%s: %u passes, %u draws%s%s%s\n", name, t.passes, t.draws, gLight ? " (light passes)" : "", gKeep ? " (a fill keeps the shadow)" : "",
                 gUntuned ? " (no stamps)" : "");
-    if (gLight) std::printf("   passes with the light head %u, with the full head %u; read barriers %u\n", gLightPasses, gFullPasses, gBarriers);
+    if (gLight) std::printf("   passes with the light head %u, with the full head %u; read barriers %u, WFIs before a write %u\n", gLightPasses, gFullPasses, gBarriers, gWriteWaits);
     if (!t.error.empty() || t.refused != 0) std::printf("   !! %u refused; %s\n", t.refused, t.error.c_str());
     std::printf("   processor: a pass's first draw %.2f us (median of %zu frames), a draw that joins %.2f us, commit %.1f us, the frame %.1f us\n", median(t.firstUs),
                 t.firstUs.size(), median(t.joinUs), median(t.commitUs), median(t.frameUs));

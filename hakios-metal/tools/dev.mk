@@ -3,6 +3,7 @@
 #
 #   make -f tools/dev.mk -j4 [CHIP=a635|a610] [OPT="-O2 -g"] tests       out/dev-$(CHIP)/tests
 #   make -f tools/dev.mk -j4 [CHIP=...] drawbench                       out/dev-$(CHIP)/drawbench (tools/drawbench.cpp)
+#   make -f tools/dev.mk -j4 [CHIP=...] passcost                        out/dev-$(CHIP)/passcost (tools/passcost.cpp)
 #   make -f tools/dev.mk -j4 [CHIP=...] check                           the tests, then the golden streams (tests/golden/)
 #   make -f tools/dev.mk -j4 [CHIP=...] golden                          write the golden streams again (a change of the stream, said in its commit)
 #
@@ -20,9 +21,10 @@ TESTS = $(basename $(notdir $(wildcard tests/*_test.cpp))) main
 CORE_O = $(CORE:%=$(OUT)/obj/src/%.o)
 TEST_O = $(TESTS:%=$(OUT)/obj/tests/%.o)
 
-.PHONY: tests drawbench check golden
+.PHONY: tests drawbench passcost check golden
 tests: $(OUT)/tests
 drawbench: $(OUT)/drawbench
+passcost: $(OUT)/passcost
 
 $(OUT)/obj/src/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
@@ -36,6 +38,8 @@ $(OUT)/obj/tools/%.o: tools/%.cpp
 $(OUT)/tests: $(CORE_O) $(TEST_O)
 	$(CXX) $(OPT) -pthread -o $@ $^
 $(OUT)/drawbench: $(CORE_O) $(OUT)/obj/tools/drawbench.o
+	$(CXX) $(OPT) -pthread -o $@ $^
+$(OUT)/passcost: $(CORE_O) $(OUT)/obj/tools/passcost.o
 	$(CXX) $(OPT) -pthread -o $@ $^
 
 # the golden streams: every scene of drawbench and every test's submissions, word for word what they were when
@@ -56,4 +60,4 @@ golden: $(OUT)/tests $(OUT)/drawbench
 	$(OUT)/drawbench --golden > tests/golden/drawbench-$(CHIP).txt
 	$(OUT)/tests --golden > tests/golden/tests-$(CHIP).txt
 
--include $(CORE_O:.o=.d) $(TEST_O:.o=.d) $(OUT)/obj/tools/drawbench.d
+-include $(CORE_O:.o=.d) $(TEST_O:.o=.d) $(OUT)/obj/tools/drawbench.d $(OUT)/obj/tools/passcost.d
