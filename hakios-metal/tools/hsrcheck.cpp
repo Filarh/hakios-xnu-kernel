@@ -221,7 +221,7 @@ struct Rig {
 // SCENE at W x H into fresh targets filled with PICTURE (and colour 1 with PICTURE1), with HSR ON or not and its DEPTH,
 // TWIN and LIMIT setHsrTest's; PASSES times over in one command buffer, each a pass of its own (a copy between them)
 Run runScene(Rig& rig, const Scene& s, uint32_t W, uint32_t H, const std::vector<uint8_t>& picture, const std::vector<uint8_t>& picture1, bool on,
-             const Depth& depth = kDefaultDepth, uint8_t twin = 0, uint32_t limit = CommandBuffer::kHsrMaxDraws, int passes = 1) {
+             const Depth& depth = kDefaultDepth, uint8_t twin = 0, uint32_t limit = CommandBuffer::kHsrMaxDraws, int passes = 1, bool clearEach = false) {
     Run r;
     auto t = makeTexture(rig.gpu, !gLinear, W, H, &r.why);
     auto c1 = t != nullptr ? makeTexture(rig.gpu, false, W, H, &r.why) : nullptr;
@@ -250,6 +250,7 @@ Run runScene(Rig& rig, const Scene& s, uint32_t W, uint32_t H, const std::vector
     auto cb = rig.queue.commandBuffer();
     cb->setHsr(on);
     cb->setHsrDepth(depth.kind, depth.lrz);
+    cb->setHsrClearEach(clearEach);
     cb->setHsrTest(twin, limit, gLinear);
     cb->setProfile(true);
     RenderPass pass;
@@ -547,7 +548,7 @@ int main(int argc, char** argv) {
                 uint64_t nMeant = 0, nTwin = 0;
                 differ(off.c0, meant.c0, sz.w, &nMeant);
                 differ(off.c0, twin7.c0, sz.w, &nTwin);
-                report(nMeant == 0, std::string("two passes on one LRZ, ") + kDepths[dk].name + " " + std::to_string(sz.w) + "x" + std::to_string(sz.h) + ", each clearing it: " +
+                report(nMeant == 0, std::string("two passes on one LRZ, ") + kDepths[dk].name + " " + std::to_string(sz.w) + "x" + std::to_string(sz.h) + ", as meant: " +
                                         std::to_string(nMeant) + " pixels of colour 0 differ");
                 std::printf("hsrcheck: lrz %s %ux%u: the second pass on the first's LRZ (twin 7) shows %llu pixels differing -- %s\n", kDepths[dk].name, sz.w, sz.h,
                             (unsigned long long)nTwin,
@@ -565,6 +566,45 @@ int main(int argc, char** argv) {
                 const std::vector<double>& on = timing[which][1 + dk];
                 if (on.empty()) continue;
                 std::printf(", %s %.1f / %.1f / %.1f", kDepths[dk].name, median(on), *std::min_element(on.begin(), on.end()), *std::max_element(on.begin(), on.end()));
+            }
+            std::printf("\n");
+        }
+    }
+    if (times) {
+        // What an HSR pass costs beside what it saves (anexo 32/03 E1): a pass of one small draw (a hundredth of the
+        // target, nothing to hide) and CoreAnimation's kind of pass, without HSR, with HSR on the depth's clock (cleared
+        // when new or spent: the default), and with a clear in every pass (setHsrClearEach, 03 M55's version), each the
+        // same picture as without HSR
+        const Scene small{"one small draw", {{kFlat, .45, .45, .1, .1}}};
+        std::vector<uint8_t> picture(750ull * 1624 * 4), picture1(picture.size());
+        std::mt19937 rng(7501624u);
+        for (auto& b : picture) b = uint8_t(rng());
+        for (auto& b : picture1) b = uint8_t(rng());
+        for (const Scene* s : {&small, &kScenes[kCaScene]}) {
+            std::vector<double> t[5];
+            const char* names[5] = {"without HSR", "D16 clock", "D16 clear each", "D16-UBWC clock", "D16-UBWC clear each"};
+            for (int rep = 0; rep < 2 * reps + 1; rep++) {
+                const Run off = runScene(rig, *s, 750, 1624, picture, picture1, false);
+                if (!off.c0.empty()) t[0].push_back(off.us);
+                for (int k = 0; k < 4; k++) {
+                    const size_t dk = k < 2 ? 1 : 3;   // (D16, D16-UBWC)
+                    if (!depthServed[dk]) continue;
+                    const Run on = runScene(rig, *s, 750, 1624, picture, picture1, true, kDepths[dk], 0, CommandBuffer::kHsrMaxDraws, 1, (k & 1) != 0);
+                    if (on.c0.empty() || off.c0.empty()) {
+                        report(false, std::string("time ") + s->name + " " + names[1 + k] + ": did not complete: " + on.why);
+                        continue;
+                    }
+                    uint64_t n0 = 0;
+                    differ(off.c0, on.c0, 750, &n0);
+                    if (rep == 0) report(n0 == 0, std::string("time ") + s->name + " " + names[1 + k] + ": " + std::to_string(n0) + " pixels of colour 0 differ");
+                    t[1 + k].push_back(on.us);
+                }
+            }
+            std::printf("hsrcheck: time %s at 750x1624, the pass's GPU time (us, median / min / max of %zu)", s->name, t[0].size());
+            for (int k = 0; k < 5; k++) {
+                if (t[k].empty()) continue;
+                std::printf("%s %s %.1f / %.1f / %.1f", k == 0 ? ":" : ",", names[k], median(t[k]), *std::min_element(t[k].begin(), t[k].end()),
+                            *std::max_element(t[k].begin(), t[k].end()));
             }
             std::printf("\n");
         }

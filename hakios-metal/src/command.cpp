@@ -465,10 +465,24 @@ void CommandBuffer::enqueue() {
     status_.compare_exchange_strong(expected, kEnqueued);
 }
 
+void CommandBuffer::hsrLetGo() {
+    for (auto& k : hsrHeld_) {
+        std::lock_guard<std::mutex> g(k->lock);
+        if (k->owner == this) k->owner = nullptr;
+    }
+    hsrHeld_.clear();
+    if (hsrClock_ == nullptr) return;
+    std::lock_guard<std::mutex> g(hsrClock_->lock);
+    if (hsrClock_->owner == this) hsrClock_->owner = nullptr;
+    hsrClock_ = nullptr;
+}
+
 void CommandBuffer::commit() {
     if (status_ > kEnqueued) {
         return;  // Metal asserts here; committing twice does nothing at all in this driver
     }
+    // (the HSR depth's clock to the next buffer only now: what this one drew with it is ahead of it in the queue)
+    hsrLetGo();
     queue_.submit(shared_from_this());
 }
 
@@ -479,6 +493,7 @@ void CommandBuffer::waitUntilCompleted() {
 }
 
 CommandBuffer::~CommandBuffer() {
+    hsrLetGo();   // (a buffer let go without a commit: its run of Z levels never reaches the GPU)
     // (a buffer never completed may be destroyed with the GPU still on it -- an error -- and its stamps are then not
     // given back; one that completed has had its readers)
     if (finished_) {
@@ -686,6 +701,7 @@ CommandQueue::HsrTarget CommandQueue::hsrDepth(uint32_t width, uint32_t height, 
     d.height = height;
     d.usage = kTextureUsageRenderTarget;
     HsrTarget t;
+    t.clock = std::make_shared<HsrClock>();
     t.depth = Texture::make(gpu_, d, why);
     if (t.depth == nullptr) return HsrTarget{};
     if (lrz) {

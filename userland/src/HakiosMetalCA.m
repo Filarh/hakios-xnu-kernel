@@ -7003,6 +7003,7 @@ HM_REFUSES_OUT_LOUD
 		_hsr = hsrMode == 1 || (hsrMode == 2 && __atomic_fetch_add(&hm_hsr_buffers, 1, __ATOMIC_RELAXED) % 2 == 0);
 		hakios_metal_cb_set_hsr(_cb, _hsr);
 		hakios_metal_cb_set_hsr_depth(_cb, hm_hsr_depth() & 3, (hm_hsr_depth() & 4) != 0);
+		hakios_metal_cb_set_hsr_clear_each(_cb, hm_hsr_clear_each());
 	}
 	_owesSlot = YES;
 	return self;
@@ -7622,6 +7623,25 @@ hm_hsr_depth(void)
 		}
 	});
 	return depth;
+}
+
+/* boot-arg metal_hsrclear=1: every HSR pass clears its depth as it opens and numbers its draws from 0 (the version of
+ * 03 M55, for an A/B against the default: the depth's Z levels running on from pass to pass, cleared when new or spent;
+ * hakios_metal_cb_set_hsr_clear_each) */
+static BOOL
+hm_hsr_clear_each(void)
+{
+	static dispatch_once_t once;
+	static BOOL each;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		each = hm_bootargs(args, &size) == 0 && strstr(args, "metal_hsrclear=1") != NULL;
+		if (each) hm_print("metal_hsrclear=1: each HSR pass clears its depth\n");
+	});
+	return each;
 }
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by

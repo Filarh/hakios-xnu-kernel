@@ -573,6 +573,9 @@ void hakios_metal_cb_set_hsr(hakios_metal_cb *cb, int on);
  * compressed; LRZ non-zero a low-resolution Z buffer beside it (the A610 alone) */
 void hakios_metal_cb_set_hsr_depth(hakios_metal_cb *cb, int kind, int lrz);
 /* what it did so far: the passes drawn with it, and their draws drawn in a prepass, tested, or as barriers */
+/* EACH 1: every HSR pass clears its depth and numbers its draws from 0 (CommandBuffer::setHsrClearEach, the version of
+ * 03 M55); 0, the default: the depth's Z levels run on from pass to pass and it is cleared only when new or spent */
+void hakios_metal_cb_set_hsr_clear_each(hakios_metal_cb *cb, int each);
 void hakios_metal_cb_hsr_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *opaque, unsigned *hidden, unsigned *barriers);
 /* How the process's command buffers take their draws from now on (CommandBuffer::keepStates, verifyDraws). KEEP 0:
  * each draw judged and written whole, as the first with its program is -- the stream is the same either way, so this is

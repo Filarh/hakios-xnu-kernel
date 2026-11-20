@@ -89,6 +89,17 @@ std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset);
 // handle is closed once, by the last owner. nullptr with *why.
 std::shared_ptr<Buffer> surfaceBuffer(Gpu& gpu, uint32_t surfaceId, SurfaceInfo* info, std::string* why);
 
+// A depth of setHsr's keeps its contents from pass to pass (anexo 32/03 P1): its Z levels are handed out in one
+// decreasing run over all the passes drawn with it, so what an earlier pass left there is always behind (a larger Z)
+// whatever a later pass draws, and is cleared only when it is new or the run has used kHsrMaxDraws levels. NEXT is the
+// next draw's place in the run; OWNER the command buffer drawing with it and not yet committed (one at a time, so
+// that the run's order is the order the GPU runs the buffers in: CommandBuffer::draw, commit).
+struct HsrClock {
+    std::mutex lock;
+    uint32_t next = 0;
+    bool fresh = true;              // never cleared: the first pass clears it
+    const void* owner = nullptr;
+};
 class CommandBuffer : public std::enable_shared_from_this<CommandBuffer> {
 public:
     enum Status { kNotEnqueued, kEnqueued, kCommitted, kScheduled, kCompleted, kError };
@@ -182,6 +193,7 @@ public:
         // setHsr's: the passes drawn with it, their draws by class (each drawn in the prepass, tested, or as a barrier),
         // and the prepasses written (segments that had an opaque draw)
         uint32_t hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0, hsrPrepasses = 0;
+        uint32_t hsrClears = 0, hsrBusy = 0;   // (HsrClock: the depth cleared as a pass opened; a draw without HSR, the clock another buffer's)
     };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -289,6 +301,10 @@ public:
         hsrKind_ = kind;
         hsrLrz_ = lrz;
     }
+    // EACH: every pass drawn with HSR clears its depth as it opens and numbers its draws from 0 (the version measured in
+    // M55, for an A/B); off, the depth's clock carries on from pass to pass (HsrClock) and a pass clears it only when the
+    // clock says so -- the default
+    void setHsrClearEach(bool each) { hsrClearEach_ = each; }
     static constexpr uint32_t kHsrMaxDraws = 32767;   // (render.cpp's hsrZ: Z_I's 16-bit level, 65533 - 2 I, at least 1 below it)
     // (for the tests) TWIN: a mutation of the stream the tests' rules must catch -- 1 the prepass left out (the hole
     // stays a NOP, the opaque draws still NOPs), 2 a barrier tested as a hidden draw, 3 an opaque draw that writes
@@ -351,6 +367,10 @@ private:
     uint32_t hsrLimit_ = kHsrMaxDraws;
     HsrDepth hsrKind_ = kHsrDepth16;   // setHsrDepth's
     bool hsrLrz_ = false;
+    bool hsrClearEach_ = false;
+    std::shared_ptr<HsrClock> hsrClock_;   // the clock this buffer owns (HsrClock::owner), let go at commit or destruction
+    std::vector<std::shared_ptr<HsrClock>> hsrHeld_;   // (an appended buffer's clocks of other depths, held the same way)
+    void hsrLetGo();
     // setHsr: a segment of the open pass begun (its hole, the shadow and the cursors forgotten), and ended (the hole made
     // the prepass's CP_INDIRECT_BUFFER when the segment had an opaque draw); false with the buffer failed
     void hsrOpenSegment();
@@ -587,6 +607,7 @@ public:
     struct HsrTarget {
         std::shared_ptr<Texture> depth;
         std::shared_ptr<Buffer> lrz;
+        std::shared_ptr<HsrClock> clock;
     };
     HsrTarget hsrDepth(uint32_t width, uint32_t height, std::string* why, uint8_t kind = 1, bool lrz = false);
     // (the screen's size and the odd other: CoreAnimation's compressed targets are its screens, all of one size; and

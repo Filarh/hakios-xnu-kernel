@@ -1113,7 +1113,21 @@ void lrzClearStream(pm4::Stream& stream, const Texture& depth, const Buffer& lrz
 // the depth attachment's Clear and the stencil attachment's, each when asked for (tu_clear_sysmem_attachment, each aspect in turn);
 // the depth's LRZ buffer cleared with it (Options::lrzClear)
 void zsClears(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o) {
-    if (pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) {
+    if (pass.depth != nullptr && pass.depthLoad == LoadAction::kClear && pass.depthHsr) {
+        // setHsr's depth: the fill, then what tu_clear_sysmem_attachment emits after a depth clear and no more
+        // (tu_clear_blit.cc:4480-4496: FD_CCU_CLEAN_COLOR, FD_CCU_CLEAN_DEPTH, FD_CCU_INVALIDATE_DEPTH, a WFI -- events
+        // not waited for: the clear is part of the pass and the WFI orders what follows); the application's depth keeps
+        // depthClearStream's waits
+        ClearWords c{};
+        c.ifmt = R2D_FLOAT32;
+        c.value[0] = fui(float(pass.clearDepth));
+        fillStream(stream, *pass.depth, c, TILE6_3, pass.depthLevel, pass.depthSlice);
+        eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, table + kTableDepthClearFlushAt, kDepthClearFlushValue, false);
+        eventTimestamp(stream, PC_CCU_FLUSH_DEPTH_TS, table + kTableDepthClearDepthFlushAt, kDepthClearDepthFlushValue, false);
+        event(stream, PC_CCU_INVALIDATE_DEPTH);
+        stream.waitForIdle();
+        if (pass.depthLrz != nullptr && o.lrzClear) lrzClearStream(stream, *pass.depth, *pass.depthLrz, pass.clearDepth, table);
+    } else if (pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) {
         depthClearStream(stream, *pass.depth, pass.clearDepth, table, pass.depthLevel, pass.depthSlice);
         if (pass.depthLrz != nullptr && o.lrzClear) lrzClearStream(stream, *pass.depth, *pass.depthLrz, pass.clearDepth, table);
     }
@@ -4478,7 +4492,24 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         const auto [W, H] = render::windowOf(given);
         std::string no;
         // (none to be had: the draw goes on without, a pass of its own)
-        const CommandQueue::HsrTarget ht = queue_.hsrDepth(W, H, &no, hsrKind_, hsrLrz_ && render::kLrzServed);
+        CommandQueue::HsrTarget ht = queue_.hsrDepth(W, H, &no, hsrKind_, hsrLrz_ && render::kLrzServed);
+        if (ht.depth != nullptr && !hsrClearEach_) {
+            // (the clock: this buffer's while it draws with it, until its commit; another buffer of the queue drawing
+            // meanwhile goes without HSR, so that the run of Z levels follows the order the GPU runs the buffers in)
+            std::lock_guard<std::mutex> g(ht.clock->lock);
+            if (ht.clock->owner == nullptr || ht.clock->owner == this) {
+                ht.clock->owner = this;
+                if (hsrClock_ != ht.clock) {
+                    // (a buffer drawing with two depths -- two sizes of target -- holds both until its commit: the
+                    // clock it leaves still has its run ahead of what another buffer would draw)
+                    if (hsrClock_ != nullptr) hsrHeld_.push_back(hsrClock_);
+                    hsrClock_ = ht.clock;
+                }
+            } else {
+                ht = CommandQueue::HsrTarget{};
+                counts_.hsrBusy++;
+            }
+        }
         hsrDepth = ht.depth;
         hsrLrz = ht.lrz;
         if (hsrDepth != nullptr) {
@@ -4489,6 +4520,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
             hsrPass.depthLoad = LoadAction::kLoad;
             hsrPass.depthStore = StoreAction::kDontCare;
             hsrPass.clearDepth = 1.0;
+            hsrPass.depthHsr = true;
         }
     }
     const bool hsr = hsrDepth != nullptr;
@@ -4522,8 +4554,24 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     render::HsrClass hsrClass = render::kHsrBarrier;
     bool hsrOpens = false;   // (it begins a segment: its hole, and the shadow and the cursors forgotten there)
     if (hsr) {
-        if (!joins) hsrPass.depthLoad = LoadAction::kClear;
-        const uint32_t i = joins ? open_->hsrDraws : 0;
+        uint32_t i = 0;
+        if (hsrClearEach_ || hsrClock_ == nullptr) {
+            // (every pass clears and counts from 0: M55's version)
+            if (!joins) hsrPass.depthLoad = LoadAction::kClear;
+            i = joins ? open_->hsrDraws : 0;
+        } else {
+            // the clock's run: a pass opens on what the earlier ones left (Load) unless the depth is new or the run is
+            // spent, and then clears and starts it again; each draw takes the run's next level
+            HsrClock& k = *hsrClock_;
+            std::lock_guard<std::mutex> g(k.lock);
+            if (!joins && (k.fresh || k.next >= hsrLimit_)) {
+                hsrPass.depthLoad = LoadAction::kClear;
+                k.fresh = false;
+                k.next = 0;
+                counts_.hsrClears++;
+            }
+            i = k.next < hsrLimit_ ? k.next++ : hsrLimit_;
+        }
         hsrDraw = givenDraw;
         if (i < hsrLimit_) {
             hsrClass = render::hsrClassOf(program, given, givenDraw, hsrTwin_);
@@ -5359,6 +5407,16 @@ bool CommandBuffer::append(CommandBuffer& other) {
     other.closePass(nullptr, true);
     appendStream(stream_, other.stream_);
     other.stream_ = pm4::Stream{};
+    // (OTHER's run of HSR Z levels now reaches the GPU with this buffer: the clock is this one's until its commit; a
+    // clock of another depth than this buffer's own is held the same way, the other then let go)
+    if (other.hsrClock_ != nullptr) {
+        std::shared_ptr<HsrClock> k = other.hsrClock_;
+        other.hsrClock_ = nullptr;
+        std::lock_guard<std::mutex> g(k->lock);
+        if (k->owner == &other) k->owner = this;
+        if (hsrClock_ == nullptr) hsrClock_ = k;
+        else if (hsrClock_ != k && k->owner == this) hsrHeld_.push_back(k);
+    }
     uses_.insert(uses_.end(), other.uses_.begin(), other.uses_.end());
     kept_.insert(kept_.end(), other.kept_.begin(), other.kept_.end());
     keptAny_.insert(keptAny_.end(), other.keptAny_.begin(), other.keptAny_.end());

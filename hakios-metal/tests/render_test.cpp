@@ -7563,6 +7563,116 @@ TEST(hsr_past_its_draw_limit_draws_the_rest_as_barriers) {
     CHECK(!hsrRules(off, on).empty());
 }
 
+// HsrClock (anexo 32/03 P1): the depth's Z levels run on from pass to pass and from command buffer to command buffer,
+// so only the first pass with a new depth clears it, and one again when the run is spent; while one command buffer
+// draws with the depth and has not committed, another of the queue goes without HSR (the run keeps the GPU's order);
+// setHsrClearEach brings back a clear in every pass.
+TEST(hsr_depth_is_cleared_once_and_its_levels_run_on_in_the_queues_order) {
+    Rig r;
+    auto t = target(r, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto u = target(r, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    RenderPass a, b;
+    a.color0 = t.get();
+    b.color0 = u.get();
+    Program flat = flatProgram();
+    flat.ssboWrites = 0;
+    render::Options o;
+    o.gmem = false;
+    auto drawsInto = [&](CommandBuffer& cb, const RenderPass& p, int n) {
+        for (int i = 0; i < n; i++) CHECK(cb.draw(flat, p, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, o));
+    };
+    auto hsrOn = [&](CommandBuffer& cb, uint32_t limit = CommandBuffer::kHsrMaxDraws) {
+        cb.setHsr(true);
+        cb.setHsrTest(0, limit, true);
+    };
+    {
+        // three passes into A (B between them) in one buffer, then a second buffer: one clear in all, every draw with HSR
+        auto cb = r.queue->commandBuffer();
+        hsrOn(*cb);
+        drawsInto(*cb, a, 3);
+        drawsInto(*cb, b, 2);
+        drawsInto(*cb, a, 3);
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(cb->counts().hsrClears, 1u);
+        CHECK_EQ(cb->counts().hsrPasses, 3u);
+        CHECK_EQ(cb->counts().hsrBusy, 0u);
+        auto cb2 = r.queue->commandBuffer();
+        hsrOn(*cb2);
+        drawsInto(*cb2, a, 2);
+        cb2->commit();
+        cb2->waitUntilCompleted();
+        CHECK(cb2->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(cb2->counts().hsrClears, 0u);
+        CHECK_EQ(cb2->counts().hsrPasses, 1u);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+    }
+    {
+        // two buffers drawing at once: the second, while the first has not committed, goes without HSR; after the
+        // first's commit a third has it again
+        auto c1 = r.queue->commandBuffer(), c2 = r.queue->commandBuffer();
+        hsrOn(*c1);
+        hsrOn(*c2);
+        drawsInto(*c1, a, 2);
+        drawsInto(*c2, a, 2);
+        CHECK_EQ(c2->counts().hsrPasses, 0u);
+        CHECK_EQ(c2->counts().hsrBusy, 2u);
+        c1->commit();
+        c2->commit();
+        c1->waitUntilCompleted();
+        c2->waitUntilCompleted();
+        CHECK(c1->status() == CommandBuffer::kCompleted && c2->status() == CommandBuffer::kCompleted);
+        auto c3 = r.queue->commandBuffer();
+        hsrOn(*c3);
+        drawsInto(*c3, a, 1);
+        CHECK_EQ(c3->counts().hsrPasses, 1u);
+        CHECK_EQ(c3->counts().hsrBusy, 0u);
+        c3->commit();
+        c3->waitUntilCompleted();
+    }
+    {
+        // a run spent (limit 4): the pass that finds it spent clears and starts it again; draws past it in the pass
+        // that spends it are barriers
+        Rig q;
+        auto v = target(q, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto w = target(q, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass pv, pw;
+        pv.color0 = v.get();
+        pw.color0 = w.get();
+        auto cb = q.queue->commandBuffer();
+        hsrOn(*cb, 4);
+        for (int i = 0; i < 6; i++) CHECK(cb->draw(flat, pv, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, o));
+        CHECK(cb->draw(flat, pw, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, o));
+        CHECK(cb->draw(flat, pv, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, o));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(cb->counts().hsrClears, 2u);
+        CHECK_EQ(cb->counts().hsrBarriers, 2u);
+        CHECK_EQ(q.fake->stats().faults, 0u);
+    }
+    {
+        // setHsrClearEach: every pass clears, as M55's version did
+        Rig q;
+        auto v = target(q, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto w = target(q, 96, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass pv, pw;
+        pv.color0 = v.get();
+        pw.color0 = w.get();
+        auto cb = q.queue->commandBuffer();
+        hsrOn(*cb);
+        cb->setHsrClearEach(true);
+        CHECK(cb->draw(flat, pv, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, o));
+        CHECK(cb->draw(flat, pw, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, o));
+        CHECK(cb->draw(flat, pv, wholeDraw(3, 96, 64), Bindings{}, Bindings{}, o));
+        CHECK_EQ(cb->counts().hsrPasses, 3u);
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+    }
+}
+
 // The prepass's draws are written from the facts the pass's draw is written from: taken from the programs' kept states
 // or judged the long way, the GPU runs every draw of the scene in the same state.
 TEST(hsr_kept_states_and_whole_draws_give_the_same_draws) {

@@ -310,6 +310,8 @@ struct RenderPass {
     // CommandBuffer::setHsrDepth's LRZ gives its passes alone. With one, a Clear of the depth clears it too, and each draw
     // tests it and writes it as its depth state allows (render.cpp: lrzCntl)
     const Buffer* depthLrz = nullptr;
+    // the depth is CommandBuffer::setHsr's: its Clear as turnip's sysmem clear, without the waits (render.cpp: zsClears)
+    bool depthHsr = false;
     // the stencil attachment (MTLRenderPassStencilAttachmentDescriptor): the depth texture itself when it is a
     // Depth32Float_Stencil8 one (its S8 plane), or none; Metal's defaults DontCare / DontCare / 0
     const Texture* stencil = nullptr;
