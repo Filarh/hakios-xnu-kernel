@@ -138,6 +138,16 @@ out/ios/hakios-metal-ycbcrcheck: tools/ycbcrcheck.cpp out/ios/libhakios-metal.a 
 	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/ycbcrcheck.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
 		-framework IOKit -framework CoreFoundation -framework IOSurface
 
+# the HSR check (tools/hsrcheck.cpp): the design's scenes drawn on the phone's GPU into a compressed target with hidden
+# surface removal by depth and without (CommandBuffer::setHsr), compared byte for byte, and its twins shown to differ
+# (its fixtures named, as the YCbCr check's)
+HSRCHECK_BC = tests/fixtures/tri_attr_vs_bc.hpp tests/fixtures/tri_base_vs_bc.hpp tests/fixtures/tri_cflat_fs_bc.hpp tests/fixtures/tri_color_fs_bc.hpp \
+	tests/fixtures/tri_dpos_vs_bc.hpp tests/fixtures/tri_fb_fs_bc.hpp tests/fixtures/tri_flat_vs_bc.hpp tests/fixtures/tri_kill_fs_bc.hpp tests/fixtures/tri_mrt_fs_bc.hpp
+out/ios/hakios-metal-hsrcheck: tools/hsrcheck.cpp out/ios/libhakios-metal.a $(HSRCHECK_BC) \
+		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
+	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/hsrcheck.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
+		-framework IOKit -framework CoreFoundation -framework IOSurface
+
 
 # a kernel's bitcode as a header, for a probe that compiles it on the phone (our own kernels only: tools/kernels/*.ll)
 tests/fixtures/%_bc.hpp: out/host/kernels/%.bc tools/bc-header.py

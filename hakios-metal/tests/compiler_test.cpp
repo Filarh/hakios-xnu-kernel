@@ -1621,3 +1621,34 @@ TEST(a_ycbcr_slot_is_converted_after_its_sample_and_filed_apart) {
     for (const std::string& n : listing(base, "")) remove((std::string(base) + "/" + n).c_str());
     rmdir(base);
 }
+
+// tri_kill_fs (hakios-metal-hsrcheck's draw that discards): compiled here, a fragment stage that says it discards
+// (Stage::hasKill, which keeps CommandBuffer::setHsr from taking its draw for an opaque one), writes colour 0, reads its
+// position and binds its constant buffer -- the same bitcode the phone compiles from tests/fixtures/tri_kill_fs_bc.hpp
+TEST(a_fragment_stage_that_discards_says_so) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: tri_kill_fs was not compiled)\n");
+        return;
+    }
+    std::vector<uint8_t> bc = bitcodeOf("tri_kill_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) {
+        std::printf("       out/host/kernels/tri_kill_fs.bc is missing (make test MESA=1 assembles it)\n");
+        return;
+    }
+    std::string why;
+    std::shared_ptr<CompiledStage> s = compileStage(bc.data(), bc.size(), &why);
+    CHECK(s != nullptr);
+    if (s == nullptr) {
+        std::printf("       tri_kill_fs: %s\n", why.c_str());
+        return;
+    }
+    CHECK_EQ(s->stage.kind, uint8_t(kStageFragment));
+    CHECK_EQ(s->stage.hasKill, uint8_t(1));
+    CHECK_EQ(s->stage.numColorOutputs, 1u);
+    CHECK(s->stage.colorRegid[0] != a6xx::kRegidNone);
+    CHECK(s->stage.fragCoordRegid != a6xx::kRegidNone);
+    CHECK(!s->writesMemory);
+    CHECK(s->listing.find("kill") != std::string::npos);
+    if (s->listing.find("kill") == std::string::npos) std::printf("%s\n", s->listing.c_str());
+}
