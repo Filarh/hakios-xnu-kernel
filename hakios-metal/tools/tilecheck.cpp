@@ -12,6 +12,9 @@
 //      blended draws and a store (GMEM); a Clear in the tiles and a store (GMEM) -- each stage read out by a 2D copy
 //      and by sampling into a linear texture, and the tiled and compressed results compared byte for byte with the
 //      linear one; and a random picture copied into the layout and back out, compared with itself
+//      The compressed target runs the sequence twice: as the driver runs it by default (its "GMEM" passes in sysmem:
+//      render::gmemPlan refuses a compressed attachment) and with CommandBuffer::setGmemCompressed (the plug-in's
+//      metal_gmemubwc=1), its GMEM passes then in as many tiles as the linear one's
 //   3. costs (GPU time by the CP's always-on counter around each pass, the median of N runs): a Clear of 756x1630; a
 //      full-screen draw, a blended one and a fetch at 752x1626; sampling it 1:1 into a linear target and at a quarter
 //      into a smaller one; a GMEM load and store of it; 2D copies out of it and into it
@@ -197,7 +200,10 @@ struct Run {
     uint32_t gmemTiles = 0;
 };
 
-Run runSequence(Gpu& gpu, CommandQueue& queue, const Programs& p, Layout l, PixelFormat f, uint32_t W, uint32_t H, const std::vector<uint8_t>& random) {
+// GMEM_UBWC: the GMEM passes' command buffers with setGmemCompressed (the plug-in's metal_gmemubwc=1); without it a
+// pass into a compressed target runs in sysmem (render::gmemPlan refuses it), and its "GMEM" stages are sysmem ones
+Run runSequence(Gpu& gpu, CommandQueue& queue, const Programs& p, Layout l, PixelFormat f, uint32_t W, uint32_t H, const std::vector<uint8_t>& random,
+                bool gmemUbwc = false) {
     Run r;
     auto t = makeTexture(gpu, l, f, W, H, &r.why);
     std::shared_ptr<Texture> lin[5];
@@ -259,6 +265,7 @@ Run runSequence(Gpu& gpu, CommandQueue& queue, const Programs& p, Layout l, Pixe
         gp.color0 = t.get();
         auto cb = queue.commandBuffer();
         cb->setProfile(true);
+        cb->setGmemCompressed(gmemUbwc);
         bool ok = cb->draw(p.over, gp, drawOf(6, 0, H / 4, W, H / 8), Bindings{}, cb0) && cb->draw(p.over, gp, drawOf(6, W / 4, 0, W / 8, H), Bindings{}, cb0);
         if (!ok) { r.why = "GMEM draws: " + cb->error(); return r; }
         if (!submit(*cb, "GMEM load and store")) return r;
@@ -275,6 +282,7 @@ Run runSequence(Gpu& gpu, CommandQueue& queue, const Programs& p, Layout l, Pixe
         gp.clearColor[0] = 0.1, gp.clearColor[1] = 0.2, gp.clearColor[2] = 0.3, gp.clearColor[3] = 0.4;
         auto cb = queue.commandBuffer();
         cb->setProfile(true);
+        cb->setGmemCompressed(gmemUbwc);
         bool ok = cb->draw(p.color, gp, drawOf(6, W / 5, H / 5, W / 2, H / 2), Bindings{}, Bindings{}) &&
                   cb->draw(p.over, gp, drawOf(6, W / 3, H / 3, W / 3, H / 3), Bindings{}, cb0);
         if (!ok) { r.why = "GMEM clear: " + cb->error(); return r; }
@@ -371,10 +379,18 @@ int main(int argc, char** argv) {
             uint64_t n = 0;
             differ(ref.out[4], random, s.w, &n);
             report(n == 0, at + " linear: a random picture copied in and out unchanged (" + std::to_string(n) + " pixels differ)");
-            for (const Layout l : {kTiled, kUbwc}) {
+            // (UBWC twice: as the driver runs it by default, its GMEM passes in sysmem since render::gmemPlan refuses a
+            // compressed target, and with setGmemCompressed -- metal_gmemubwc=1 -- in as many tiles as the linear one)
+            struct Case {
+                Layout l;
+                bool gmemUbwc;
+                const char* name;
+            };
+            for (const Case cs : {Case{kTiled, false, "tiled"}, Case{kUbwc, false, "ubwc"}, Case{kUbwc, true, "ubwc+gmemubwc"}}) {
+                const Layout l = cs.l;
                 if (l == kUbwc && !ubwc) continue;
-                const Run got = runSequence(gpu, *queue, p, l, f, s.w, s.h, random);
-                const std::string who = at + " " + kLayoutName[l];
+                const Run got = runSequence(gpu, *queue, p, l, f, s.w, s.h, random, cs.gmemUbwc);
+                const std::string who = at + " " + cs.name;
                 if (got.out[4].empty()) {
                     report(false, who + ": did not complete: " + got.why + " (FAULTS " + std::to_string(gpu.faults()) + ")");
                     continue;
@@ -386,8 +402,13 @@ int main(int argc, char** argv) {
                     const std::string first = differ(k == 4 ? random : ref.out[k], got.out[k], s.w, &n);
                     report(n == 0, who + ": " + kStage[k] + ": " + std::to_string(n) + " pixels differ from " + (k == 4 ? "the picture" : "linear") + first);
                 }
-                report(got.gmemTiles > 0 || ref.gmemTiles == 0, who + ": the GMEM passes ran in " + std::to_string(got.gmemTiles) + " tiles (linear " +
-                                                                    std::to_string(ref.gmemTiles) + ")");
+                if (l == kUbwc && !cs.gmemUbwc) {
+                    report(got.gmemTiles == 0, who + ": the GMEM passes ran in sysmem as the driver runs a compressed target by default (" +
+                                                   std::to_string(got.gmemTiles) + " tiles)");
+                } else {
+                    report(got.gmemTiles == ref.gmemTiles && (got.gmemTiles > 0 || ref.gmemTiles == 0),
+                           who + ": the GMEM passes ran in " + std::to_string(got.gmemTiles) + " tiles (linear " + std::to_string(ref.gmemTiles) + ")");
+                }
             }
         }
         // costs, BGRA8 alone (what CoreAnimation draws)
@@ -448,6 +469,7 @@ int main(int argc, char** argv) {
                 {"GMEM load+store 752x1626 (2 small draws)", [&](CommandBuffer& cb) {
                      // (the whole window tiled, whatever the two draws touch: every bin loaded and stored)
                      cb.setGmemOff(CommandBuffer::kGmemWholeArea);
+                     cb.setGmemCompressed(true);   // (a compressed target too: metal_gmemubwc=1's path)
                      return cb.draw(p.over, onT, drawOf(6, 0, 0, 16, 16), Bindings{}, cb0) && cb.draw(p.over, onT, drawOf(6, W - 16, H - 16, 16, 16), Bindings{}, cb0);
                  }},
                 {"copy out to linear (2D)", [&](CommandBuffer& cb) { return cb.blit(*t, 0, all, *out1, 0, all, false); }},
@@ -476,6 +498,9 @@ int main(int argc, char** argv) {
                 if (!err.empty() || us.empty()) {
                     report(false, std::string("costs: ") + kLayoutName[l] + " " + op.name + ": " + err);
                     continue;
+                }
+                if (strstr(op.name, "GMEM") != nullptr && tiles == 0) {
+                    report(false, std::string("costs: ") + kLayoutName[l] + " " + op.name + ": ran in sysmem, not in tiles");
                 }
                 std::printf("tilecheck: time %-6s %-42s median %8.1f us  min %8.1f  max %8.1f  n %zu%s\n", kLayoutName[l], op.name, median(us),
                             *std::min_element(us.begin(), us.end()), *std::max_element(us.begin(), us.end()), us.size(),
