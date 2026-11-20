@@ -161,6 +161,22 @@ hm_bootargs(char *args, size_t *size)
 	return 0;
 }
 static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int hm_asklog_fd = -1;    /* metal_asklog=1: the file hm_print also writes (-1: none) */
+static pthread_once_t hm_asklog_once = PTHREAD_ONCE_INIT;
+
+static void
+hm_asklog_open(void)
+{
+	char args[4096];
+	size_t size = sizeof(args);
+
+	if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_asklog=1") != NULL) {
+		char path[160];
+
+		snprintf(path, sizeof(path), "/var/tmp/metal-log-%s-%d.txt", getprogname(), getpid());
+		hm_asklog_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	}
+}
 static int hm_print_fd = -1;    /* where hm_print writes: stderr, the console, or (metal_m2v=1) a copy of stderr kept aside */
 
 /* To stderr, as one write: a launchd job's stderr is the console (userland/mkjobs.py sets StandardErrorPath) and its
@@ -202,6 +218,11 @@ hm_print(const char *fmt, ...)
 		hm_print_fd = fd;
 		(void)!write(fd, line, strlen(line));
 	}
+	/* boot-arg metal_asklog=1: every line also appended to /var/tmp/metal-log-PROGRAM-PID.txt, which outlives the window
+	 * server's restart (a console taken with conscat does not) and is there for an application whose console line is
+	 * lost; what Metal asks of this plug-in and it refuses is read from there */
+	pthread_once(&hm_asklog_once, hm_asklog_open);
+	if (hm_asklog_fd >= 0) (void)!write(hm_asklog_fd, line, strlen(line));
 }
 
 /* a sentence that is true every time and says nothing new after the first */
@@ -3710,6 +3731,13 @@ hm_boot_arg_set(const char *what)
  * to accept it; a buffer longer than the kernel gives is refused at -newBufferWithLength:options:, with the reason. */
 - (uint64_t)maxBufferLength { return 256ULL << 20; }
 
+/* The sample counts a texture and a render pipeline take here: 1, 2 and 4 (texture.cpp's multisample rule; the
+ * pipeline's rasterSampleCount check). Not implemented, both answered NO through the zero stub -- also for 1 -- and
+ * Photos asks -supportsSampleCount: when it starts (PhotosUICore; console, 20 November); MetalKit and applications ask
+ * -supportsTextureSampleCount: before they choose a multisample target. */
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count { return count == 1 || count == 2 || count == 4; }
+- (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1 || count == 2 || count == 4; }
+
 /* profile 0's own maxVertexAmplificationCount is 1 */
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count <= 1; }
 
@@ -5718,8 +5746,23 @@ HM_REFUSES_OUT_LOUD
 		const unsigned n = ++refused;
 
 		if (n <= 8 || n % 100 == 0) {
-			hm_print("refused: a no-copy buffer of %lu bytes at %p (%u so far): %s; nil (QuartzCore then uploads the image)\n",
-				 (unsigned long)length, bytes, n, hakios_metal_error());
+			/* what the memory is, as this process's map has it: its protection now and at most, who made it (the
+			 * VM_MEMORY_* tag) and how it is shared -- the kernel takes it for the GPU only if it can wire it */
+			vm_address_t at = (vm_address_t)bytes;
+			vm_size_t size = 0;
+			natural_t depth = 0;
+			struct vm_region_submap_info_64 info;
+			mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+			char region[160] = "region unknown";
+
+			if (vm_region_recurse_64(mach_task_self(), &at, &size, &depth, (vm_region_recurse_info_64_t)&info, &count) == KERN_SUCCESS &&
+			    at <= (vm_address_t)bytes) {
+				snprintf(region, sizeof(region), "region %#llx+%#llx prot %d/%d tag %u share %u%s", (unsigned long long)at,
+					 (unsigned long long)size, info.protection, info.max_protection, info.user_tag, info.share_mode,
+					 info.is_submap ? " submap" : "");
+			}
+			hm_print("refused: a no-copy buffer of %lu bytes at %p (%u so far; %s): %s; nil (QuartzCore then uploads the image)\n",
+				 (unsigned long)length, bytes, n, region, hakios_metal_error());
 		}
 		[self release];
 		return nil;
