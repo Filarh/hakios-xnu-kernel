@@ -801,6 +801,7 @@ bool Texture::readSlices(uint32_t level, uint32_t x, uint32_t y, uint32_t z, uin
 }
 
 a6xx::TexConst Texture::sampledDescriptor() const {
+    if (override_ != nullptr) return *override_;
     // PITCHALIGN = log2(pitch alignment / 64) = log2(cpp) for the pitch texturePitch chose (fd6_layout.c:194-201, fd6_view.c:244);
     // a surface's rows carry the alignment their pitch has, wrapSurface worked it out
     a6xx::TexConst d = texture2d(gpuAddress(), desc_.width, desc_.height, uint32_t(pitch_), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),

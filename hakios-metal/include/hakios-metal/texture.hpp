@@ -343,6 +343,13 @@ public:
     // DEPTH 1, ARRAY_PITCH the layer's bytes, the format's swap and swizzle (fd6_view.c:232-250)
     // (with mip levels: all of them, MIPLVLS levels - 1 and the layer the whole of them, fd6_view.c:232-250)
     a6xx::TexConst sampledDescriptor() const;
+    // The check tools' own (hakios-metal-ycbcrcheck --diag): every draw from now on samples the texture through D instead
+    // of the descriptor worked out from its layout, to try a variant of it on the phone's texture unit. Called before
+    // the texture is first drawn; nothing of the driver calls it.
+    void overrideSampledDescriptor(const a6xx::TexConst& d) {
+        override_ = std::make_unique<a6xx::TexConst>(d);
+        sampledState_.store(0);
+    }
     // ...its sixteen words, worked out once and kept: they are the texture's for as long as it lives (its memory, its
     // size, its format and its swizzle are fixed when it is made), and a draw that samples it copies them into its table
     // -- working them out again for every texture of every draw was a draw's stageTextures
@@ -384,6 +391,7 @@ private:
     mutable std::atomic<bool> stale_{false};
     mutable std::atomic<uint8_t> sampledState_{0};   // sampledWords': 0 not worked out, 1 being written, 2 there
     mutable uint32_t sampledWords_[16];
+    std::unique_ptr<a6xx::TexConst> override_;   // overrideSampledDescriptor's
 public:
     const Texture* staging() const { return staging_.get(); }
     bool takeStale() const { return stale_.exchange(false); }   // true once a draw is to copy the rows in

@@ -4,18 +4,22 @@
 // cpuConvert), and what each costs. It runs the driver's core on the phone's GPU from a process of its own (the
 // kernel's msm client, as hakios-metal-probe and hakios-metal-tilecheck do: no Metal, no CoreAnimation, nothing of the
 // window server touched), compiles its shaders there with the driver's compiler (tools/kernels/*.ll as bitcode: the
-// YCbCr conversion is compileStage's, for the A610), and reads results back from LINEAR RGBA8 targets only.
+// YCbCr conversion is compileStage's, for the A610), and reads results back from LINEAR RGBA8 targets only. Pixel
+// (x, y) samples texel (x, y): tri_ptex and tri_hptex take the coordinate from the fragment's position (tri_tex takes
+// tri_color_vs's colour, barycentric weights, which draws a picture of the texture but not texel by texel).
 //
 //   1. layout: for each size, a surface with the planes IOSurface lays out by itself (its own pitches and offsets: are
 //      they the 64 bytes the texture unit needs?) and one with both planes' rows and starts set to 64 bytes
 //   2. correctness, per size (64x64, 751x1625, 750x1624 -- the app snapshot's --, 1920x1080), FourCC ('420f', '420v')
 //      and picture (ramps of Y, Cb and Cr, random, both planes zero, chroma 0, chroma 255, the probe's 20/60/a0):
-//      sampled 1:1 with a nearest sampler by tri_tex into a linear target and compared with the processor's conversion:
-//      540 byte for byte (0 bytes differ), 500 within one step of 8 bits in every channel at fp32 (tri_tex) and half
-//      (tri_htex: CoreAnimation's _lph functions sample as half), BT.601 and BT.709 (and BT.2020 at 64x64)
+//      sampled with a nearest sampler at each pixel's own texel by tri_ptex into a linear target and compared with the
+//      processor's conversion:
+//      540 byte for byte (0 bytes differ), 500 within one step of 8 bits in every channel at fp32 (tri_ptex) and half
+//      (tri_hptex: CoreAnimation's _lph functions sample as half), BT.601 and BT.709 (and BT.2020 at 64x64)
 //   3. coherence (19 N-05): the planes written by the processor after the draw is encoded and before it is committed:
 //      the result is the new picture
-//   4. filtering, said and not judged: a picture whose chroma alternates by column, magnified 2x with a linear sampler:
+//   4. filtering, said and not judged: a picture whose chroma alternates by column, magnified by tri_tex with a linear
+//      sampler:
 //      whether the texture unit interpolates the chroma (CHROMA_LINEAR has no effect before a6xx_gen3), cosited and
 //      with the siting midpoint
 //   5. costs (GPU time by the CP's always-on counter, the median of N runs) at 750x1624: 500 sampled 1:1 from the
@@ -26,6 +30,15 @@
 // and a last line with the count; the exit status is the number of failures (100: no GPU).
 //
 //   hakios-metal-ycbcrcheck [--reps N] [--no-time] [--quick]   (--quick: 64x64 and 750x1624 alone)
+//   hakios-metal-ycbcrcheck --diag
+//
+// --diag, instead of the above: where the texture unit reads each pixel from. Both planes are filled with their own
+// byte offsets (the luma byte at offset k holds k's low byte in one draw and its high byte in the next; the chroma
+// sample m, row by row in the plane's own pitch, holds m in Cb and Cr), so every pixel drawn says which luma byte and
+// which chroma sample it was given. At 64x64 (pitch = width) and 96x64 (pitch 128), for the two-plane texture as the
+// plug-in makes it, unswizzled, with TILE_ALL, with SWAP XYZW, and for the two planes read as plain R8 and RG8 textures
+// over the same memory: the descriptor's sixteen words, how many pixels read their own luma byte and their own chroma
+// sample, rows 0-2 and column 0 decoded, and a row of 540's wanted and obtained values on the ramps.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -40,11 +53,13 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
 
+#include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/compiler.hpp"
 #include "hakios-metal/texture.hpp"
 #include "../tests/fixtures/tri_color_vs_bc.hpp"
-#include "../tests/fixtures/tri_htex_fs_bc.hpp"
+#include "../tests/fixtures/tri_hptex_fs_bc.hpp"
+#include "../tests/fixtures/tri_ptex_fs_bc.hpp"
 #include "../tests/fixtures/tri_tex_fs_bc.hpp"
 
 using namespace hakios::metal;
@@ -257,14 +272,16 @@ std::shared_ptr<Texture> ycbcrTexture(Gpu& gpu, IOSurfaceRef s, uint8_t siting, 
 
 struct Programs {
     std::shared_ptr<CompiledStage> vs;
-    std::map<std::pair<int, uint64_t>, std::shared_ptr<CompiledProgram>> made;   // by (half, YCbCr word)
-    // tri_tex (HALF: tri_htex) compiled with WORD for slot 0, linked for RGBA8
-    const Program* get(bool half, uint64_t word, std::string* why) {
-        auto key = std::make_pair(half ? 1 : 0, word);
+    std::map<std::pair<int, uint64_t>, std::shared_ptr<CompiledProgram>> made;   // by (shader, YCbCr word)
+    // tri_ptex (HALF 1: tri_hptex; 2: tri_tex, barycentric) compiled with WORD for slot 0, linked for RGBA8: with the
+    // first two, pixel (x, y) samples texel (x, y)
+    const Program* get(int half, uint64_t word, std::string* why) {
+        auto key = std::make_pair(half, word);
         auto it = made.find(key);
         if (it != made.end()) return it->second ? &it->second->program : nullptr;
-        std::shared_ptr<CompiledStage> fs(half ? compileStage(kernels::tri_htex_fs_bc, kernels::tri_htex_fs_bc_size, why, {}, 0, nullptr, word)
-                                               : compileStage(kernels::tri_tex_fs_bc, kernels::tri_tex_fs_bc_size, why, {}, 0, nullptr, word));
+        std::shared_ptr<CompiledStage> fs(half == 2 ? compileStage(kernels::tri_tex_fs_bc, kernels::tri_tex_fs_bc_size, why, {}, 0, nullptr, word)
+                                          : half ? compileStage(kernels::tri_hptex_fs_bc, kernels::tri_hptex_fs_bc_size, why, {}, 0, nullptr, word)
+                                                 : compileStage(kernels::tri_ptex_fs_bc, kernels::tri_ptex_fs_bc_size, why, {}, 0, nullptr, word));
         std::shared_ptr<CompiledProgram> p = fs != nullptr ? std::shared_ptr<CompiledProgram>(linkProgram(vs, fs, PixelFormat::kRGBA8Unorm, why)) : nullptr;
         made[key] = p;
         return p ? &p->program : nullptr;
@@ -346,15 +363,212 @@ double median(std::vector<double> v) {
 
 const char* modelName(int model) { return model == 1 ? "BT.601" : model == 2 ? "BT.709" : "BT.2020"; }
 
+
+// --- --diag ---------------------------------------------------------------------------------------------------------
+
+// both planes filled with their own offsets: luma byte k = k's low byte (HIGH: its high byte), over the whole pitch;
+// chroma sample m (row * pitch / 2 + column) = Cb m's low byte, Cr its high byte
+void fillOffsets(IOSurfaceRef s, bool high) {
+    IOSurfaceLock(s, 0, nullptr);
+    const size_t H = IOSurfaceGetHeightOfPlane(s, 0), ch = IOSurfaceGetHeightOfPlane(s, 1);
+    const size_t r0 = IOSurfaceGetBytesPerRowOfPlane(s, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(s, 1);
+    auto* y = static_cast<uint8_t*>(IOSurfaceGetBaseAddressOfPlane(s, 0));
+    auto* c = static_cast<uint8_t*>(IOSurfaceGetBaseAddressOfPlane(s, 1));
+    for (size_t k = 0; k < r0 * H; k++) y[k] = uint8_t(high ? k >> 8 : k);
+    for (size_t m = 0; m < r1 / 2 * ch; m++) {
+        c[2 * m] = uint8_t(m);
+        c[2 * m + 1] = uint8_t(m >> 8);
+    }
+    IOSurfaceUnlock(s, 0, nullptr);
+}
+
+void printDescriptor(const char* what, const a6xx::TexConst& d) {
+    std::string w;
+    for (int i = 0; i < 16; i++) {
+        char t[12];
+        std::snprintf(t, sizeof t, "%s%08x", i ? " " : "", d.dword[i]);
+        w += t;
+    }
+    std::printf("ycbcrcheck: diag %s descriptor: %s\n", what, w.c_str());
+}
+
+// the channels a pixel's luma and chroma come back in: KIND 0 the plug-in's (Cr, Y, Cb, 1), 1 the unswizzled planes
+// (Y, Cb, Cr, 1), 2 plane 0 as R8 (Y), 3 plane 1 as RG8 (Cb, Cr)
+struct Decoded {
+    int luma = -1, chroma = -1;
+};
+Decoded decodeAt(const std::vector<uint8_t>& lo, const std::vector<uint8_t>& hi, size_t p, int kind) {
+    const uint8_t* a = &lo[4 * p];
+    const uint8_t* b = &hi[4 * p];
+    Decoded d;
+    switch (kind) {
+    case 0: d.luma = b[1] << 8 | a[1], d.chroma = a[0] << 8 | a[2]; break;
+    case 1: d.luma = b[0] << 8 | a[0], d.chroma = a[2] << 8 | a[1]; break;
+    case 2: d.luma = b[0] << 8 | a[0]; break;
+    case 3: d.chroma = a[1] << 8 | a[0]; break;
+    }
+    return d;
+}
+
+void runDiag(Gpu& gpu, CommandQueue& queue, Programs& progs, const Sampler& nearest) {
+    std::string why;
+    const Program* plain = progs.get(false, 0, &why);
+    if (plain == nullptr) {
+        report(false, "diag: tri_ptex compiled here: " + why);
+        return;
+    }
+    struct Size {
+        uint32_t w, h;
+    };
+    for (const Size sz : {Size{64, 64}, Size{96, 64}}) {
+        IOSurfaceRef s = makeSurface(sz.w, sz.h, k420f, true);
+        if (s == nullptr) {
+            report(false, "diag: a two-plane surface of " + std::to_string(sz.w) + "x" + std::to_string(sz.h));
+            continue;
+        }
+        const Layout l = layoutOf(s);
+        const uint32_t W = sz.w, H = sz.h, cw = (W + 1) / 2, ch = (H + 1) / 2;
+        const uint32_t p0 = uint32_t(l.row0), p1c = uint32_t(l.row1 / 2);
+        std::printf("ycbcrcheck: diag ---- '420f' %ux%u: plane 0 %u bytes a row, plane 1 at +%llu, %zu bytes a row\n", W, H, p0,
+                    (unsigned long long)l.chromaOffset, l.row1);
+        struct Variant {
+            const char* name;
+            int kind;
+            std::function<std::shared_ptr<Texture>()> make;
+        };
+        auto nv12 = [&](bool swizzled) {
+            std::string w;
+            auto t = ycbcrTexture(gpu, s, 0, &w);
+            if (t != nullptr && !swizzled) {
+                const uint8_t rgba[4] = {2, 3, 4, 5};
+                t = Texture::swizzled(t, rgba, &w);   // (over the swizzled one: identity on top of it is not what is wanted)
+            }
+            return t;
+        };
+        auto planes = [&]() {
+            std::string w;
+            const Layout ll = layoutOf(s);
+            Texture::SurfacePlane chroma{ll.chromaOffset, uint32_t(ll.row1)};
+            TextureDesc d;
+            d.format = PixelFormat::kYCbCr8_420_2P;
+            d.width = W;
+            d.height = H;
+            d.usage = kTextureUsageRead;
+            return Texture::wrapSurface(gpu, IOSurfaceGetID(s), d, &w, &chroma);
+        };
+        auto overridden = [&](std::function<void(a6xx::TexConst&)> change) {
+            auto t = planes();
+            if (t != nullptr) {
+                a6xx::TexConst d = t->sampledDescriptor();
+                change(d);
+                t->overrideSampledDescriptor(d);
+            }
+            return t;
+        };
+        auto plain8 = [&](bool chromaPlane) -> std::shared_ptr<Texture> {
+            auto t = planes();
+            if (t == nullptr) return nullptr;
+            TextureDesc d;
+            d.format = chromaPlane ? PixelFormat::kRG8Unorm : PixelFormat::kR8Unorm;
+            d.width = chromaPlane ? cw : W;
+            d.height = chromaPlane ? ch : H;
+            d.usage = kTextureUsageRead;
+            std::string w;
+            auto r = Texture::overBuffer(t->buffer(), chromaPlane ? l.chromaOffset : l.offset0, chromaPlane ? l.row1 : l.row0, d, &w);
+            if (r == nullptr) std::printf("ycbcrcheck: diag %s over the surface's memory: %s\n", chromaPlane ? "RG8" : "R8", w.c_str());
+            return r;
+        };
+        // (the unswizzled planes: the texture as wrapTwoPlanes makes it, before the plug-in's swizzle)
+        const std::vector<Variant> variants = {
+            {"nv12 as the plug-in makes it (Cr, Y, Cb, 1)", 0, [&] { return nv12(true); }},
+            {"nv12 unswizzled (Y, Cb, Cr, 1)", 1, [&] { return planes(); }},
+            {"nv12 unswizzled, TILE_ALL", 1, [&] { return overridden([](a6xx::TexConst& d) { d.dword[3] |= a6xx::A6XX_TEX_CONST_3_TILE_ALL; }); }},
+            {"nv12 unswizzled, SWAP XYZW", 1, [&] {
+                 return overridden([](a6xx::TexConst& d) {
+                     d.dword[0] = (d.dword[0] & ~a6xx::A6XX_TEX_CONST_0_SWAP__MASK) | a6xx::A6XX_TEX_CONST_0_SWAP(a6xx::XYZW);
+                 });
+             }},
+            {"plane 0 as R8Unorm", 2, [&] { return plain8(false); }},
+            {"plane 1 as RG8Unorm", 3, [&] { return plain8(true); }},
+        };
+        for (const Variant& v : variants) {
+            auto t = v.make();
+            if (t == nullptr) {
+                report(false, std::string("diag: ") + v.name + ": no texture");
+                continue;
+            }
+            printDescriptor(v.name, t->sampledDescriptor());
+            std::vector<uint8_t> lo, hi;
+            std::string swhy;
+            fillOffsets(s, false);
+            bool ok = sample(gpu, queue, *plain, *t, nearest, W, H, &lo, &swhy);
+            fillOffsets(s, true);
+            ok = ok && sample(gpu, queue, *plain, *t, nearest, W, H, &hi, &swhy);
+            if (!ok) {
+                report(false, std::string("diag: ") + v.name + ": " + swhy);
+                continue;
+            }
+            uint32_t lumaRight = 0, chromaRight = 0;
+            for (uint32_t y = 0; y < H; y++) {
+                for (uint32_t x = 0; x < W; x++) {
+                    const Decoded d = decodeAt(lo, hi, size_t(y) * W + x, v.kind);
+                    lumaRight += d.luma == int(y * p0 + x);
+                    chromaRight += d.chroma == int((y / 2) * p1c + x / 2);
+                }
+            }
+            info(std::string("diag ") + v.name + ": " + (v.kind == 3 ? "-" : std::to_string(lumaRight)) + " pixels of " + std::to_string(W * H) +
+                 " read their own luma byte, " + (v.kind == 2 ? "-" : std::to_string(chromaRight)) + " their own chroma sample");
+            auto at = [&](uint32_t x, uint32_t y) {
+                const Decoded d = decodeAt(lo, hi, size_t(y) * W + x, v.kind);
+                char t[64];
+                std::string luma = d.luma < 0 ? "-" : std::to_string(d.luma % p0) + "," + std::to_string(d.luma / p0);
+                std::string chroma = d.chroma < 0 ? "-" : std::to_string(d.chroma % p1c) + "," + std::to_string(d.chroma / p1c);
+                std::snprintf(t, sizeof t, " %u,%u:Y(%s)C(%s)", x, y, luma.c_str(), chroma.c_str());
+                return std::string(t);
+            };
+            for (uint32_t y = 0; y < 3; y++) {
+                std::string row;
+                for (uint32_t x = 0; x < 16; x++) row += at(x, y);
+                std::printf("ycbcrcheck: diag   row %u:%s\n", y, row.c_str());
+            }
+            std::string col;
+            for (uint32_t y = 0; y < 8; y++) col += at(0, y);
+            std::printf("ycbcrcheck: diag   column 0:%s\n", col.c_str());
+            if (v.kind == 0 && W == 64) {
+                // 540 on the ramps, as the check compares it: a row of wanted and obtained values
+                fill(s, kRamps, 0);
+                std::vector<uint8_t> got;
+                if (sample(gpu, queue, *plain, *t, nearest, W, H, &got, &swhy)) {
+                    const std::vector<uint8_t> want = cpuConvert(s, W, H, 1, true, true);
+                    for (uint32_t y = 0; y < 2; y++) {
+                        std::string g, w;
+                        for (uint32_t x = 0; x < 16; x++) {
+                            char a[16], b[16];
+                            const size_t p = (size_t(y) * W + x) * 4;
+                            std::snprintf(a, sizeof a, " %02x%02x%02x", got[p], got[p + 1], got[p + 2]);
+                            std::snprintf(b, sizeof b, " %02x%02x%02x", want[p], want[p + 1], want[p + 2]);
+                            g += a;
+                            w += b;
+                        }
+                        std::printf("ycbcrcheck: diag   540 ramps row %u want:%s\nycbcrcheck: diag   540 ramps row %u got: %s\n", y, w.c_str(), y, g.c_str());
+                    }
+                }
+            }
+        }
+        CFRelease(s);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     int reps = 7;
-    bool times = true, quick = false;
+    bool times = true, quick = false, diag = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--reps") == 0 && i + 1 < argc) reps = std::max(1, atoi(argv[++i]));
         if (strcmp(argv[i], "--no-time") == 0) times = false;
         if (strcmp(argv[i], "--quick") == 0) quick = true;
+        if (strcmp(argv[i], "--diag") == 0) diag = true;
     }
     std::string why;
     auto transport = openKernelGpu(&why);
@@ -387,6 +601,12 @@ int main(int argc, char** argv) {
     SamplerDesc bd;
     bd.minFilter = bd.magFilter = 1;
     makeSampler(bd, &bilinear, &why);
+    if (diag) {
+        runDiag(gpu, *queue, progs, nearest);
+        report(gpu.faults() == faults0, "no GPU reset during the run (FAULTS " + std::to_string(faults0) + " -> " + std::to_string(gpu.faults()) + ")");
+        std::printf("ycbcrcheck: %d failure(s)\n", failures);
+        return failures;
+    }
 
     struct Size {
         uint32_t w, h;
@@ -505,7 +725,7 @@ int main(int argc, char** argv) {
             for (const uint8_t siting : {uint8_t(0), uint8_t(3)}) {
                 std::string twhy;
                 auto t = ycbcrTexture(gpu, s, siting, &twhy);
-                const Program* p = progs.get(false, 0, &twhy);
+                const Program* p = progs.get(2, 0, &twhy);   // (tri_tex: a coordinate that is not the pixel's, across 128 pixels)
                 std::vector<uint8_t> got;
                 if (t == nullptr || p == nullptr || !sample(gpu, *queue, *p, *t, bilinear, 128, 128, &got, &twhy)) {
                     report(false, "filtering: " + twhy);
