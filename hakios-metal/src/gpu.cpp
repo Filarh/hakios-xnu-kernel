@@ -1,5 +1,6 @@
 #include "hakios-metal/gpu.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 
@@ -103,8 +104,21 @@ std::atomic<bool> gAnnounceCpu{true};
 
 void setCpuAccessAnnounced(bool on) { gAnnounceCpu.store(on, std::memory_order_relaxed); }
 
+// (GEM_CPU_PREP waits for the GPU to be done with the surface: how many and how long, for metal_fps's long gaps)
+std::atomic<uint64_t> gCpuPreps{0}, gCpuPrepNs{0};
+
+void cpuPrepCounts(uint64_t* count, uint64_t* ns) {
+    *count = gCpuPreps.load(std::memory_order_relaxed);
+    *ns = gCpuPrepNs.load(std::memory_order_relaxed);
+}
+
 void Bo::cpuBegin(bool write) const {
-    if (surface_ && gAnnounceCpu.load(std::memory_order_relaxed)) (void)gpu_.cpuPrep(*this, write ? kPrepRead | kPrepWrite : kPrepRead, kPrepPatienceNs);
+    if (surface_ && gAnnounceCpu.load(std::memory_order_relaxed)) {
+        const int64_t began = gpu_.transport().nowNs();
+        (void)gpu_.cpuPrep(*this, write ? kPrepRead | kPrepWrite : kPrepRead, kPrepPatienceNs);
+        gCpuPrepNs.fetch_add(uint64_t(std::max<int64_t>(0, gpu_.transport().nowNs() - began)), std::memory_order_relaxed);
+        gCpuPreps.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void Bo::cpuEnd() const {

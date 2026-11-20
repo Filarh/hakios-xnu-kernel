@@ -114,6 +114,11 @@ public:
     void waitUntilCompleted();
     // how long the GPU had it: from commit to the fence, in nanoseconds (Metal's GPUStartTime..GPUEndTime, roughly)
     int64_t gpuNanoseconds() const { return completedAt_ - committedAt_; }
+    // what -commit cost the caller's thread, in nanoseconds of the transport's clock: the last pass's tail (closePass:
+    // in tiles its draw-state groups and the tiles' stream), the copy of the stream into its command BO, and the whole
+    // of CommandQueue::submit up to the kernel's answer; and the words handed to the GPU. Zero before the commit.
+    struct SubmitCost { int64_t closeNs = 0, copyNs = 0, submitNs = 0; uint32_t words = 0; };
+    const SubmitCost& submitCost() const { return submitCost_; }
 
     // --- the blit encoder's work, recorded into this command buffer ---
     bool copy(const Buffer& from, uint64_t fromOffset, const Buffer& to, uint64_t toOffset, uint64_t length);
@@ -194,6 +199,8 @@ public:
         // and the prepasses written (segments that had an opaque draw)
         uint32_t hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0, hsrPrepasses = 0;
         uint32_t hsrClears = 0, hsrBusy = 0;   // (HsrClock: the depth cleared as a pass opened; a draw without HSR, the clock another buffer's)
+        // ...and of those, the ones whose draw before them in the pass was of the same program, taken the same way
+        uint32_t sameProgramDraws = 0;
     };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -566,6 +573,7 @@ private:
     uint64_t faultsAtCommit_ = 0;                       // the GPU's reset count then: one more by completion = given up, not run
     std::unique_ptr<Bo> commands_;
     int64_t committedAt_ = 0, completedAt_ = 0;
+    SubmitCost submitCost_;
 };
 
 class CommandQueue {

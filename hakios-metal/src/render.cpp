@@ -3506,6 +3506,9 @@ struct Cursor {
         bool plain = false;
     } last[kSlots];
     bool rastSet = false, viewportSet = false, blendSet = false, vfdSet = false;
+    // the kept state of the draw this stream last took that way: a draw of the same program after it (metal_fps counts
+    // them, CommandBuffer::Counts::sameProgramDraws)
+    const void* program = nullptr;
     uint32_t rast = 0;
     struct ViewportIn {
         double v[6];
@@ -4089,9 +4092,14 @@ constexpr size_t kHsrPrepassMaxWords = 0x0fffff;
 // The groups in the order a draw has them. One kept as words goes through the shadow unless the stream last held those
 // very words for it; one made of the draw's numbers is made when the numbers are not the last draw's; the two stages'
 // loads and HLSQ_INVALIDATE_CMD, which no shadow drops, go as they are, every draw.
-void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, const ProgramState& ps, PassCache& pc, const DrawFacts& f, const Program& program,
-              const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, uint64_t table, const Options& o, const GmemPlan* gmem,
-              bool afterFetch, pm4::Stream& scratch) {
+// What emitFast says of the draw: whether the draw before it on this stream, also taken from its kept state, was of the
+// same program (kFastSameProgram)
+enum : uint32_t { kFastSameProgram = 1 };
+uint32_t emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, const ProgramState& ps, PassCache& pc, const DrawFacts& f, const Program& program,
+                  const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, uint64_t table, const Options& o, const GmemPlan* gmem,
+                  bool afterFetch, pm4::Stream& scratch) {
+    const uint32_t said = cur.program == &ps ? uint32_t(kFastSameProgram) : 0u;
+    cur.program = &ps;
     DedupSink sink(to, regs);
     uint32_t pending = 0;
     auto flush = [&]() {
@@ -4306,6 +4314,7 @@ void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, cons
     pending |= kGDraw;
     flush();
     // (nothing a draw taken this way writes makes the shadow forget: no occlusion query, no memory write)
+    return said;
 }
 
 // (the tests': CommandBuffer::verifyDraws) The same draw the long way -- drawFacts over a table of its own, every group
@@ -5073,8 +5082,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
                 }
             }
             into.packet(pm4::kNop, nullptr, 0);
-            render::emitFast(into, shadow, cursor, *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings, table.gpuAddress(), encodeOptions, tiled,
-                             afterFetch, dc.scratch);
+            const uint32_t said = render::emitFast(into, shadow, cursor, *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings, table.gpuAddress(),
+                                                   encodeOptions, tiled, afterFetch, dc.scratch);
+            if (said & render::kFastSameProgram) counts_.sameProgramDraws++;
             if (open_->dual) {
                 open_->sysStream.packet(pm4::kNop, nullptr, 0);
                 render::emitFast(open_->sysStream, open_->regs, open_->cache->cur[0], *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings,

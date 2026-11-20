@@ -126,6 +126,8 @@ public:
     virtual int64_t nowNs() = 0;
 };
 
+// the GEM_CPU_PREPs Bo::cpuBegin made since the process began, and the nanoseconds they took (the waits for the GPU among them)
+void cpuPrepCounts(uint64_t* count, uint64_t* ns);
 // Whether Bo::cpuBegin and cpuEnd tell the kernel (true by default): false for holding their cost against their absence
 void setCpuAccessAnnounced(bool on);
 

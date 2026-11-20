@@ -1676,10 +1676,11 @@ static struct {
 } hm_ft_work[HM_FT_W_KINDS];
 static BOOL hm_ft_mode(void);
 
+/* (also under metal_fps: its long gaps say what of this was done between two commits) */
 static double
 hm_ft_work_began(void)
 {
-	return hm_ft_mode() ? hm_now() : 0;
+	return hm_ft_mode() || hm_fps_on() ? hm_now() : 0;
 }
 
 static void
@@ -4726,7 +4727,7 @@ hm_describe_function(id f)
 	NSData *vsAir, *fsAir;
 	hakios_metal_program *program;
 	unsigned format;
-	const double ftBegan = hm_ft_mode() ? hm_now() : 0;   /* metal_trace=frame: how long the pipeline took to make */
+	const double ftBegan = hm_ft_work_began();           /* metal_trace=frame, metal_fps: how long the pipeline took to make */
 	const double madeBegan = hm_now();                    /* ...and for the console's line, always */
 	unsigned ccStages = 0, ccCached = 0, ccCompiled = 0;
 	double ccWaited = 0, ccLoaded = 0, ccCompiling = 0;
@@ -7669,6 +7670,25 @@ static struct {
 	double sampledBytes[6];   /* metal_fps=timeline: the bound fragment textures' sizes, by hakiosStorageKind */
 	struct { unsigned w, h, origin; double bytes; } bySize[16];
 	unsigned ycbcrGpu, ycbcrCopies;   /* metal_ycbcrgpu=1: YCbCr textures drawn from their surfaces, and through their copies */
+	/* The commits' rhythm against the display's: the gaps between commits (while something moves, under 0.25 s) in
+	 * ticks of a 120 Hz refresh, 8.33 ms (index 1-14; 15: more); what the thread did between the last commit and the
+	 * making of this buffer ("outside": CoreAnimation's prepare, its swap, the wait for the tick); what -commit's own
+	 * parts cost (the last pass's tail, the copy of the stream, the submission) and the words handed over; the draws
+	 * taken from kept states and of those the ones with the program of the draw before. */
+	unsigned ticks[16];
+	double outside, outsideMax;
+	unsigned outsides;
+	double closeCost, copyCost, submitCost, words;
+	unsigned costed, keptDraws, samePrograms;
+	/* gaps of metal_fps_long=MS or more (50 when not given): how many, how many quiet (a buffer of under 1 ms encoding,
+	 * with nothing of the driver's between the two commits -- a window server with nothing to draw, not a stall), and the
+	 * first few of the others with what the process did of the driver's work in them */
+	unsigned longGaps, longQuiet, longShown;
+	char longs[4][320];
+	uint64_t workAt[HM_FT_W_KINDS][2];        /* hm_ft_work (count, ns) at the last commit */
+	double waitedAt;                          /* hm_fps_waitedAll at the last commit */
+	unsigned waitsAt;
+	unsigned long long prepsAt, prepNsAt;     /* GEM_CPU_PREPs (hakios_metal_cpu_prep_counts) at the last commit */
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}}, 0, 0 };
 
 /* boot-arg metal_hsr=1: hidden surface removal by depth (hakios_metal_cb_set_hsr; dev-notes/investigacion/anexos/
@@ -7856,6 +7876,22 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 
 			hakios_metal_cb_counts(cb, &passes, &draws, &dispatches, &copies, &clears);
 			hm_fps.passes += passes + copies + clears + dispatches;
+			{
+				int64_t closeNs = 0, copyNs = 0, submitNs = 0;
+				unsigned words = 0, kept = 0, same = 0;
+
+				hakios_metal_cb_submit_cost(cb, &closeNs, &copyNs, &submitNs, &words);
+				hakios_metal_cb_kept_counts(cb, &kept, &same);
+				if (submitNs > 0) {
+					hm_fps.closeCost += closeNs / 1e9;
+					hm_fps.copyCost += copyNs / 1e9;
+					hm_fps.submitCost += submitNs / 1e9;
+					hm_fps.words += words;
+					hm_fps.costed++;
+				}
+				hm_fps.keptDraws += kept;
+				hm_fps.samePrograms += same;
+			}
 			hm_fps.draws += draws;
 			hm_fps.dispatches += dispatches;
 			hm_fps.copies += copies + clears;
@@ -8034,6 +8070,33 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 hm_fps.waits, hm_fps.waited * 1e3, hm_fps.drawCalls, hm_fps.drawCalls ? hm_fps.drawCpu * 1e6 / hm_fps.drawCalls : 0.0,
 				 hm_fps.drawCalls ? hm_fps.coreCpu * 1e6 / hm_fps.drawCalls : 0.0);
 		}
+		{
+			char ticks[200] = "";
+			size_t at = 0;
+			const double costed = hm_fps.costed ? (double)hm_fps.costed : 1.0;
+
+			for (unsigned k = 1; k < 16 && at < sizeof(ticks); k++) {
+				if (hm_fps.ticks[k] != 0) at += (size_t)snprintf(ticks + at, sizeof(ticks) - at, " %u%s:%u", k, k == 15 ? "+" : "", hm_fps.ticks[k]);
+			}
+			if (ticks[0] != 0 || hm_fps.costed != 0) {
+				hm_print("fps: ... gaps between commits in ticks of 8.33 ms:%s; outside the command buffer %.1f ms on average, %.1f at most; "
+					 "-commit: the last pass's tail %.2f ms, the stream's copy %.2f, the submission in all %.2f, %.0f words a buffer; "
+					 "%u draws from kept states, %u of them with the program of the draw before\n",
+					 ticks, hm_fps.outsides ? hm_fps.outside * 1e3 / hm_fps.outsides : 0.0, hm_fps.outsideMax * 1e3, hm_fps.closeCost * 1e3 / costed,
+					 hm_fps.copyCost * 1e3 / costed, hm_fps.submitCost * 1e3 / costed, hm_fps.words / costed, hm_fps.keptDraws, hm_fps.samePrograms);
+			}
+			if (hm_fps.longGaps != 0) {
+				hm_print("fps: ... long gaps (%.0f ms or more): %u, %u of them quiet (under 1 ms of encoding, nothing of the driver's between)\n",
+					 hm_fps_long() * 1e3, hm_fps.longGaps, hm_fps.longQuiet);
+				for (unsigned k = 0; k < hm_fps.longShown; k++) hm_print("fps: ... long gap %s\n", hm_fps.longs[k]);
+			}
+			memset(hm_fps.ticks, 0, sizeof(hm_fps.ticks));
+			hm_fps.outside = hm_fps.outsideMax = 0;
+			hm_fps.outsides = 0;
+			hm_fps.closeCost = hm_fps.copyCost = hm_fps.submitCost = hm_fps.words = 0;
+			hm_fps.costed = hm_fps.keptDraws = hm_fps.samePrograms = 0;
+			hm_fps.longGaps = hm_fps.longQuiet = hm_fps.longShown = 0;
+		}
 		if (hm_sampling()) hm_sample_report();
 		if (hm_timeline_on() && hm_fps.sampledBytes[0] + hm_fps.sampledBytes[1] + hm_fps.sampledBytes[2] + hm_fps.sampledBytes[3] + hm_fps.sampledBytes[4] +
 		    hm_fps.sampledBytes[5] > 0) {
@@ -8159,8 +8222,8 @@ hm_ycbcr_count(unsigned gpu, unsigned copies)
 static void
 hm_fps_shadow(BOOL in, double seconds)
 {
-	if (hm_ft_mode()) {
-		/* (metal_trace=frame's count of the same copies) */
+	if (hm_ft_mode() || hm_fps_on()) {
+		/* (metal_trace=frame's count of the same copies, and metal_fps's long gaps') */
 		atomic_fetch_add(&hm_ft_work[HM_FT_W_COPY].n, 1);
 		atomic_fetch_add(&hm_ft_work[HM_FT_W_COPY].ns, (uint64_t)(seconds > 0 ? seconds * 1e9 : 0));
 	}
@@ -8317,6 +8380,8 @@ hm_fps_waited(double seconds)
 	pthread_mutex_lock(&hm_fps.lock);
 	hm_fps.waited += seconds;
 	hm_fps.waits++;
+	hm_fps_waitedAll += seconds;
+	hm_fps_waitsAll++;
 	pthread_mutex_unlock(&hm_fps.lock);
 }
 
@@ -8335,23 +8400,97 @@ hm_fps_encoded(double seconds, BOOL held)
 	pthread_mutex_unlock(&hm_fps.lock);
 }
 
+/* metal_fps_long=MS: a gap between commits of MS or more is a long one (50 when not given) */
+static double
+hm_fps_long(void)
+{
+	static double ms = -1;
+
+	if (ms < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		ms = 50;
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_fps_long=")) != NULL) {
+			ms = MAX(1, atoi(at + strlen("metal_fps_long=")));
+		}
+	}
+	return ms / 1e3;
+}
+
+/* the time and count of -waitUntilCompleted since the process began (hm_fps.waited is the period's) */
+static double hm_fps_waitedAll;
+static unsigned hm_fps_waitsAll;
+
+/* a buffer committed: -commit took SECONDS; it was made at CREATED and committed at COMMITTED (hm_now) */
 static void
-hm_fps_commit(double seconds)
+hm_fps_commit(double seconds, double created, double committed, hakios_metal_cb *cb)
 {
 	if (!hm_fps_on()) {
 		return;
 	}
+	unsigned long long preps = 0, prepNs = 0;
+	unsigned draws = 0;
+
+	hakios_metal_cpu_prep_counts(&preps, &prepNs);
+	hakios_metal_cb_counts(cb, NULL, &draws, NULL, NULL, NULL);
 	pthread_mutex_lock(&hm_fps.lock);
 	hm_fps.commit += seconds;
 	{
-		const double now = hm_now(), gap = now - hm_fps.lastCommit;
+		const double gap = committed - hm_fps.lastCommit;
 
 		if (hm_fps.lastCommit != 0 && gap < 0.25) {
 			if (gap <= 0.020) hm_fps.gapsOnTime++;
 			else if (gap <= 0.050) hm_fps.gapsLate++;
 			else hm_fps.gapsStall++;
+			hm_fps.ticks[MIN(15, MAX(1, (int)lround(gap * 120.0)))]++;
 		}
-		hm_fps.lastCommit = now;
+		if (hm_fps.lastCommit != 0 && gap < 0.25 && created >= hm_fps.lastCommit) {
+			const double out = created - hm_fps.lastCommit;
+
+			hm_fps.outside += out;
+			hm_fps.outsides++;
+			if (out > hm_fps.outsideMax) hm_fps.outsideMax = out;
+		}
+		if (hm_fps.lastCommit != 0 && gap >= hm_fps_long() && gap < 1.0) {
+			/* what of the driver's own work fell between the two commits */
+			uint64_t n[HM_FT_W_KINDS], ns[HM_FT_W_KINDS], any = 0;
+
+			for (int k = 0; k < HM_FT_W_KINDS; k++) {
+				n[k] = atomic_load(&hm_ft_work[k].n) - hm_fps.workAt[k][0];
+				ns[k] = atomic_load(&hm_ft_work[k].ns) - hm_fps.workAt[k][1];
+				any += n[k];
+			}
+			const unsigned waits = hm_fps_waitsAll - hm_fps.waitsAt;
+			const double waited = hm_fps_waitedAll - hm_fps.waitedAt;
+			const unsigned long long p = preps - hm_fps.prepsAt, pns = prepNs - hm_fps.prepNsAt;
+			const double encoding = committed - created;
+
+			hm_fps.longGaps++;
+			if (encoding < 0.001 && any == 0 && waits == 0 && p == 0) {
+				hm_fps.longQuiet++;
+			} else if (hm_fps.longShown < 4) {
+				snprintf(hm_fps.longs[hm_fps.longShown++], sizeof(hm_fps.longs[0]),
+					 "%.1f ms (%ld ticks): outside %.1f, encoding %.2f, %u draws; in it %llu pipelines (%.1f ms), %llu textures (%.1f ms), "
+					 "%llu surfaces (%.1f ms), %llu buffers (%.1f ms), %llu uploads (%.1f ms), %llu copies (%.1f ms), %u waits (%.1f ms), "
+					 "%llu GEM_CPU_PREP (%.1f ms)",
+					 gap * 1e3, lround(gap * 120.0), (created - hm_fps.lastCommit) * 1e3, encoding * 1e3, draws,
+					 (unsigned long long)n[HM_FT_W_PIPELINE], ns[HM_FT_W_PIPELINE] / 1e6, (unsigned long long)n[HM_FT_W_TEXTURE],
+					 ns[HM_FT_W_TEXTURE] / 1e6, (unsigned long long)n[HM_FT_W_SURFACE], ns[HM_FT_W_SURFACE] / 1e6,
+					 (unsigned long long)n[HM_FT_W_BUFFER], ns[HM_FT_W_BUFFER] / 1e6, (unsigned long long)n[HM_FT_W_UPLOAD],
+					 ns[HM_FT_W_UPLOAD] / 1e6, (unsigned long long)n[HM_FT_W_COPY], ns[HM_FT_W_COPY] / 1e6, waits, waited * 1e3, p, pns / 1e6);
+			}
+		}
+		for (int k = 0; k < HM_FT_W_KINDS; k++) {
+			hm_fps.workAt[k][0] = atomic_load(&hm_ft_work[k].n);
+			hm_fps.workAt[k][1] = atomic_load(&hm_ft_work[k].ns);
+		}
+		hm_fps.waitsAt = hm_fps_waitsAll;
+		hm_fps.waitedAt = hm_fps_waitedAll;
+		hm_fps.prepsAt = preps;
+		hm_fps.prepNsAt = prepNs;
+		hm_fps.lastCommit = committed;
 	}
 	pthread_mutex_unlock(&hm_fps.lock);
 }
@@ -8505,7 +8644,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 		const double began = hm_now();
 
 		hakios_metal_cb_commit(_cb, hm_completed, self);
-		hm_fps_commit(hm_now() - began);
+		hm_fps_commit(hm_now() - began, _createdAt, _committedAt, _cb);
 	}
 	if (ft != NULL) [self hakiosFtPhase:ft scheduled:YES];
 	[self hakiosDeliverScheduled];
