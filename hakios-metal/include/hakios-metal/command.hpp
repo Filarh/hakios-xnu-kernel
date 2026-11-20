@@ -336,6 +336,10 @@ public:
     // stream is the same either way (the tests record it both ways); a bisect's switch. On by default; what it was is
     // returned.
     static bool keepStates(bool on);
+    // a draw of a sysmem pass whose draw before it was of the same program, both from its kept state, without the
+    // program's HLSQ_INVALIDATE_CMD and its stages' preloads and immediates (render.cpp: gSkipSameProgram): the stream
+    // differs. Off by default (metal_sameprog=1 in the plug-in); what it was is returned.
+    static bool skipSameProgramLoads(bool on);
     std::vector<PassTime> passTimes() const;
     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
     const char* passSysmemWhy(size_t i) const { return i < profiled_.size() ? profiled_[i].sysmemWhy.c_str() : ""; }

@@ -1156,6 +1156,7 @@ int main(int argc, char** argv) {
         else if (a == "--each") asked.each = true;
         else if (a == "--verify") asked.verify = true;
         else if (a == "--long") CommandBuffer::keepStates(false);
+        else if (a == "--sameprog") CommandBuffer::skipSameProgramLoads(true);
         else if (a == "--record") asked.record = uint32_t(std::max(0, atoi(value())));
         else if (a == "--hist") asked.hist = true;
         else if (a == "--csv") asked.csv = true;
@@ -1168,7 +1169,7 @@ int main(int argc, char** argv) {
         else if (a == "--gmem-draws") asked.gmemDraws = atoi(value());
         else if (a == "--no-memoryless") asked.memoryless = false;
         else {
-            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--gpu] [--gmem-off BITS] [--gmem-draws N] [--no-memoryless] [--verify] [--long]"
+            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--gpu] [--gmem-off BITS] [--gmem-draws N] [--no-memoryless] [--verify] [--long] [--sameprog]"
                         " | --golden [--long]\n");
             return 2;
         }

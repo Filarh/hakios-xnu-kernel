@@ -3223,6 +3223,21 @@ hm_cpu_access_switch(void)
 	}
 }
 
+/* Boot-arg metal_sameprog=1: a draw of a sysmem pass whose draw before it was of the same program, both from its kept
+ * state, leaves out the program's HLSQ_INVALIDATE_CMD and its stages' preloads and immediates
+ * (hakios_metal_same_program_loads; CommandBuffer::skipSameProgramLoads). Off by default, for an A/B. */
+static void
+hm_same_program_switch(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+
+	if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_sameprog=1") != NULL) {
+		hakios_metal_same_program_loads(1);
+		hm_print("metal_sameprog=1: a draw with the program of the draw before writes neither its invalidate nor its preloads\n");
+	}
+}
+
 static void
 hm_warm_up(void)
 {
@@ -3734,6 +3749,7 @@ hm_boot_arg_set(const char *what)
 		 hakios_metal_has_compiler() ? "in this build" : "NOT in this build (make ios MESA=1): every pipeline will be refused",
 		 _targetName);
 	hm_cpu_access_switch();
+	hm_same_program_switch();
 	hm_warm_up();
 	return self;
 }

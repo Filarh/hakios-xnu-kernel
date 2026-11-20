@@ -4093,13 +4093,25 @@ constexpr size_t kHsrPrepassMaxWords = 0x0fffff;
 // very words for it; one made of the draw's numbers is made when the numbers are not the last draw's; the two stages'
 // loads and HLSQ_INVALIDATE_CMD, which no shadow drops, go as they are, every draw.
 // What emitFast says of the draw: whether the draw before it on this stream, also taken from its kept state, was of the
-// same program (kFastSameProgram)
-enum : uint32_t { kFastSameProgram = 1 };
+// same program (kFastSameProgram), and whether that left out its program's HLSQ_INVALIDATE_CMD and its two stages'
+// preloads and immediates (kFastSkippedLoads: gSkipSameProgram)
+enum : uint32_t { kFastSameProgram = 1, kFastSkippedLoads = 2 };
+// (CommandBuffer::skipSameProgramLoads, metal_sameprog=1) A draw of a sysmem pass whose draw before it on the same stream
+// was of the same program, both taken from the program's kept state, writes neither the program's HLSQ_INVALIDATE_CMD
+// nor its stages' preloads and immediates (kGInvalidate, kGVsLoads, kGFsLoads): what the draw before loaded is the same
+// words, and nothing between the two invalidated it -- everything the invalidate drops that a draw depends on (the
+// pushed constants, the UBO, texture, sampler and IBO tables) each draw loads again anyway. Turnip and fd6 write the
+// invalidate only with a new program (tu6_emit_program_config). Not in a tiled pass: its draws become draw-state groups
+// (gmem.hpp) whose program group is the invalidate and the preloads. Off by default; the stream differs when on.
+std::atomic<bool> gSkipSameProgram{false};
+constexpr uint32_t kSkippedGroups = kGInvalidate | kGVsLoads | kGFsLoads;
 uint32_t emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, const ProgramState& ps, PassCache& pc, const DrawFacts& f, const Program& program,
                   const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, uint64_t table, const Options& o, const GmemPlan* gmem,
                   bool afterFetch, pm4::Stream& scratch) {
-    const uint32_t said = cur.program == &ps ? uint32_t(kFastSameProgram) : 0u;
+    uint32_t said = cur.program == &ps ? uint32_t(kFastSameProgram) : 0u;
     cur.program = &ps;
+    if (said != 0 && gmem == nullptr && gSkipSameProgram.load(std::memory_order_relaxed)) said |= kFastSkippedLoads;
+    const bool skip = (said & kFastSkippedLoads) != 0;
     DedupSink sink(to, regs);
     uint32_t pending = 0;
     auto flush = [&]() {
@@ -4229,15 +4241,15 @@ uint32_t emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, 
         }
         kept(Cursor::kPass, fr->words.data(), uint32_t(fr->words.size()), fr->segs.data(), fr->byReg.data(), uint32_t(fr->segs.size()), fr->plain);
     }
-    asIs(ps.invalidate);
+    if (!skip) asIs(ps.invalidate);
     keptOf(Cursor::kConfig, ps.config);
     if (ps.vs.numSsbos != 0 || ps.fs.numSsbos != 0) pending |= kGIbos;
     keptOf(Cursor::kVsRegs, ps.vsRegs);
-    asIs(ps.vsLoads);
+    if (!skip) asIs(ps.vsLoads);
     if (!ps.vs.ranges.empty() || ps.vs.numUbos != 0) pending |= kGVsConsts;
     if (ps.driverParams) pending |= kGDriverParams;
     keptOf(Cursor::kFsRegs, ps.fsRegs);
-    asIs(ps.fsLoads);
+    if (!skip) asIs(ps.fsLoads);
     if (!ps.fs.ranges.empty() || ps.fs.numUbos != 0) pending |= kGFsConsts;
     pending |= kGFsTex | kGVsTex;
     keptOf(Cursor::kVfd, ps.vfd);
@@ -4322,7 +4334,7 @@ uint32_t emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, 
 // into its table. "" when they are the same, else what differs.
 std::string verifyDraw(const pm4::Stream& to, size_t mark, CommandBuffer::RegShadow& shadow, const Program& program, const RenderPass& pass, const Draw& draw,
                        const Bindings& vsb, const Bindings& fsb, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, const uint8_t* tableCpu, const Options& o,
-                       const GmemPlan* gmem, bool afterFetch) {
+                       const GmemPlan* gmem, bool afterFetch, uint32_t without) {
     std::vector<uint8_t> ownTable(kTableBytes, 0xa5);
     ProgramFacts pf;
     DrawFacts f;
@@ -4333,7 +4345,7 @@ std::string verifyDraw(const pm4::Stream& to, size_t mark, CommandBuffer::RegSha
     pm4::Stream long_;
     long_.packet(pm4::kNop, nullptr, 0);
     DedupSink sink(long_, shadow);
-    emitDraw(sink, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, table, o, gmem, afterFetch, kGAll);
+    emitDraw(sink, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, table, o, gmem, afterFetch, kGAll & ~without);
     const std::vector<uint32_t>& a = to.words();
     const std::vector<uint32_t>& b = long_.words();
     if (a.size() - mark != b.size()) return n(a.size() - mark) + " words, " + n(b.size()) + " the long way";
@@ -4481,6 +4493,7 @@ void CommandQueue::givePass(CommandBuffer::OpenPass* p) {
 }
 
 void CommandBuffer::verifyDraws(bool on) { render::gVerifyDraws = on; }
+bool CommandBuffer::skipSameProgramLoads(bool on) { return render::gSkipSameProgram.exchange(on); }
 bool CommandBuffer::keepStates(bool on) { return render::gKeepStates.exchange(on); }
 
 bool CommandBuffer::draw(const Program& program, const RenderPass& given, const Draw& givenDraw, const Bindings& vsBindings, const Bindings& fsBindings,
@@ -5085,9 +5098,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
             const uint32_t said = render::emitFast(into, shadow, cursor, *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings, table.gpuAddress(),
                                                    encodeOptions, tiled, afterFetch, dc.scratch);
             if (said & render::kFastSameProgram) counts_.sameProgramDraws++;
+            uint32_t saidSys = 0;
             if (open_->dual) {
                 open_->sysStream.packet(pm4::kNop, nullptr, 0);
-                render::emitFast(open_->sysStream, open_->regs, open_->cache->cur[0], *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings,
+                saidSys = render::emitFast(open_->sysStream, open_->regs, open_->cache->cur[0], *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings,
                                  sysTable.gpuAddress(), sysOptions, nullptr, afterFetch, dc.scratch);
             }
             open_->staticKey.clear();   // (the long way's key: what it would skip is no longer what the last draw made)
@@ -5098,10 +5112,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
                 const bool had = substituted;
                 substitute();
                 std::string differs = render::verifyDraw(into, mark, before, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(),
-                                                         table.contents(), encodeOptions, tiled, afterFetch);
+                                                         table.contents(), encodeOptions, tiled, afterFetch,
+                                                         said & render::kFastSkippedLoads ? render::kSkippedGroups : 0u);
                 if (differs.empty() && open_->dual) {
                     differs = render::verifyDraw(open_->sysStream, markSys, beforeSys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(),
-                                                 sysTable.contents(), sysOptions, nullptr, afterFetch);
+                                                 sysTable.contents(), sysOptions, nullptr, afterFetch,
+                                                 saidSys & render::kFastSkippedLoads ? render::kSkippedGroups : 0u);
                 }
                 if (!differs.empty()) return fail("a draw of " + std::string(program.name != nullptr ? program.name : "?") + " from its kept state: " + differs);
                 if (!had) {
