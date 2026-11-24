@@ -73,6 +73,7 @@ struct Asked {
     uint32_t runs = 5;
     size_t coldBytes = 0;
     std::string scenes, stages;
+    bool each = false;   // --each: every layer of a stage scene by itself (eachLayer)
 } asked;
 
 uint64_t nowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
@@ -428,6 +429,8 @@ struct Frame {
     std::vector<hakios_metal_texture*> icons;
     hakios_metal_buffer* index = nullptr;
     bool gmem = true;
+    std::vector<hakios_metal_render_pass> passes;
+    uint32_t drawsAPass = 0;
 };
 
 // one frame through the C interface: the draws of F in order; false with the first refusal when one is refused
@@ -438,6 +441,7 @@ void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
     hakios_metal_render_pass pass = f.pass;
     for (size_t i = 0; i < f.order.size(); i++) {
         Layer& l = f.layers[f.order[i]];
+        if (f.drawsAPass != 0 && i % f.drawsAPass == 0) pass = f.passes[(i / f.drawsAPass) % f.passes.size()];
         hakios_metal_viewport vp{0, 0, 750, 1624, 0, 1};
         hakios_metal_scissor sc{};
         const bool scissored = i % 3 != 0;   // (most of a compositor's layers are clipped to their bounds)
@@ -701,8 +705,98 @@ bool loadStage(const std::string& path, LoadedStage* out) {
     return true;
 }
 
+
+// --each: every layer of a stage scene by itself, drawn as a blur's chain draws -- into a surface of a sixteenth of the
+// screen (RGBA16Float, cleared), then into one of a quarter (BGRA8) sampling the first, then into the screen (two
+// attachments) sampling the second; three draws each, the textures and the constants' places moving from draw to draw
+// -- once in sysmem, once as the plug-in records (tiles for a pass of 56 draws, so these stay in sysmem after being
+// recorded both ways) and once in tiles whatever their draws. A line a layer and a way: what was submitted, summed, and
+// the refusals. For holding one version of the driver to another, program by program.
+uint32_t eachHash(const std::string& t) {
+    uint32_t h = 2166136261u;
+    for (char ch : t) h = (h ^ uint8_t(ch)) * 16777619u;
+    return h;
+}
+void eachLayer(CRig& r, Common& c, Frame& f) {
+    hakios_metal_texture* sixteenth = hakios_metal_texture_new(r.device, k2D, 115, 188, 406, kUsageRead | kUsageTarget);   // RGBA16Float
+    hakios_metal_texture* quarter = hakios_metal_texture_new(r.device, k2D, kBGRA8, 375, 812, kUsageRead | kUsageTarget);
+    if (sixteenth == nullptr || quarter == nullptr) {
+        std::printf("each: %s\n", hakios_metal_error());
+        return;
+    }
+    for (size_t li = 0; li < f.layers.size(); li++) {
+        Layer& l = f.layers[li];
+        for (int way = 0; way < 3; way++) {
+            gSums.reset();
+            hakios_metal_cb* cb = pluginCb(r, way != 0);
+            if (way == 2) {
+                hakios_metal_cb_set_gmem_min_draws(cb, 0);
+                hakios_metal_cb_set_gmem_tuned(cb, 0);
+            }
+            hakios_metal_cb_set_vertex_textures(cb, nullptr, 0, nullptr, 0);
+            uint32_t taken = 0, refused = 0, whys = 0;
+            for (int step = 0; step < 3; step++) {
+                hakios_metal_render_pass pass{};
+                unsigned w = 750, h = 1624;
+                hakios_metal_texture* sampled = nullptr;   // what the layer's own texture is in this step: the step before's target
+                if (step == 0) {
+                    pass.color0 = sixteenth;
+                    pass.load_action = 2;
+                    pass.store_action = 1;
+                    pass.clear_color[3] = 1.0;
+                    w = 188, h = 406;
+                } else if (step == 1) {
+                    pass.color0 = quarter;
+                    pass.load_action = 0;
+                    pass.store_action = 1;
+                    w = 375, h = 812;
+                    sampled = sixteenth;
+                } else {
+                    pass = c.mainPass(true);
+                    sampled = quarter;
+                }
+                for (unsigned i = 0; i < 3; i++) {
+                    hakios_metal_viewport vp{0, 0, double(w), double(h), 0, 1};
+                    hakios_metal_scissor sc{w / 8 * i, h / 8, w / 2, h / 2};
+                    uint64_t vso[31], fso[31];
+                    for (unsigned k = 0; k < l.vsCount; k++) vso[k] = l.vsOffsets[k] + (l.vsUniform[k] ? 8ull * (1 + 2 * (3 * step + i)) : 0);
+                    for (unsigned k = 0; k < l.fsCount; k++) fso[k] = l.fsOffsets[k] + (l.fsUniform[k] ? 8ull * (1 + 2 * (3 * step + i)) : 0);
+                    hakios_metal_texture* tex[16];
+                    for (unsigned k = 0; k < l.texCount; k++) {
+                        tex[k] = l.texVaries[k] ? (sampled != nullptr && i != 2 ? sampled : f.icons[(i + k) % f.icons.size()]) : l.tex[k];
+                    }
+                    int drawn;
+                    if (l.indexed) {
+                        drawn = hakios_metal_cb_draw_indexed(cb, l.program, &pass, &vp, i == 1 ? &sc : nullptr, 3, 6, 0, f.index, 12 * i, 1, 0, 0, l.vs, vso, l.vsCount,
+                                                             l.fs, fso, l.fsCount, tex, l.texCount, l.samp, l.sampCount);
+                    } else {
+                        drawn = hakios_metal_cb_draw3(cb, l.program, &pass, &vp, i == 1 ? &sc : nullptr, 3, 0, 6, 1, 0, l.vs, vso, l.vsCount, l.fs, fso, l.fsCount,
+                                                      tex, l.texCount, l.samp, l.sampCount);
+                    }
+                    if (drawn == 0) {
+                        taken++;
+                    } else {
+                        refused++;
+                        whys = whys * 31 + eachHash(hakios_metal_error());
+                    }
+                    pass.load_action = 1;
+                }
+            }
+            hakios_metal_cb_commit(cb, nullptr, nullptr);
+            hakios_metal_cb_wait(cb);
+            const bool completed = hakios_metal_cb_status(cb) == HAKIOS_METAL_COMPLETED;
+            const uint32_t error = completed ? 0 : eachHash(hakios_metal_cb_error(cb));
+            hakios_metal_cb_free(cb);
+            settle();
+            std::printf("each %s way %d taken %u refused %u (%08x) submits %u words %llu draws %u loads %u stream %016llx state %016llx%s %08x\n", l.name.c_str(), way,
+                        taken, refused, whys, gSums.submits, (unsigned long long)gSums.words, gSums.draws, gSums.loads, (unsigned long long)gSums.stream,
+                        (unsigned long long)gSums.state, completed ? "" : " (error)", error);
+        }
+    }
+}
+
 void runStageScenes() {
-    if (asked.stages.empty() || !(wanted("S") || wanted("T"))) return;
+    if (asked.stages.empty() || !(wanted("S") || wanted("T") || wanted("U"))) return;
     std::vector<std::unique_ptr<LoadedStage>> vss, fss;
     {
         std::vector<std::string> files;
@@ -725,16 +819,27 @@ void runStageScenes() {
         std::printf("drawbench: no stages in %s\n", asked.stages.c_str());
         return;
     }
-    for (const char* letter : {"S", "T"}) {
+    for (const char* letter : {"S", "T", "U"}) {
         if (!wanted(letter)) continue;
         CRig r;
         Common c(r);
         Frame f;
-        f.gmem = letter[0] == 'S';
+        f.gmem = letter[0] != 'T';
         f.pass = c.mainPass(true);
         f.index = c.index;
         f.icons = c.icons;
         hakios_metal_texture* lut = hakios_metal_texture_new_3d(r.device, kBGRA8, 16, 16, 16, kUsageRead);
+        if (letter[0] == 'U') {
+            hakios_metal_render_pass own[3];
+            for (hakios_metal_render_pass& p : own) {
+                p = hakios_metal_render_pass{};
+                p.color0 = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
+                p.load_action = 1;
+                p.store_action = 1;
+            }
+            f.passes = {own[0], own[1], c.mainPass(true), own[2], c.mainPass(true)};
+            f.drawsAPass = 22;
+        }
         // every fragment stage with the first vertex stage it links with -- the one of its own family first, by the
         // names' common beginning (variable_blur_frag_lph with variable_blur_vert_lph) -- bound as its tables ask
         for (const auto& fs : fss) {
@@ -818,6 +923,10 @@ void runStageScenes() {
                 break;
             }
         }
+        if (asked.each) {
+            eachLayer(r, c, f);
+            continue;
+        }
         // one frame of every layer to see which the driver takes; the main pass is then made of those, in runs
         {
             Result probe;
@@ -854,6 +963,7 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--golden") asked.golden = true;
+        else if (a == "--each") asked.each = true;
         else if (a == "--hist") asked.hist = true;
         else if (a == "--csv") asked.csv = true;
         else if (a == "--runs") asked.runs = std::max(1, atoi(value()));
@@ -880,6 +990,10 @@ int main(int argc, char** argv) {
         {"G", "one draw alone in a command buffer (the fixed cost of a pass and a submit)", 1, 0, 0, 0, false, true, 1},
         {"H", "one draw into a pass whose load action is Clear", 1, 0, 0, 0, true, true, 1},
     };
+    if (asked.each) {
+        runStageScenes();
+        return 0;
+    }
     for (const Scene& s : scenes) runCore(s);
     runFixtureScenes();
     runStageScenes();

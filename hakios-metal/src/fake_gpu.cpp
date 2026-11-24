@@ -272,6 +272,7 @@ uint8_t* FakeGpu::at(uint64_t iova, uint64_t length) {
 void FakeGpu::fault(const std::string& why) {
     stats_.faults++;
     stats_.lastFault = why;
+    if (getenv("HM_FAULTS") != nullptr) fprintf(stderr, "fake fault: %s\n", why.c_str());
 }
 
 uint32_t FakeGpu::reg(uint32_t r) const {
