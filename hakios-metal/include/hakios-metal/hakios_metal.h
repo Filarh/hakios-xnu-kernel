@@ -317,6 +317,9 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
  * descriptor and sample count come with it. NULL with the reason. */
 hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
+/* another handle on PROGRAM's compiled code and state (freed on its own with hakios_metal_program_free; the code lives
+ * while either does): what a job that outlives the pipeline holds */
+hakios_metal_program *hakios_metal_program_share(hakios_metal_program *program);
 /* Which of the bytes a specialised PROGRAM was compiled for decided anything: MASK[i] 0xff for a byte its compilation
  * read, 0 for one it did not (a structure's padding, a field no branch taken looks at). A buffer that holds the same
  * bytes where the mask is set is drawn by this very program. Writes at most LENGTH bytes and returns how many the
@@ -327,6 +330,52 @@ unsigned hakios_metal_program_known_reads(hakios_metal_program *program, unsigne
  * another thread compiled, reading cached stages, and compiling. Any pointer may be NULL. */
 void hakios_metal_compile_times(unsigned *stages, unsigned *cached, unsigned *compiled, double *waited_us, double *loaded_us,
     double *compiled_us);
+/* --- Compiling without stalling: lanes, the queue, the shared cache (compile_queue.hpp, shader_cache.hpp, specialize.hpp) ---
+ * LANES 1 (the default): one compiler for every thread, as before. 2: a foreground compiler for threads that wait for
+ * their result and a background one for the queue's worker -- background work never holds the compiler a waiting
+ * thread needs. Set before the first compilation. */
+void hakios_metal_compile_set_lanes(unsigned lanes);
+unsigned hakios_metal_compile_lanes(void);
+/* what the calling thread compiles from now on (NULL or "" clears it), named to whoever waits behind it */
+void hakios_metal_compile_set_activity(const char *what);
+/* hakios_metal_compile_times with more: what held the compiler when this thread found it taken (BEHIND, the longest such
+ * wait's, BEHIND_US), the time spent waiting for another thread compiling the very same stage, the lane (0 foreground,
+ * 1 background). The counts start again. */
+typedef struct hakios_metal_compile_report {
+	unsigned stages, cached, compiled, lane;
+	double waited_us, loaded_us, compiled_us, same_stage_us, behind_us;
+	char behind[160];
+} hakios_metal_compile_report;
+void hakios_metal_compile_report_take(hakios_metal_compile_report *report);
+/* PRIORITY: 0 something waits for it, 1 something draws a fallback until it is done, 2 likely needed soon, 3 warm-up.
+ * A job of KEY, run on the background lane by the queue's worker, highest priority first; 1 when queued now, 0 when
+ * KEY was already queued, running or done (its priority raised; JOB not called: CONTEXT is the caller's to release). */
+typedef void (*hakios_metal_job_fn)(void *context);
+int hakios_metal_compile_submit(const char *key, unsigned priority, const char *what, hakios_metal_job_fn job, void *context);
+/* KEY needed now: queued, it runs here; running, it is waited for */
+void hakios_metal_compile_run_or_wait(const char *key);
+/* the warm-up's recipes handed to the queue at PRIORITY (one job each) instead of compiled in the calling thread;
+ * REPORT says what was read and queued; DONE (may be NULL) is called on the worker after the last job, with what they did */
+void hakios_metal_warmup_async(unsigned priority, hakios_metal_warmup_report *report, void (*done)(const hakios_metal_warmup_report *report));
+/* the shared layout's generation (the compiler's identity), and a trim of the writable cache to MAX_MEGABYTES */
+const char *hakios_metal_cache_generation(void);
+typedef struct hakios_metal_cache_trim_report {
+	uint64_t bytes_before, bytes_after;
+	unsigned files, removed, generations_removed;
+} hakios_metal_cache_trim_report;
+void hakios_metal_cache_trim(unsigned max_megabytes, hakios_metal_cache_trim_report *report);
+/* An uber shader's specialisations, never waited for (specialize.hpp): BASE (not owned) draws a content until the
+ * program COMPILE makes for it (on the queue's worker, at PRIORITY) is ready. LENGTH deciding bytes, MOST contents; EXACT:
+ * a content matches only byte for byte. RELEASE_CONTEXT(CONTEXT) when the table and its last job are gone. */
+typedef struct hakios_metal_spec_table hakios_metal_spec_table;
+typedef hakios_metal_program *(*hakios_metal_spec_compile_fn)(void *context, const unsigned char *bytes, size_t length);
+hakios_metal_spec_table *hakios_metal_spec_table_new(hakios_metal_program *base, unsigned length, unsigned most, unsigned priority, const char *what,
+    int exact, hakios_metal_spec_compile_fn compile, void *context, void (*release_context)(void *context));
+/* the program to draw LENGTH bytes at BYTES with, now (*STARTED 1 when a compilation was asked for just now) */
+hakios_metal_program *hakios_metal_spec_table_program(hakios_metal_spec_table *table, const unsigned char *bytes, int *started);
+void hakios_metal_spec_table_stats(hakios_metal_spec_table *table, unsigned *contents, unsigned *ready, unsigned *failed, unsigned *fallback_draws,
+    unsigned *hits, unsigned *full);
+void hakios_metal_spec_table_free(hakios_metal_spec_table *table);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* what PROGRAM's fragment stage does that a frame trace reports (the plug-in's metal_trace=frame looks for it by name):

@@ -156,6 +156,13 @@ struct CompileTimes {
     // ...and of the compiling: the front end (AIR to NIR) and the folding of a known buffer's reads; the rest is the
     // lowering and ir3
     double frontEndUs = 0, foldedUs = 0;
+    // of the waiting: what held the compiler when this thread found it taken (compile_queue.hpp: setCompileActivity),
+    // the longest such wait's; and the time spent waiting for another thread that was compiling the very same stage
+    // (which this thread then read from the cache instead of compiling it again)
+    std::string behind;
+    double behindUs = 0;
+    double sameStageUs = 0;
+    uint8_t lane = 0;   // the lane the last compilation ran on (CompileLane)
 };
 CompileTimes takeCompileTimes();
 // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
@@ -183,6 +190,13 @@ struct WarmUpReport {
     std::string firstFailure;      // the first refusal, by its recipe and reason
 };
 WarmUpReport warmUp();
+// The same walk, the compilations handed to QUEUE (compile_queue.hpp) at PRIORITY, one job a recipe, instead of being
+// made in the calling thread: what nothing waits for is compiled on the background lane, after whatever something
+// draws a fallback for. The report says what was read and queued (compiled: the jobs queued); DONE, when given, is
+// called on the worker after the last of them, with the counts of what they did.
+class CompileQueue;
+enum class CompilePriority : uint8_t;
+WarmUpReport warmUpAsync(CompileQueue& queue, CompilePriority priority, void (*done)(const WarmUpReport&) = nullptr);
 
 // VS and FS linked (render::link, and with Mesa present cross-checked against ir3_link_shaders) for a colour target of
 // COLOR0's format. nullptr with *why: the refusals render.hpp names for a stage (attributes, several colour outputs,

@@ -18,6 +18,9 @@
 
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/compiler.hpp"
+#include "hakios-metal/compile_queue.hpp"
+#include "hakios-metal/shader_cache.hpp"
+#include "hakios-metal/specialize.hpp"
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/hakios_metal.h"
 #include "hakios-metal/a6xx.hpp"
@@ -1240,6 +1243,14 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
     return programOf(std::move(vs), std::move(fs), colorPixelFormat);
 }
 
+hakios_metal_program* hakios_metal_program_share(hakios_metal_program* p) {
+    if (p == nullptr) return nullptr;
+    auto* r = new hakios_metal_program;
+    r->program = p->program;
+    r->color = p->color;
+    return r;
+}
+
 hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants,
                                                      unsigned fsCount, unsigned binding, const void* bytes, size_t length) {
     if (base == nullptr || fsBitcode == nullptr || fsSize == 0 || bytes == nullptr) {
@@ -1338,6 +1349,122 @@ void hakios_metal_compile_times(unsigned* stages, unsigned* cached, unsigned* co
     if (loadedUs != nullptr) *loadedUs = t.loadedUs;
     if (compiledUs != nullptr) *compiledUs = t.compiledUs;
 }
+
+void hakios_metal_compile_set_lanes(unsigned lanes) { setCompileLanes(lanes); }
+unsigned hakios_metal_compile_lanes(void) { return compileLanes(); }
+void hakios_metal_compile_set_activity(const char* what) { setCompileActivity(what != nullptr ? what : ""); }
+
+void hakios_metal_compile_report_take(hakios_metal_compile_report* r) {
+    const CompileTimes t = takeCompileTimes();
+    *r = hakios_metal_compile_report{};
+    r->stages = t.stages;
+    r->cached = t.cached;
+    r->compiled = t.compiled;
+    r->lane = t.lane;
+    r->waited_us = t.waitedUs;
+    r->loaded_us = t.loadedUs;
+    r->compiled_us = t.compiledUs;
+    r->same_stage_us = t.sameStageUs;
+    r->behind_us = t.behindUs;
+    snprintf(r->behind, sizeof(r->behind), "%s", t.behind.c_str());
+}
+
+static CompilePriority priorityOf(unsigned p) { return CompilePriority(p > 3 ? 3 : p); }
+
+int hakios_metal_compile_submit(const char* key, unsigned priority, const char* what, hakios_metal_job_fn job, void* context) {
+    bool fresh = false;
+    CompileQueue::shared().submit(key != nullptr ? key : "", priorityOf(priority), what != nullptr ? what : "", [job, context] {
+        if (job != nullptr) job(context);
+    }, &fresh);
+    return fresh ? 1 : 0;
+}
+
+void hakios_metal_compile_run_or_wait(const char* key) { CompileQueue::shared().runOrWait(key != nullptr ? key : ""); }
+
+static void (*gWarmUpDone)(const hakios_metal_warmup_report*) = nullptr;
+static void reportOf(const WarmUpReport& r, hakios_metal_warmup_report* out) {
+    *out = hakios_metal_warmup_report{};
+    out->recipes = r.recipes;
+    out->cached = r.cached;
+    out->compiled = r.compiled;
+    out->failed = r.failed;
+    out->milliseconds = r.milliseconds;
+    out->compile_milliseconds = r.compileMilliseconds;
+    snprintf(out->first_failure, sizeof(out->first_failure), "%s", r.firstFailure.c_str());
+}
+static void warmUpDone(const WarmUpReport& r) {
+    hakios_metal_warmup_report out;
+    reportOf(r, &out);
+    if (gWarmUpDone != nullptr) gWarmUpDone(&out);
+}
+
+void hakios_metal_warmup_async(unsigned priority, hakios_metal_warmup_report* report, void (*done)(const hakios_metal_warmup_report*)) {
+    gWarmUpDone = done;
+    const WarmUpReport r = warmUpAsync(CompileQueue::shared(), priorityOf(priority), done != nullptr ? warmUpDone : nullptr);
+    if (report != nullptr) reportOf(r, report);
+}
+
+const char* hakios_metal_cache_generation(void) {
+    static const std::string g = cacheGeneration();
+    return g.c_str();
+}
+
+void hakios_metal_cache_trim(unsigned maxMegabytes, hakios_metal_cache_trim_report* out) {
+    const CacheTrimReport r = trimCache(cacheWritableRoot(), cacheGeneration(), uint64_t(maxMegabytes) << 20);
+    if (out == nullptr) return;
+    out->bytes_before = r.bytesBefore;
+    out->bytes_after = r.bytesAfter;
+    out->files = r.files;
+    out->removed = r.removed;
+    out->generations_removed = r.generationsRemoved;
+}
+
+struct hakios_metal_spec_table {
+    std::unique_ptr<SpecializationTable> table;
+};
+
+hakios_metal_spec_table* hakios_metal_spec_table_new(hakios_metal_program* base, unsigned length, unsigned most, unsigned priority, const char* what,
+                                                     int exact, hakios_metal_spec_compile_fn compile, void* context, void (*releaseContext)(void*)) {
+    if (base == nullptr || length == 0 || length > 256 || compile == nullptr) {
+        failed("a specialisation table needs its generic program, 1 to 256 deciding bytes and a compile function");
+        return nullptr;
+    }
+    // the caller's context lives as long as the hooks do: the table's state, which its last queued job may outlive it in
+    std::shared_ptr<void> ctx(context, [releaseContext](void* c) {
+        if (releaseContext != nullptr) releaseContext(c);
+    });
+    SpecializationTable::Hooks hooks;
+    hooks.compile = [ctx, compile](const uint8_t* bytes, size_t n) -> void* { return compile(ctx.get(), bytes, n); };
+    hooks.reads = [length](void* p, std::vector<uint8_t>* mask) {
+        mask->assign(length, 0);
+        return hakios_metal_program_known_reads(static_cast<hakios_metal_program*>(p), mask->data(), length) == length;
+    };
+    hooks.release = [](void* p) { hakios_metal_program_free(static_cast<hakios_metal_program*>(p)); };
+    auto* t = new hakios_metal_spec_table;
+    t->table = std::make_unique<SpecializationTable>(base, length, most, std::move(hooks), CompileQueue::shared(), priorityOf(priority),
+                                                     what != nullptr ? what : "specialisation", exact != 0);
+    return t;
+}
+
+hakios_metal_program* hakios_metal_spec_table_program(hakios_metal_spec_table* t, const unsigned char* bytes, int* started) {
+    bool s = false;
+    void* p = t->table->programFor(bytes, &s);
+    if (started != nullptr) *started = s ? 1 : 0;
+    return static_cast<hakios_metal_program*>(p);
+}
+
+void hakios_metal_spec_table_stats(hakios_metal_spec_table* t, unsigned* contents, unsigned* ready, unsigned* failedOnes, unsigned* fallbackDraws,
+                                   unsigned* hits, unsigned* full) {
+    const SpecializationTable::Stats st = t->table->stats();
+    if (contents != nullptr) *contents = st.contents;
+    if (ready != nullptr) *ready = st.ready;
+    if (failedOnes != nullptr) *failedOnes = st.failed;
+    if (fallbackDraws != nullptr) *fallbackDraws = st.fallbackDraws;
+    if (hits != nullptr) *hits = st.hits;
+    if (full != nullptr) *full = st.full;
+}
+
+void hakios_metal_spec_table_free(hakios_metal_spec_table* t) { delete t; }
 
 unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
     if (p == nullptr || stage > 1) return 0;

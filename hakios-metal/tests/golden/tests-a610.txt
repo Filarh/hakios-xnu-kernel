@@ -56,6 +56,12 @@ a_command_buffer_behind_a_hang_is_given_up_not_run submits 3 words 207 draws 0 l
 without_recovery_the_first_hang_ends_every_later_wait submits 3 words 105 draws 0 loads 0 stream 9efcf556390aec4c state cbf29ce484222325 names 1 9ab2aef0511b058f (unread)
 a_fence_never_handed_out_is_a_hang submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 big_copies_are_cut_into_packets_the_gpu_takes submits 1 words 1167 draws 0 loads 0 stream fb5fa7318f328cc5 state cbf29ce484222325 names 2 b55fb85efbbb8fa8
+the_compile_queue_runs_the_highest_priority_first submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_queued_job_that_is_waited_for_runs_on_the_waiting_thread submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+the_foreground_compiler_is_never_held_by_background_work submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+an_uber_shaders_new_content_is_drawn_at_once_and_then_with_its_own_program submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+the_generic_and_the_specialised_program_write_the_same_colour submits 2 words 1372 draws 2 loads 5 stream ff31f27e2d775e92 state 910556a59302e9c8 names 10 d23b1897dba7c73a
+a_stage_one_process_filed_is_read_by_another submits 1 words 684 draws 1 loads 2 stream 8d8e31a33fd4ac30 state cb137a44d958688c names 4 82e9056f7ae1d6e6
        (no compiler in this build: the fixture comparison did not run)
 compiler_without_mesa_refuses_by_name_and_with_it_matches_the_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the query typing did not run)

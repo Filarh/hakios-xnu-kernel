@@ -51,7 +51,7 @@ IOS_CXX   ?= $(abspath $(HAKIOS))/xnu-deps/host/bin/xnu-clang++ -arch arm64 -isy
 IOS_AR    ?= llvm-ar --format=darwin rcs
 endif
 
-CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/gmem.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp
+CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/gmem.cpp src/link.cpp src/compiler.cpp src/compile_queue.cpp src/shader_cache.cpp src/specialize.cpp src/metallib.cpp src/c_api.cpp
 HOST      = $(CORE) src/fake_gpu.cpp
 TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
 
@@ -114,6 +114,16 @@ IOS_CACHE_BUILD := $(shell cat src/compiler.cpp include/hakios-metal/*.hpp $(wil
 	| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-24)
 ifneq ($(strip $(IOS_CACHE_BUILD)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_CACHE_BUILD='"$(IOS_CACHE_BUILD)"'
+endif
+# the shared cache's generation (shader_cache.hpp: HAKIOS_METAL_CACHE_V2): what decides a compiled stage's bytes and
+# nothing else -- the compiler and its stage/kernel layouts, the cache's file format, and Mesa's archives (the AIR
+# front end among them) -- so that a rebuild of the driver that leaves them alone keeps the cache, and a compiler that
+# changed starts a directory of its own (never a stale stage). IOS_COMPILER_ID= overrides it.
+IOS_COMPILER_ID ?= $(shell cat src/compiler.cpp src/shader_cache.cpp include/hakios-metal/compiler.hpp include/hakios-metal/render.hpp \
+	include/hakios-metal/kernel.hpp include/hakios-metal/texture.hpp $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))) 2>/dev/null \
+	| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-20)
+ifneq ($(strip $(IOS_COMPILER_ID)),)
+IOS_CXXFLAGS += -DHAKIOS_METAL_COMPILER_ID='"$(IOS_COMPILER_ID)"'
 endif
 endif
 
