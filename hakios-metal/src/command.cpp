@@ -364,8 +364,10 @@ void CommandQueue::tuned(uint64_t key, bool gmem, double us) {
 }
 
 void CommandBuffer::stampStart(PassKind kind, uint32_t width, uint32_t height) {
+    lastStamped_ = -1;
     if (!(profile_ || tuning_) || profiled_.size() >= kMaxProfiled) return;
     { PassTime t{}; t.kind = kind, t.width = width, t.height = height; profiled_.push_back(std::move(t)); }
+    lastStamped_ = int(profiled_.size() - 1);
     stamp(uint32_t(2 * (profiled_.size() - 1)));
     if (profileSamples_) sampleStamp(uint32_t(2 * (profiled_.size() - 1)));
 }
@@ -493,7 +495,8 @@ void CommandBuffer::finish(Status s) {
     if (s == kCompleted && counts_.binnedPasses != 0) queue_.checkVsc();
     if (s == kCompleted && tuning_) {
         for (const PassTime& t : passTimes()) {
-            if (t.tuneKey != 0) queue_.tuned(t.tuneKey, t.tiles != 0, t.us);
+            // (a pass run as a copy of its kept result says nothing of what such passes cost: passmemo.hpp)
+            if (t.tuneKey != 0 && t.memo != 2) queue_.tuned(t.tuneKey, t.tiles != 0, t.us);
         }
     }
     for (auto& h : handlers_) {
@@ -720,6 +723,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         return;
     }
     cb->closePass();   // the last pass's tail
+    cb->memoResolve();   // render-pass memoization: each kept pass a copy of its result, or run (passmemo.cpp)
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
     cb->stream_.waitForIdle();

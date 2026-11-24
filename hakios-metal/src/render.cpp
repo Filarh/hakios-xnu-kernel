@@ -4323,6 +4323,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
+    // (the caller's word for this draw alone: passmemo.hpp)
+    const memo::Hint memoHint = memoHint_;
+    memoHint_ = memo::Hint{};
     // A compressed texture whose rows this processor changed since the GPU last copied them in (Texture::staging): the
     // copy first, by the 2D engine into the UBWC layout, in a pass of its own before this draw's
     if (!freshen(vsBindings, options) || !freshen(fsBindings, options)) return false;
@@ -4707,6 +4710,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         open_->options = options;
         open_->table = passTable.gpuAddress();
         open_->cache = std::move(opened);
+        memoOpen(pass, options);   // (before the pass's words: passmemo.cpp)
         if (dual) {
             appendDeduped(open_->sysStream, headSys, open_->regs);
             open_->headGmem.clear();
@@ -4971,6 +4975,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             keep(null_->buffer());
         }
     }
+    memoDraw(program, pass, d, vsBindings, fsBindings, options, !joins, memoHint);
     return true;
 }
 
@@ -5108,6 +5113,15 @@ bool CommandBuffer::append(CommandBuffer& other) {
     // attachment is stored by both)
     closePass(nullptr, true);
     other.closePass(nullptr, true);
+    // (OTHER's memoized passes come along, their places in its stream moved to where it lands in this one)
+    for (std::unique_ptr<MemoPending>& p : other.memoPending_) {
+        const size_t base = stream_.size();
+        p->begin += base, p->end += base;
+        if (p->storeEnd > p->storeBegin) p->storeBegin += base, p->storeEnd += base;
+        p->profiled = -1;
+        memoPending_.push_back(std::move(p));
+    }
+    other.memoPending_.clear();
     appendStream(stream_, other.stream_);
     other.stream_ = pm4::Stream{};
     uses_.insert(uses_.end(), other.uses_.begin(), other.uses_.end());
@@ -5365,8 +5379,10 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
         render::encodeEnd(tail, open_->pass, open_->table, open_->options);
         appendStream(stream_, tail);
     }
+    std::unique_ptr<MemoPending> memo = memoClose(next, kept);   // (what may be kept of it: passmemo.cpp)
     stampEnd();
     open_.reset();
+    memoStore(std::move(memo));
 }
 
 bool CommandBuffer::clear(const RenderPass& pass, const render::Options& options) {

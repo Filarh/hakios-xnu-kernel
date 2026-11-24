@@ -28,6 +28,7 @@
 #include "hakios-metal/compute.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/gpu.hpp"
+#include "hakios-metal/passmemo.hpp"
 #include "hakios-metal/pm4.hpp"
 
 namespace hakios::metal {
@@ -63,8 +64,14 @@ public:
     const Bo& bo() const { return *bo_; }
     // the program's memory (newBufferNoCopy), cached by the processor; every other buffer is the driver's, write-combined
     bool programMemory() const { return programMemory_; }
+    // Its write epoch: one more each time a command buffer of this process records a GPU write of it (CommandBuffer::use
+    // for writing) or the processor writes it through the driver (Texture::replace). Render-pass memoization takes a
+    // sampled texture's memory as unchanged while this is (passmemo.hpp); writes through contents() are not counted.
+    uint64_t writes() const { return writes_.load(std::memory_order_relaxed); }
+    void noteWrite() const { writes_.fetch_add(1, std::memory_order_relaxed); }
 
 private:
+    mutable std::atomic<uint64_t> writes_{0};
     std::unique_ptr<Bo> bo_;
     uint64_t length_;
     std::function<void()> released_;
@@ -140,6 +147,9 @@ public:
     bool generateMipmaps(const Texture& texture, const render::Options& options = render::Options{});
     // a blit the caller could not record (a buffer not in the GPU's memory, say): the buffer ends in the error state
     void refuse(const std::string& why) { fail(why); }
+    // --- render-pass memoization (passmemo.hpp), the queue's mode permitting ---
+    // The caller's word for the next draw: where its vertices land (memo::Hint). Read by that draw alone.
+    void memoHint(const memo::Hint& hint) { memoHint_ = hint; }
     // a buffer it uses, kept alive until it completes (the owner may let go of it before that)
     // (by reference, and once: a draw names the same few buffers and textures as the draw before it, and a copy of the
     // pointer for each -- two atomic counts and a slot of a growing vector -- was most of what keeping them cost. One
@@ -193,7 +203,7 @@ public:
     // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
     // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; uint8_t memo = 0; };   // MEMO: 0 not looked at, 1 run (a miss or refused), 2 a copy of its kept result (a hit), 3 run and kept   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and the samples each pass's draws passed: the RB's running count copied out by ZPASS_DONE at the pass's start
@@ -300,6 +310,7 @@ private:
     // (once for reading and once for writing: the submission names each buffer once whatever the draws, and the list was
     // as long as the frame's draws times their bindings, gone through again for every one of them at the commit)
     void use(const Buffer& b, bool write) {
+        if (write) b.noteWrite();
         const Bo* bo = &b.bo();
         const void* key = reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(bo) | (write ? 1u : 0u));
         if (!recently(key)) uses_.push_back(BoUse{bo, write});
@@ -391,6 +402,7 @@ private:
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
         std::shared_ptr<render::PassCache> cache;
+        memo::Pass memo;   // render-pass memoization's look at it (passmemo.hpp)
     };
     // NEXT: the pass of the draw that could not join the open one, when it is such a draw that closes it (nullptr for
     // anything else: a copy, a dispatch, the commit). A memoryless attachment the tiles wrote is stored for it alone:
@@ -398,6 +410,34 @@ private:
     // KEPT: stored whatever follows (a command buffer appended to another: what follows is not known here).
     void closePass(const RenderPass* next = nullptr, bool kept = false);
     void useAttachments(const RenderPass& pass);
+    // --- render-pass memoization (passmemo.cpp) ---
+    // a pass closed whose words may become a copy at commit
+    struct MemoPending {
+        size_t begin = 0, end = 0;               // the pass's words in the stream
+        size_t storeBegin = 0, storeEnd = 0;     // the copy into the cache after it (none: equal)
+        uint64_t slot = 0;                       // what it is kept under in the queue
+        memo::Hash structure;
+        uint32_t rect[4] = {0, 0, 0, 0};         // the rectangle copied (X Y W H)
+        std::vector<memo::Range> ranges;
+        std::vector<memo::Volatile> volatiles;
+        std::vector<uint32_t> hitWords;          // the copy cache -> target, for a hit
+        std::vector<uint32_t> storeWords;        // the copy target -> cache, until memoStore puts it on the stream
+        std::shared_ptr<Texture> hitCache;       // ...from this cache
+        std::shared_ptr<Texture> storeCache;     // the cache the store wrote (none: no store)
+        int profiled = -1;
+        uint32_t draws = 0;
+    };
+    void memoOpen(const RenderPass& pass, const render::Options& options);
+    void memoDraw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
+                  const render::Options& options, bool first, const memo::Hint& hint);
+    // (before the pass's end stamp: what is to be kept of it; after: the store and the list)
+    std::unique_ptr<MemoPending> memoClose(const RenderPass* next, bool kept);
+    void memoStore(std::unique_ptr<MemoPending> p);
+    void memoResolve();
+    std::vector<std::unique_ptr<MemoPending>> memoPending_;
+    std::unordered_map<uint64_t, uint32_t> memoOrdinals_;   // the memo passes so far into each kind of target
+    memo::Hint memoHint_;
+    int lastStamped_ = -1;   // stampStart's entry among profiled_, -1 when it made none
     // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
     // again from nothing, a doubling at a time.
@@ -543,6 +583,18 @@ public:
     bool takeSpare(Spare* spare);
     CommandBuffer::OpenPassPtr takePass();
     void givePass(CommandBuffer::OpenPass* pass);
+    // Render-pass memoization (passmemo.hpp): MODE a memo::Mode; MIN_DRAWS the fewest draws a pass needs to be looked
+    // at (a pass of a few draws costs less than its copy); HASH_CAP the most bytes of one binding or texture hashed at
+    // commit (more: the pass is refused). Off by default.
+    void setMemo(uint32_t mode, uint32_t minDraws = 8, uint64_t hashCap = 1u << 20);
+    uint32_t memoMode() const { return memoMode_.load(std::memory_order_relaxed); }
+    // What answers for a texture whose memory the driver does not see written (an IOSurface, a texture over a buffer's
+    // rows): true and *VERSION a number that changes whenever its contents may have (the kernel's write sequence of the
+    // GEM object, an IOSurface seed); false: not known, its rows are hashed instead. None by default.
+    void setMemoVersion(std::function<bool(const Texture&, uint64_t*)> hook);
+    memo::Stats memoStats();
+    // the kept results let go (their textures freed once no command buffer in flight uses them)
+    void memoForget();
 
 
 private:
@@ -576,6 +628,24 @@ private:
     struct Peak { uint32_t draws = 0, below = 0; };
     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
     std::shared_ptr<render::StateCache> states_;   // (made by states() at the first ask, under lock_)
+    // render-pass memoization's store (passmemo.cpp), under memoLock_: by slot (the kind of target and the pass's place
+    // among the frame's memo passes into it), the kept result and what it was the result of
+    struct MemoEntry {
+        bool valid = false;
+        memo::Hash full;                    // structure and contents of the pass whose result the cache holds
+        memo::Hash structure;
+        uint32_t rect[4] = {0, 0, 0, 0};
+        std::shared_ptr<Texture> cache;
+        memo::Hash lastFull, lastStructure; // the last pass resolved at this slot (a pass seen twice in a row is kept)
+        bool seen = false;
+    };
+    std::mutex memoLock_;
+    std::unordered_map<uint64_t, MemoEntry> memo_;
+    std::atomic<uint32_t> memoMode_{0};
+    uint32_t memoMinDraws_ = 8;
+    uint64_t memoHashCap_ = 1u << 20;
+    std::function<bool(const Texture&, uint64_t*)> memoVersion_;
+    memo::Stats memoStats_;
     std::condition_variable changed_;
     std::deque<std::shared_ptr<CommandBuffer>> inFlight_;
     std::vector<std::unique_ptr<Bo>> idle_;

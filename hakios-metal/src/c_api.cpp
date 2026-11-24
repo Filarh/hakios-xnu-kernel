@@ -848,6 +848,22 @@ void hakios_metal_queue_set_deferred(hakios_metal_queue* q, int on) {
     if (!on) q->deferrer.reset();
 }
 
+void hakios_metal_queue_set_passmemo(hakios_metal_queue* q, unsigned mode, unsigned minDraws, uint64_t hashCap) {
+    q->queue->setMemo(mode, minDraws, hashCap);
+}
+
+int hakios_metal_queue_passmemo_stats(hakios_metal_queue* q, uint64_t counts[9], const char** lastRefusal, const char** lastMiss) {
+    static thread_local std::string refusal, miss;
+    const memo::Stats s = q->queue->memoStats();
+    const uint64_t c[9] = {s.candidates, s.hits, s.misses, s.stores, s.refused, s.skippedDraws, s.hashedBytes, s.hashNs, s.cacheBytes};
+    memcpy(counts, c, sizeof c);
+    refusal = s.lastRefusal;
+    miss = s.lastMiss;
+    if (lastRefusal != nullptr) *lastRefusal = refusal.c_str();
+    if (lastMiss != nullptr) *lastMiss = miss.c_str();
+    return q->queue->memoMode() != 0 ? 0 : -1;
+}
+
 hakios_metal_cb* hakios_metal_cb_new(hakios_metal_queue* q) {
     auto* r = new hakios_metal_cb;
     r->cb = q->queue->commandBuffer();
@@ -1017,6 +1033,21 @@ const char* hakios_metal_cb_gmem_refusal(hakios_metal_cb* cb) {
 
 const char* hakios_metal_cb_pass_sysmem_why(hakios_metal_cb* cb, unsigned i) {
     syncOne(cb); return cb->cb->passSysmemWhy(i); }
+
+int hakios_metal_cb_pass_memo(hakios_metal_cb* cb, unsigned i) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    return i < t.size() ? int(t[i].memo) : -1;
+}
+
+void hakios_metal_cb_memo_hint(hakios_metal_cb* cb, int rect, float x0, float y0, float x1, float y1) {
+    memo::Hint h;
+    h.set = true;
+    h.rect = rect != 0;
+    h.box[0] = x0, h.box[1] = y0, h.box[2] = x1, h.box[3] = y1;
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, h] { cb->cb->memoHint(h); });
+    cb->cb->memoHint(h);
+}
 
 int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned* attached, unsigned* touched) {
     syncOne(cb);

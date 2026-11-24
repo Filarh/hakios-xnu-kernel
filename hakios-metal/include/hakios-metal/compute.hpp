@@ -39,6 +39,9 @@ struct Sampler;
 struct Binding {
     const Buffer* buffer = nullptr;
     uint64_t offset = 0;      // bytes into it; a multiple of 4 (the descriptors address elements)
+    // the bytes from OFFSET the stage may read, when the caller knows them (-setVertexBytes:length:); 0 not known (to the
+    // buffer's end). Only render-pass memoization reads it (passmemo.hpp): what it hashes of the binding.
+    uint64_t bytes = 0;
 };
 
 // Everything a dispatch binds, each by Metal's own index: buffers[i] is [[buffer(i)]], textures[n] is [[texture(n)]]

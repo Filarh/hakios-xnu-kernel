@@ -490,6 +490,14 @@ void hakios_metal_queue_free(hakios_metal_queue *queue);
  * fills, blits, dispatches and anything asked back wait for what was told before them. Set it with no command buffer
  * of the queue being recorded. */
 void hakios_metal_queue_set_deferred(hakios_metal_queue *queue, int on);
+/* Render-pass memoization (passmemo.hpp): MODE 0 off, 1 passes whose colour 0 is cleared or DontCare, 2 those and
+ * passes that load it under a first draw the caller vouched for (hakios_metal_cb_memo_hint); MIN_DRAWS the fewest
+ * draws a pass needs to be looked at; HASH_CAP the most bytes of one binding or texture hashed at commit. */
+void hakios_metal_queue_set_passmemo(hakios_metal_queue *queue, unsigned mode, unsigned min_draws, uint64_t hash_cap);
+/* what the queue's memoization has done so far: candidates, hits, misses, stores, refused, the draws hits left out,
+ * the bytes hashed at commit and the nanoseconds that took, the bytes the caches hold; *LAST_REFUSAL and *LAST_MISS
+ * (valid until the next call) why the last pass was refused and what differed in the last miss. 0, or -1 when off. */
+int hakios_metal_queue_passmemo_stats(hakios_metal_queue *queue, uint64_t counts[9], const char **last_refusal, const char **last_miss);
 
 hakios_metal_cb *hakios_metal_cb_new(hakios_metal_queue *queue);
 /* the command buffer is released by its owner; one still in flight is waited for first. It may be freed inside its
@@ -563,6 +571,13 @@ const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);
 /* why profiled pass I (hakios_metal_cb_pass_time's) of draws was drawn in sysmem, "" for a GMEM pass or past the passes;
  * valid while CB lives */
 const char *hakios_metal_cb_pass_sysmem_why(hakios_metal_cb *cb, unsigned i);
+/* what render-pass memoization made of profiled pass I: 0 not looked at, 1 run, 2 a copy of its kept result, 3 run and
+ * kept; -1 past the passes */
+int hakios_metal_cb_pass_memo(hakios_metal_cb *cb, unsigned i);
+/* The caller's word for the next draw on CB (render-pass memoization, mode 2): its vertices land in X0 Y0 X1 Y1
+ * (pixels of the target, not clipped), and with RECT they are exactly that axis-aligned rectangle (two triangles over
+ * its corners). Read by the next draw alone. */
+void hakios_metal_cb_memo_hint(hakios_metal_cb *cb, int rect, float x0, float y0, float x1, float y1);
 int hakios_metal_cb_refuse(hakios_metal_cb *cb, const char *why);
 unsigned hakios_metal_cb_skipped(hakios_metal_cb *cb, const char **last);
 /* -generateMipmapsForTexture: */

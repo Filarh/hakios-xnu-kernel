@@ -661,6 +661,7 @@ struct CpuAccess {
 }  // namespace
 
 bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const void* bytes, uint64_t bytesPerRow, std::string* why) {
+    buffer_->noteWrite();   // (a processor write the driver sees: render-pass memoization's epoch, passmemo.hpp)
     if (staging_ != nullptr) {
         const bool ok = staging_->replace(level, x, y, w, h, bytes, bytesPerRow, why);
         if (ok) stale_ = true;
@@ -773,6 +774,7 @@ bool slicesFit(const Texture& t, uint32_t x, uint32_t y, uint32_t z, uint32_t w,
 
 bool Texture::replaceSlices(uint32_t level, uint32_t x, uint32_t y, uint32_t z, uint32_t w, uint32_t h, uint32_t d, const void* bytes,
                             uint64_t bytesPerRow, uint64_t bytesPerImage, std::string* why) {
+    buffer_->noteWrite();
     if (!slicesFit(*this, x, y, z, w, h, d, bytesPerRow, bytesPerImage, why) || !regionFits(*this, level, x, y, w, h, bytesPerRow, why)) return false;
     const TextureLevel L = this->level(level);
     const uint64_t row = uint64_t(w) * info_->bytesPerPixel;

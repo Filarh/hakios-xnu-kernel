@@ -1636,7 +1636,41 @@ struct hm_ft_pipe {
 	char *lines;                       /* its pipe line and a pblend line per colour attachment */
 	unsigned vdFormat, vdOffset, vdBuffer, vdStride;   /* attribute 0 of its vertex descriptor; vdFormat 0: none */
 	BOOL fixedVert, baseColor;         /* CoreAnimation's fixed_vert_*_gen, which reads its vertices itself; its fc_base_color */
+	BOOL caPipe;                       /* labelled com.apple.coreanimation.*: its vertex function keeps hm_ft_geometry's convention */
 };
+
+/*
+ * metal_passmemo=N (render-pass memoization, hakios-metal's passmemo.hpp): 0 off (the default), 1 passes whose colour 0
+ * is cleared or DontCare, 2 those and passes that load it under a first draw this plug-in vouches for -- an opaque
+ * axis-aligned rectangle by CoreAnimation's vertex convention (hm_ft_geometry), as CoreAnimation's screen pass begins.
+ * metal_passmemo_draws=K the fewest draws a pass needs (8), metal_passmemo_cap=BYTES the most bytes of one binding or
+ * texture hashed at commit (1 MiB). Read once, for every queue.
+ */
+static unsigned hm_memo_mode, hm_memo_draws = 8;
+static unsigned long long hm_memo_cap = 1ull << 20;
+static hakios_metal_queue *hm_memo_queue;   /* the last queue it was set on: whose counts metal_fps prints */
+
+static unsigned
+hm_passmemo_mode(void)
+{
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		if (hm_bootargs(args, &size) != 0) return;
+		if ((at = strstr(args, "metal_passmemo=")) != NULL) hm_memo_mode = (unsigned)MIN(MAX(atoi(at + strlen("metal_passmemo=")), 0), 2);
+		if ((at = strstr(args, "metal_passmemo_draws=")) != NULL && atoi(at + strlen("metal_passmemo_draws=")) > 0) {
+			hm_memo_draws = (unsigned)atoi(at + strlen("metal_passmemo_draws="));
+		}
+		if ((at = strstr(args, "metal_passmemo_cap=")) != NULL && atoll(at + strlen("metal_passmemo_cap=")) > 0) {
+			hm_memo_cap = (unsigned long long)atoll(at + strlen("metal_passmemo_cap="));
+		}
+	});
+	return hm_memo_mode;
+}
 
 static void *hm_ft_watch(void *unused);
 static void hm_ft_debug_methods(void);
@@ -2161,10 +2195,11 @@ hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
 		(void)hakios_metal_cb_pass_access(cb, (unsigned)i, &wrote, &read);
 		(void)hakios_metal_cb_pass_moved(cb, (unsigned)i, &loaded, &stored);
 		hm_ft_line(ft, "gpass i=%d kind=%s w=%u h=%u draws=%u us=%.1f mode=%s tiles=%d attached=0x%x touched=0x%x wrote=0x%x read=0x%x loaded=0x%x "
-			   "stored=0x%x samples=%lld why=%s\n", i,
+			   "stored=0x%x samples=%lld memo=%d why=%s\n", i,
 			   HM_FT_NAME(kind, "draw", "copy", "clear", "dispatch"), width, height, draws, us,
 			   kind != 0 ? "-" : tiles > 0 ? "gmem" : "sysmem", MAX(tiles, 0), attached, touched, wrote, read, loaded, stored,
-			   hakios_metal_cb_pass_samples(cb, (unsigned)i), hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
+			   hakios_metal_cb_pass_samples(cb, (unsigned)i), hakios_metal_cb_pass_memo(cb, (unsigned)i),
+			   hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
 	}
 }
 
@@ -2487,6 +2522,7 @@ hm_ft_pipe_new(MTLRenderPipelineDescriptor *d, id vs, id fs, hakios_metal_progra
 		snprintf(vd, sizeof(vd), "f%u+%u@b%u/%u", p->vdFormat, p->vdOffset, p->vdBuffer, p->vdStride);
 	}
 	p->fixedVert = [[vs name] hasPrefix:@"fixed_vert_"];
+	p->caPipe = [[d label] hasPrefix:@"com.apple.coreanimation."];
 	p->baseColor = hm_ft_constant_named(vs, @"fc_base_color", vsConstants, vsCount) > 0;
 	if (hm_ft_fs_traits != NULL) {
 		const unsigned traits = hm_ft_fs_traits(program);
@@ -4764,7 +4800,7 @@ hm_describe_function(id f)
 		unsigned count = fs != nil ? hm_function_constants(fs, fc, 64) : 0;
 
 		if (state != nil && fsAir != nil) [state hakiosKeepFragment:fsAir constants:fc count:count];
-		if (state != nil && hm_ft_mode()) {
+		if (state != nil && (hm_ft_mode() || hm_passmemo_mode() >= 2)) {   /* (metal_passmemo=2 reads its vertex descriptor too) */
 			hakios_metal_constant vc[64];
 			const unsigned vcount = hm_function_constants(vs, vc, 64);
 
@@ -6591,6 +6627,12 @@ HM_REFUSES_OUT_LOUD
 			hakios_metal_queue_set_deferred(_queue, 1);
 			HM_ONCE("command buffers recorded deferred, by a thread of hakios-metal's (metal_defer=1)\n");
 		}
+		if (hm_passmemo_mode() != 0) {
+			hakios_metal_queue_set_passmemo(_queue, hm_memo_mode, hm_memo_draws, hm_memo_cap);
+			hm_memo_queue = _queue;
+			HM_ONCE("passmemo: render-pass memoization on (metal_passmemo=%u, passes of %u draws or more, %llu bytes hashed at most a "
+				"binding)\n", hm_memo_mode, hm_memo_draws, hm_memo_cap);
+		}
 		/* boot-arg metal_keep=0: no draw is taken from what hakios-metal keeps of its program (hakios_metal_draw_states):
 		 * each is judged and written whole. The command stream is the same either way, so this is the switch to measure
 		 * what the kept states save and to bisect them. metal_verify=1: each draw taken from a kept state is also
@@ -6621,6 +6663,7 @@ HM_REFUSES_OUT_LOUD
 - (void)dealloc
 {
 	if (_queue != NULL) {
+		if (hm_memo_queue == _queue) hm_memo_queue = NULL;
 		hakios_metal_queue_free(_queue);
 	}
 	[_device release];
@@ -7643,6 +7686,17 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			 hm_fps.commit * 1e3, hm_fps.buffers ? hm_fps.latency * 1e3 / hm_fps.buffers : 0.0, hm_fps.latencyMax * 1e3,
 			 hm_fps.passes / per, hm_fps.draws / per, hm_fps.dispatches / per, hm_fps.copies / per, hm_fps.gmemPasses / per,
 			 hm_fps.tiles / per);
+		if (hm_memo_queue != NULL) {
+			uint64_t c[9];
+			const char *refusal = "", *miss = "";
+
+			if (hakios_metal_queue_passmemo_stats(hm_memo_queue, c, &refusal, &miss) == 0) {
+				hm_print("passmemo: %llu passes looked at, %llu hits (%llu draws left out), %llu misses, %llu kept, %llu refused; "
+					 "%.1f MB hashed at commit in %.2f ms; caches %.1f MB; last refusal \"%s\", last miss \"%s\" (totals since start)\n",
+					 (unsigned long long)c[0], (unsigned long long)c[1], (unsigned long long)c[5], (unsigned long long)c[2],
+					 (unsigned long long)c[3], (unsigned long long)c[4], c[6] / 1048576.0, c[7] / 1e6, c[8] / 1048576.0, refusal, miss);
+			}
+		}
 		if (hm_fps.gapsOnTime + hm_fps.gapsLate + hm_fps.gapsStall != 0) {
 			hm_print("fps: ... gaps between commits while something moves: %u on time (20 ms at most), %u a frame late (to 50 ms), "
 				 "%u stalls (past 50); a buffer made to committed %.1f ms on average, %.1f at most; %u held for an event; "
@@ -10422,6 +10476,57 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	_ftDraws++;
 }
 
+/*
+ * metal_passmemo=2: the core's word for the draw about to be recorded -- where its vertices land by CoreAnimation's
+ * convention (hm_ft_geometry: position attribute 0 times the mvp_matrix at [[buffer(2)]]), and whether they are exactly
+ * one axis-aligned rectangle (six vertices, two triangles over its four corners, the corner each leaves out opposite
+ * the other's). Said only for CoreAnimation's own pipelines (com.apple.coreanimation.*), whose vertex functions keep
+ * the convention; for any other draw nothing is said, and a pass that loads its target is then not kept.
+ */
+- (void)hakiosMemoHint:(hakios_metal_cb *)cb primitive:(MTLPrimitiveType)primitive start:(NSUInteger)start count:(NSUInteger)count
+	   indexBuffer:(id)indexBuffer indexType:(MTLIndexType)indexType indexOffset:(NSUInteger)indexOffset baseVertex:(NSInteger)baseVertex
+	     instances:(NSUInteger)instances
+{
+	const struct hm_ft_pipe *pipe = _pipeline != nil ? [_pipeline hakiosFtPipe] : NULL;
+	hakios_metal_buffer *vs[HM_MAX_BUFFERS];
+	struct hakios_metal_viewport vp;
+	float box[4], pos[12];
+	unsigned positions = 0, read = 0, w = 0, h = 0;
+	const char *source = "";
+	BOOL rect = NO;
+
+	if (pipe == NULL || !pipe->caPipe || instances != 1) return;
+	if (indexBuffer != nil && ![indexBuffer isKindOfClass:[HakiosMetalBuffer class]]) return;
+	hm_ft_window(&_pass, &w, &h);
+	vp = _hasViewport ? _viewport : (struct hakios_metal_viewport){ 0, 0, (double)w, (double)h, 0, 1 };
+	for (unsigned i = 0; i < _vsHighest; i++) vs[i] = _vsBuffers[i] != nil ? [_vsBuffers[i] hakiosBuffer] : NULL;
+	if (!hm_ft_geometry(pipe, vs, _vsOffsets, _vsHighest, &vp, (unsigned)start, (unsigned)count,
+			    indexBuffer != nil ? [(HakiosMetalBuffer *)indexBuffer hakiosBuffer] : NULL, (unsigned)indexType, (uint64_t)indexOffset,
+			    (long)baseVertex, box, pos, &positions, &read, &source)) {
+		return;
+	}
+	if (primitive == MTLPrimitiveTypeTriangle && count == 6 && read == 6 && positions == 6) {
+		/* each vertex a corner of the box; each triangle three distinct corners; the two left out opposite */
+		unsigned corner[6], missing[2];
+
+		rect = YES;
+		for (unsigned i = 0; i < 6 && rect; i++) {
+			const BOOL x0 = pos[2 * i] == box[0], x1 = pos[2 * i] == box[2], y0 = pos[2 * i + 1] == box[1], y1 = pos[2 * i + 1] == box[3];
+
+			rect = (x0 || x1) && (y0 || y1) && box[0] < box[2] && box[1] < box[3];
+			corner[i] = (x1 ? 1u : 0u) | (y1 ? 2u : 0u);
+		}
+		for (unsigned t = 0; t < 2 && rect; t++) {
+			const unsigned a = corner[3 * t], b = corner[3 * t + 1], c = corner[3 * t + 2];
+
+			rect = a != b && b != c && a != c;
+			missing[t] = 6u - a - b - c;   /* (the corners are 0..3: the one left out) */
+		}
+		rect = rect && (missing[0] ^ missing[1]) == 3u;
+	}
+	hakios_metal_cb_memo_hint(cb, rect, box[0], box[1], box[2], box[3]);
+}
+
 - (void)hakiosDrawOnce:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances
 	   indexBuffer:(id)indexBuffer indexType:(MTLIndexType)indexType indexOffset:(NSUInteger)indexOffset baseVertex:(NSInteger)baseVertex
 	  baseInstance:(NSUInteger)baseInstance
@@ -10536,6 +10641,10 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 			return;
 		}
 		hakios_metal_cb_set_indirect(cb, [(HakiosMetalBuffer *)indirectArgs hakiosBuffer], (uint64_t)indirectOffset);
+	}
+	if (hm_memo_mode >= 2 && indirectArgs == nil) {
+		[self hakiosMemoHint:cb primitive:primitive start:start count:count indexBuffer:indexBuffer indexType:indexType indexOffset:indexOffset
+			  baseVertex:baseVertex instances:instances];
 	}
 	const double coreBegan = hm_fps_on() ? hm_now() : 0;
 	if (_ftrace != NULL) ftBefore = hm_ft_total(cb);

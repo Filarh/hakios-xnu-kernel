@@ -82,6 +82,8 @@ public:
     void append(const uint32_t* words, size_t count) { words_.insert(words_.end(), words, words + count); }
 
     const std::vector<uint32_t>& words() const { return words_; }
+    // the words in place, for a change that keeps their number (render-pass memoization's, at commit: passmemo.cpp)
+    uint32_t* data() { return words_.data(); }
     size_t size() const { return words_.size(); }
     void clear() { words_.clear(); }
 
