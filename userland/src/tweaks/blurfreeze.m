@@ -31,9 +31,16 @@
  *   scale=F           the snapshot's resolution relative to the screen (default 1 for mode 1, 0.5 for mode 2)
  *   maxms=N           the longest a session lasts (default 1500)
  *   slackms=N         how long after the last change a session stays (default 250)
- *   recipes=a,b       the materials it applies to (default modulesBackground: the Control Center's background)
- *   dump=1            each snapshot is also written to /var/tmp/blurfreeze-N.raw (BGRA, its size in the log line)
+ *   recipes=a,b       the materials it applies to, * for all (default modulesBackground,homeScreenOverlay: the Control
+ *                     Center's background, and the overlay of the Today panel and the App Library)
+ *   dump=1            each snapshot is also written to /var/tmp/blurfreeze-N.raw (BGRA, its size in the log line), and
+ *                     every animation added to a material and its weighting changes are logged (a weighting line per
+ *                     material at most every 100 ms; nothing is formatted without dump=1)
  *   quiet=1           no log lines but the errors
+ *
+ * Crash guard: /var/tmp/blurfreeze.armed exists while a session runs (it is written before the snapshot and removed when
+ * the session ends). A SpringBoard that starts and finds it died in a session: the file becomes /var/tmp/blurfreeze.tripped
+ * (with the count of trips) and the tweak installs nothing. While blurfreeze.tripped exists it stays off; rm it to re-arm.
  *
  * Each session says on the console: "blurfreeze: session N mode M recipe R rect ... snapshot W x H in X ms, excluded
  * contexts [...]" and at the end "blurfreeze: session N ended after X ms (changes C, animations A)".
@@ -68,7 +75,7 @@ struct bf_config {
 	int dump, quiet;
 };
 
-static struct bf_config bf_cfg = { 0, 0, 1500, 250, "modulesBackground", 0, 0 };
+static struct bf_config bf_cfg = { 0, 0, 1500, 250, "modulesBackground,homeScreenOverlay", 0, 0 };
 static CFTimeInterval bf_cfg_read_at = -1e9;
 static int bf_sessions_live;   /* sessions running (main thread only): the cheap test every hook makes first */
 
@@ -95,7 +102,7 @@ static void
 bf_read_config(void)
 {
 	char buf[512] = "";
-	struct bf_config c = { 0, 0, 1500, 250, "modulesBackground", 0, 0 };
+	struct bf_config c = { 0, 0, 1500, 250, "modulesBackground,homeScreenOverlay", 0, 0 };
 	int fd = open("/var/tmp/blurfreeze.args", O_RDONLY);
 
 	if (fd >= 0) {
@@ -152,7 +159,7 @@ bf_recipe_allowed(NSString *recipe)
 /* the private API, found at run time: nothing here links against a symbol iOS 16 might not have */
 
 static BOOL (*bf_CARenderServerSnapshot)(mach_port_t, CFDictionaryRef);
-static CFStringRef bf_kMode, bf_kModeExclude, bf_kContextList, bf_kDisplayName, bf_kDestination, bf_kTransform;
+static CFStringRef bf_kMode, bf_kModeExclude, bf_kContextList, bf_kContextId, bf_kDisplayName, bf_kDestination, bf_kTransform;
 static Class bf_MTMaterialLayer, bf_CABackdropLayer;
 
 static CFStringRef
@@ -170,12 +177,13 @@ bf_resolve(void)
 	bf_kMode = bf_const("kCASnapshotMode");
 	bf_kModeExclude = bf_const("kCASnapshotModeExcludeContextList");
 	bf_kContextList = bf_const("kCASnapshotContextList");
+	bf_kContextId = bf_const("kCASnapshotContextId");
 	bf_kDisplayName = bf_const("kCASnapshotDisplayName");
 	bf_kDestination = bf_const("kCASnapshotDestination");
 	bf_kTransform = bf_const("kCASnapshotTransform");
 	bf_MTMaterialLayer = objc_getClass("MTMaterialLayer");
 	bf_CABackdropLayer = objc_getClass("CABackdropLayer");
-	if (bf_CARenderServerSnapshot == NULL || bf_kMode == NULL || bf_kModeExclude == NULL || bf_kContextList == NULL ||
+	if (bf_CARenderServerSnapshot == NULL || bf_kMode == NULL || bf_kModeExclude == NULL || bf_kContextList == NULL || bf_kContextId == NULL ||
 	    bf_kDisplayName == NULL || bf_kDestination == NULL || bf_kTransform == NULL || bf_MTMaterialLayer == Nil ||
 	    bf_CABackdropLayer == Nil) {
 		bf_say(YES, "not armed: snapshot=%p mode=%p exclude=%p list=%p display=%p dest=%p transform=%p MTMaterialLayer=%p",
@@ -201,6 +209,102 @@ bf_context_id(CALayer *layer)
 	SEL s = sel_registerName("contextId");
 
 	return context != nil && [context respondsToSelector:s] ? ((unsigned (*)(id, SEL))objc_msgSend)(context, s) : 0;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------- */
+/* the crash guard: /var/tmp/blurfreeze.armed while a session (or its snapshot) is in progress */
+
+#define BF_ARMED   "/var/tmp/blurfreeze.armed"
+#define BF_TRIPPED "/var/tmp/blurfreeze.tripped"
+
+static void
+bf_guard_enter(int number)
+{
+	char line[64];
+	int fd = open(BF_ARMED, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	if (fd < 0) return;
+	snprintf(line, sizeof(line), "session=%d pid=%d\n", number, getpid());
+	(void)write(fd, line, strlen(line));
+	fsync(fd);
+	close(fd);
+}
+
+static void
+bf_guard_leave(void)
+{
+	if (bf_sessions_live == 0) unlink(BF_ARMED);
+}
+
+/* at load: NO when the last SpringBoard died in a session or a trip has not been cleared (then nothing is installed) */
+static BOOL
+bf_guard_ok(void)
+{
+	char old[64] = "", prev[64] = "";
+	int trips = 0, fd;
+
+	if ((fd = open(BF_TRIPPED, O_RDONLY)) >= 0) {
+		ssize_t got = read(fd, prev, sizeof(prev) - 1);
+
+		close(fd);
+		prev[got > 0 ? got : 0] = '\0';
+		sscanf(prev, "trips=%d", &trips);
+	}
+	if ((fd = open(BF_ARMED, O_RDONLY)) >= 0) {
+		ssize_t got = read(fd, old, sizeof(old) - 1);
+		char line[160];
+
+		close(fd);
+		old[got > 0 ? got : 0] = '\0';
+		old[strcspn(old, "\n")] = '\0';
+		unlink(BF_ARMED);
+		trips++;
+		if ((fd = open(BF_TRIPPED, O_WRONLY | O_CREAT | O_TRUNC, 0644)) >= 0) {
+			snprintf(line, sizeof(line), "trips=%d last=%s\n", trips, old);
+			(void)write(fd, line, strlen(line));
+			fsync(fd);
+			close(fd);
+		}
+		bf_say(YES, "DISABLED: the last SpringBoard died during a session (%s); trips %d. rm " BF_TRIPPED " to re-arm", old, trips);
+		return NO;
+	}
+	if (trips > 0 || prev[0] != '\0') {
+		bf_say(YES, "DISABLED: " BF_TRIPPED " exists (%d trips); rm it to re-arm", trips);
+		return NO;
+	}
+	return YES;
+}
+
+/* something of MATERIAL's own CAContext is drawn before it (a visible earlier sibling of it or of an ancestor): then
+ * leaving its context out of the snapshot would leave out what is behind it too (the home screen's icons behind the
+ * homeScreenOverlay material) */
+static BOOL
+bf_shares_context_behind(CALayer *m)
+{
+	for (CALayer *l = m, *p = m.superlayer; p != nil; l = p, p = p.superlayer) {
+		for (CALayer *sib in p.sublayers) {
+			if (sib == l) break;
+			if (!sib.hidden && sib.opacity > 0) return YES;
+		}
+	}
+	return NO;
+}
+
+/* the layers drawn over MATERIAL in its own context: it and every later sibling of it and of its ancestors */
+static NSArray *
+bf_layers_from(CALayer *m)
+{
+	NSMutableArray *out = [NSMutableArray arrayWithObject:m];
+
+	for (CALayer *l = m, *p = m.superlayer; p != nil; l = p, p = p.superlayer) {
+		BOOL after = NO;
+
+		for (CALayer *sib in p.sublayers) {
+			if (after && !sib.hidden) [out addObject:sib];
+			if (sib == l) after = YES;
+		}
+	}
+	return out;
 }
 
 /* ---------------------------------------------------------------------------------------------------------------- */
@@ -248,11 +352,12 @@ bf_screen_rect(CALayer *material, CALayer **rootOut)
 	return [material convertRect:material.bounds toLayer:root];
 }
 
-/* the contexts the snapshot leaves out: the material's own, and every SpringBoard window's at or above its window */
+/* the contexts the snapshot leaves out: the material's own (unless OWN is NO), and every SpringBoard window's at or above
+ * its window -- as context IDs (NSNumber); bf_snapshot makes them the dictionaries CoreAnimation wants */
 static NSArray *
-bf_excluded_contexts(CALayer *material, unsigned materialContext)
+bf_excluded_contexts(CALayer *material, unsigned materialContext, BOOL own)
 {
-	NSMutableArray *ids = [NSMutableArray arrayWithObject:@(materialContext)];
+	NSMutableArray *ids = own ? [NSMutableArray arrayWithObject:@(materialContext)] : [NSMutableArray array];
 	Class app = objc_getClass("UIApplication");
 	id shared = app != Nil ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("sharedApplication")) : nil;
 	NSArray *windows = bf_send(shared, "windows");
@@ -312,14 +417,31 @@ bf_snapshot(CALayer *material, double scale, CGRect rect, NSArray *excluded, dou
 	}
 	/* as MaterialKit's own snapshot: the display's points moved by the rectangle's origin, then scaled to pixels */
 	t = CATransform3DConcat(CATransform3DMakeTranslation(-rect.origin.x, -rect.origin.y, 0), CATransform3DMakeScale(s, s, 1));
-	began = CACurrentMediaTime();
-	ok = bf_CARenderServerSnapshot(0, (__bridge CFDictionaryRef)@{
-		(__bridge NSString *)bf_kMode: (__bridge NSString *)bf_kModeExclude,
-		(__bridge NSString *)bf_kContextList: excluded,
-		(__bridge NSString *)bf_kDisplayName: name,
-		(__bridge NSString *)bf_kDestination: (__bridge id)surface,
-		(__bridge NSString *)bf_kTransform: [NSValue valueWithCATransform3D:t],
-	});
+	/* Each element of kCASnapshotContextList is a DICTIONARY, not a number: QuartzCore 20H392's
+	 * get_context_list_info(NSArray *, unsigned *, CATransform3D *) (0x188369fd4) enumerates the list and sends each
+	 * element -objectForKey:kCASnapshotContextId ("contextId") -unsignedIntValue, and, when asked for transforms (the
+	 * capture paths), -objectForKey:kCASnapshotTransform ("transform") -CATransform3DValue. With an include or exclude
+	 * mode CARenderServerSnapshot_ (0x1882adc90) calls it without transforms and gives _CARenderServerSnapshotDisplay
+	 * the dictionary's top-level kCASnapshotTransform. An NSNumber element raised "unrecognized selector
+	 * -objectForKey:" inside the render call (SpringBoard aborted on the phone). */
+	{
+		NSMutableArray *list = [NSMutableArray arrayWithCapacity:excluded.count];
+
+		for (NSNumber *n in excluded) [list addObject:@{ (__bridge NSString *)bf_kContextId: n }];
+		began = CACurrentMediaTime();
+		@try {
+			ok = bf_CARenderServerSnapshot(0, (__bridge CFDictionaryRef)@{
+				(__bridge NSString *)bf_kMode: (__bridge NSString *)bf_kModeExclude,
+				(__bridge NSString *)bf_kContextList: list,
+				(__bridge NSString *)bf_kDisplayName: name,
+				(__bridge NSString *)bf_kDestination: (__bridge id)surface,
+				(__bridge NSString *)bf_kTransform: [NSValue valueWithCATransform3D:t],
+			});
+		} @catch (NSException *e) {
+			bf_say(YES, "CARenderServerSnapshot raised %s: %s", e.name.UTF8String, e.reason.UTF8String);
+			ok = NO;
+		}
+	}
 	*msOut = (CACurrentMediaTime() - began) * 1e3;
 	if (!ok) {
 		bf_say(YES, "CARenderServerSnapshot failed (%zux%zu)", w, h);
@@ -458,6 +580,7 @@ bf_end(BFSession *s, const char *why)
 	s.proxy = nil;
 	if (m != nil) objc_setAssociatedObject(m, bf_session_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 	bf_sessions_live--;
+	bf_guard_leave();
 	bf_say(NO, "session %d ended (%s) after %.0f ms: %u changes, %u animations", s.number, why, (now - s.started) * 1e3, s.changes,
 	       s.animations);
 }
@@ -474,14 +597,38 @@ bf_begin(CALayer *m, int mode)
 	IOSurfaceRef surface;
 	double ms = 0;
 	size_t w = 0, h = 0;
+	BOOL shared;
 	BFSession *s;
 
 	if (!bf_recipe_allowed(recipe) || m.superlayer == nil || cid == 0) return nil;
 	rect = bf_screen_rect(m, &root);
 	if (CGRectIsEmpty(rect)) return nil;
-	excluded = bf_excluded_contexts(m, cid);
-	surface = bf_snapshot(m, scale, rect, excluded, &ms, &w, &h);
-	if (surface == NULL) return nil;
+	bf_guard_enter(bf_session_count + 1);
+	shared = bf_shares_context_behind(m);
+	excluded = bf_excluded_contexts(m, cid, !shared);
+	if (!shared) {
+		surface = bf_snapshot(m, scale, rect, excluded, &ms, &w, &h);
+	} else {
+		/* "hide": the material's context stays in the snapshot, with the material and what its context draws over it
+		 * hidden for the moment of the snapshot (committed by a flush; at the start of a transition the material is
+		 * nearly transparent, but one frame without it may reach the screen) */
+		NSArray *over = bf_layers_from(m);
+
+		[CATransaction begin];
+		[CATransaction setDisableActions:YES];
+		for (CALayer *l in over) l.hidden = YES;
+		[CATransaction commit];
+		[CATransaction flush];
+		surface = bf_snapshot(m, scale, rect, excluded, &ms, &w, &h);
+		[CATransaction begin];
+		[CATransaction setDisableActions:YES];
+		for (CALayer *l in over) l.hidden = NO;
+		[CATransaction commit];
+	}
+	if (surface == NULL) {
+		bf_guard_leave();
+		return nil;
+	}
 
 	s = [BFSession new];
 	s.material = m;
@@ -536,8 +683,8 @@ bf_begin(CALayer *m, int mode)
 
 		for (NSNumber *n in excluded) [ex appendFormat:@"%@%u", ex.length ? @"," : @"", n.unsignedIntValue];
 		for (id f in m.filters ?: s.savedFilters) [fl appendFormat:@"%@%@", fl.length ? @"," : @"", bf_send(f, "name") ?: @"?"];
-		bf_say(NO, "session %d mode %d recipe %s rect %.0f,%.0f %.0fx%.0f pt: snapshot %zux%zu (scale %g) in %.1f ms, excluded "
-		       "contexts [%s] of context %u; material %s sublayers %lu filters [%s] animations %lu", s.number, mode, recipe.UTF8String,
+		bf_say(NO, "session %d mode %d recipe %s strategy %s rect %.0f,%.0f %.0fx%.0f pt: snapshot %zux%zu (scale %g) in %.1f ms, excluded "
+		       "contexts [%s] of context %u; material %s sublayers %lu filters [%s] animations %lu", s.number, mode, recipe.UTF8String, shared ? "hide" : "exclude",
 		       rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, w, h, scale, ms, ex.UTF8String, cid,
 		       class_getName(object_getClass(m)), (unsigned long)m.sublayers.count, fl.UTF8String, (unsigned long)m.animationKeys.count);
 	}
@@ -569,10 +716,29 @@ bf_touch(CALayer *m, CFTimeInterval until, BOOL animation)
 /* ---------------------------------------------------------------------------------------------------------------- */
 /* the replacements */
 
+/* dump=1: a material's weighting change, at most one line per material every 100 ms (the last material and time kept) */
+static void
+bf_dump_weighting(CALayer *m)
+{
+	static __unsafe_unretained CALayer *last;
+	static CFTimeInterval lastAt;
+	const CFTimeInterval now = CACurrentMediaTime();
+
+	if (m == last && now - lastAt < 0.1) return;
+	last = m;
+	lastAt = now;
+	bf_say(NO, "weighting %.3f on %s %p recipe=%s context=%u session=%d", [[m valueForKey:@"weighting"] doubleValue],
+	       object_getClassName(m), (__bridge void *)m, [[bf_send(m, "recipeName") description] UTF8String], bf_context_id(m),
+	       bf_session(m) != nil ? bf_session(m).number : 0);
+}
+
 static void
 bf_updateWeighting(id self, SEL _cmd)
 {
 	bf_orig_updateWeighting(self, _cmd);
+	if (!pthread_main_np()) return;
+	(void)bf_mode();   /* (re-reads the switches, at most once a second, outside sessions) */
+	if (bf_cfg.dump) bf_dump_weighting(self);
 	bf_touch(self, 0, NO);
 }
 
@@ -593,9 +759,14 @@ bf_addAnimation(id self, SEL _cmd, CAAnimation *anim, NSString *key)
 	BFSession *s;
 
 	bf_orig_addAnimation(self, _cmd, anim, key);
-	/* the cheap way out first: switched off (as last read, under a second ago), or not the main thread */
-	if (bf_cfg.mode == 0 && bf_sessions_live == 0 && CACurrentMediaTime() - bf_cfg_read_at < 1.0) return;
+	/* the cheap way out first: switched off with no logging (as last read, under a second ago), or not the main thread */
+	if (bf_cfg.mode == 0 && !bf_cfg.dump && bf_sessions_live == 0 && CACurrentMediaTime() - bf_cfg_read_at < 1.0) return;
 	if (!pthread_main_np()) return;
+	if (bf_cfg.dump && [self isKindOfClass:bf_MTMaterialLayer])
+		bf_say(NO, "anim on %s recipe=%s key=%s keyPath=%s class=%s", object_getClassName(self),
+		    [[bf_send(self, "recipeName") description] UTF8String], key.UTF8String,
+		    [anim isKindOfClass:[CAPropertyAnimation class]] ? ((CAPropertyAnimation *)anim).keyPath.UTF8String : "-",
+		    object_getClassName(anim));
 	if (![self isKindOfClass:bf_MTMaterialLayer] || ![anim isKindOfClass:[CAPropertyAnimation class]]) return;
 	{
 		NSString *keyPath = ((CAPropertyAnimation *)anim).keyPath;
@@ -679,7 +850,7 @@ bf_init(void)
 	if (prog == NULL || strcmp(prog, "SpringBoard") != 0) return;
 	/* CoreMaterial is SpringBoard's already, but a library loaded early may come before it */
 	dlopen("/System/Library/PrivateFrameworks/CoreMaterial.framework/CoreMaterial", RTLD_LAZY);
-	if (!bf_resolve()) return;
+	if (!bf_guard_ok() || !bf_resolve()) return;
 	if (!bf_replace(bf_MTMaterialLayer, "_updateForChangeInWeighting", (IMP)bf_updateWeighting, &bf_orig_updateWeighting) ||
 	    !bf_replace([CALayer class], "addAnimation:forKey:", (IMP)bf_addAnimation, &bf_orig_addAnimation) ||
 	    !bf_replace([CALayer class], "setFilters:", (IMP)bf_setFilters, &bf_orig_setFilters) ||
