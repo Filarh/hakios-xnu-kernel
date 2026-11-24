@@ -1430,6 +1430,7 @@ void hakios_metal_compile_times(unsigned* stages, unsigned* cached, unsigned* co
 
 void hakios_metal_compile_set_lanes(unsigned lanes) { setCompileLanes(lanes); }
 unsigned hakios_metal_compile_lanes(void) { return compileLanes(); }
+void hakios_metal_compile_set_foreground_first(int on) { setCompileForegroundFirst(on != 0); }
 void hakios_metal_compile_set_activity(const char* what) { setCompileActivity(what != nullptr ? what : ""); }
 
 void hakios_metal_compile_report_take(hakios_metal_compile_report* r) {

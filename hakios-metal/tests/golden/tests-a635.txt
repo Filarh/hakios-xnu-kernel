@@ -62,6 +62,8 @@ the_foreground_compiler_is_never_held_by_background_work submits 0 words 0 draws
 an_uber_shaders_new_content_is_drawn_at_once_and_then_with_its_own_program submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_generic_and_the_specialised_program_write_the_same_colour submits 2 words 1372 draws 2 loads 5 stream f5a2ea399c0db14e state 910556a59302e9c8 names 10 d23b1897dba7c73a
 a_stage_one_process_filed_is_read_by_another submits 1 words 684 draws 1 loads 2 stream 3cd3c2527fb3890a state cb137a44d958688c names 4 82e9056f7ae1d6e6
+       (no compiler in this build: the two lanes did not run)
+two_compilers_at_once_compile_what_one_compiles_alone submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the fixture comparison did not run)
 compiler_without_mesa_refuses_by_name_and_with_it_matches_the_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the query typing did not run)

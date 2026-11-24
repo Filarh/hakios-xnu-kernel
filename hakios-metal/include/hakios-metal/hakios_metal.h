@@ -359,6 +359,8 @@ void hakios_metal_compile_times(unsigned *stages, unsigned *cached, unsigned *co
  * thread needs. Set before the first compilation. */
 void hakios_metal_compile_set_lanes(unsigned lanes);
 unsigned hakios_metal_compile_lanes(void);
+/* with one lane: a waiting foreground thread gets the compiler before any background one (1), or not (0, the default) */
+void hakios_metal_compile_set_foreground_first(int on);
 /* what the calling thread compiles from now on (NULL or "" clears it), named to whoever waits behind it */
 void hakios_metal_compile_set_activity(const char *what);
 /* hakios_metal_compile_times with more: what held the compiler when this thread found it taken (BEHIND, the longest such
