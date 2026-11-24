@@ -1,7 +1,10 @@
 #include "hakios-metal/compiler.hpp"
+#include "hakios-metal/compile_queue.hpp"
+#include "hakios-metal/shader_cache.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +71,11 @@ CompileTimes takeCompileTimes() { return {}; }
 
 WarmUpReport warmUp() { return {}; }
 
+WarmUpReport warmUpAsync(CompileQueue&, CompilePriority, void (*done)(const WarmUpReport&)) {
+    if (done != nullptr) done(WarmUpReport{});
+    return {};
+}
+
 std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage>, std::shared_ptr<CompiledStage>, PixelFormat, std::string* why) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
@@ -82,11 +90,14 @@ bool argumentBufferLayout(const void*, size_t, uint32_t, std::vector<std::pair<u
 
 namespace {
 
-std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
+// ir3 keeps state in the compiler object (compileStage turns has_preamble off and on around a second compilation): one
+// compilation at a time on each. One compiler a slot (compile_queue.hpp): slot 0 is the only one with one lane, and the
+// foreground's with two; slot 1 the background's. A compilation holds its slot (CompilerHold) and compiles with that
+// slot's compiler: tHeldSlot is the slot the calling thread holds.
+thread_local unsigned tHeldSlot = 0;
 
-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
-ir3_compiler* theCompiler() {
-    static ir3_compiler* compiler = [] {
+ir3_compiler* makeCompiler() {
+    {
         fd_dev_id id{};
         id.gpu_id = 0;
         id.chip_id = a6xx::kChipId;
@@ -99,9 +110,26 @@ ir3_compiler* theCompiler() {
         // is read through one); held for the life of the process, as the compiler is
         glsl_type_singleton_init_or_ref();
         return ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
-    }();
-    return compiler;
+    }
 }
+
+// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row --
+// the one of the slot this thread holds
+ir3_compiler* theCompiler() {
+    static ir3_compiler* compilers[2] = {};
+    static std::once_flag made[2];
+    const unsigned slot = tHeldSlot < 2 ? tHeldSlot : 0;
+    std::call_once(made[slot], [&] { compilers[slot] = makeCompiler(); });
+    return compilers[slot];
+}
+
+// what the calling thread holds while it compiles: its lane's slot, and with it that slot's compiler
+struct HeldCompiler {
+    CompilerHold hold;
+    unsigned was;
+    explicit HeldCompiler(CompileLane lane) : hold(lane), was(tHeldSlot) { tHeldSlot = hold.slot(); }
+    ~HeldCompiler() { tHeldSlot = was; }
+};
 
 bool refuse(std::string* why, const std::string& text) {
     *why = text;
@@ -1257,7 +1285,6 @@ struct CacheReader {
         return v;
     }
 };
-constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
 // What the compiler is, for the cache's key: the Makefile's hash of this file, the driver's headers and the Mesa
 // archives linked in (HAKIOS_METAL_CACHE_BUILD), so that a stage compiled before stays good across a rebuild of the
 // library that changed nothing of the compiler -- with __DATE__ and __TIME__ every rebuild of the plug-in (any file
@@ -1269,14 +1296,55 @@ const char* const kCacheBuild = HAKIOS_METAL_CACHE_BUILD;
 const char* const kCacheBuild = __DATE__ " " __TIME__;
 #endif
 
+// The constants that decide a module's code: those it declares, each once (the last value supplied for an index is the
+// one translate applies), in index order. CoreAnimation supplies each function its pipeline's whole set; the ones a
+// module does not declare change nothing it compiles to, and in the old key they made two names of one stage. Read off
+// the module once per bitcode (by its hash) and kept.
+FunctionConstants declaredConstants(const void* bitcode, size_t size, const FunctionConstants& supplied) {
+    static std::mutex lock;
+    static std::map<std::pair<uint64_t, uint64_t>, std::vector<uint32_t>> declaredOf;
+    uint64_t h[2] = {0xcbf29ce484222325ull, 0x84222325cbf29ce4ull};
+    for (size_t i = 0; i < size; i++) {
+        const uint8_t b = static_cast<const uint8_t*>(bitcode)[i];
+        h[0] = (h[0] ^ b) * 0x100000001b3ull;
+        h[1] = (h[1] ^ b) * 0x1000193ull + (h[1] >> 29);
+    }
+    std::vector<uint32_t> declared;
+    {
+        std::lock_guard<std::mutex> g(lock);
+        auto it = declaredOf.find({h[0], h[1]});
+        if (it != declaredOf.end()) declared = it->second;
+    }
+    if (declared.empty()) {
+        void* mem = ralloc_context(nullptr);
+        air_constant_value* constants = nullptr;
+        const unsigned n = air_module_function_constants(mem, bitcode, size, &constants);
+        for (unsigned i = 0; i < n; i++) declared.push_back(constants[i].index);
+        ralloc_free(mem);
+        declared.push_back(~0u);   // (a sentinel: a module that declares none is remembered too)
+        std::lock_guard<std::mutex> g(lock);
+        declaredOf[{h[0], h[1]}] = declared;
+    }
+    std::map<uint32_t, uint64_t> byIndex;
+    for (const FunctionConstant& c : supplied) {
+        if (std::find(declared.begin(), declared.end(), c.index) != declared.end()) byIndex[c.index] = c.bits;
+    }
+    FunctionConstants out;
+    for (const auto& kv : byIndex) out.push_back(FunctionConstant{kv.first, kv.second});
+    return out;
+}
+
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
 // HAKIOS_METAL_CACHE, and the read-only ones HAKIOS_METAL_CACHE_SEED (':' between them) -- stages compiled on an
-// earlier boot and put into the system image, looked in after the writable one and never written.
+// earlier boot and put into the system image, looked in after the writable one and never written. In the shared
+// layout (shader_cache.hpp) the name is under the compiler's generation, and its hash is of the constants the module
+// declares (declaredConstants) rather than of every one supplied.
 std::string stageCacheName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known,
                            uint64_t ycbcr = 0) {
     const char* dir = getenv("HAKIOS_METAL_CACHE");
     const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
     if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
+    const bool shared = sharedCacheLayout();
     uint64_t h[2] = {0xcbf29ce484222325ull, 0x84222325cbf29ce4ull};
     auto mix = [&](const void* p, size_t n) {
         for (size_t i = 0; i < n; i++) {
@@ -1287,9 +1355,13 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
     };
     const uint32_t layout[3] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase};
     mix(kCacheBuild, strlen(kCacheBuild));
+    if (shared) {
+        const std::string g = "v2:" + cacheGeneration();
+        mix(g.data(), g.size());
+    }
     mix(layout, sizeof(layout));
     mix(bitcode, size);
-    for (const FunctionConstant& c : constants) {
+    for (const FunctionConstant& c : shared ? declaredConstants(bitcode, size, constants) : constants) {
         mix(&c.index, sizeof(c.index));
         mix(&c.bits, sizeof(c.bits));
     }
@@ -1303,9 +1375,9 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
         mix(tag, sizeof(tag));
         mix(&ycbcr, sizeof(ycbcr));
     }
-    char name[64];
-    snprintf(name, sizeof(name), "/%016llx%016llx.stage", (unsigned long long)h[0], (unsigned long long)h[1]);
-    return name;
+    char hex[40];
+    snprintf(hex, sizeof(hex), "%016llx%016llx", (unsigned long long)h[0], (unsigned long long)h[1]);
+    return cacheRelativePath(hex, ".stage");
 }
 
 // the writable cache's path for NAME, "" when there is none
@@ -1315,106 +1387,18 @@ std::string stageCacheWritable(const std::string& name) {
     return std::string(dir) + name;
 }
 
-// the Stage or Kernel as the file holds it: its pointers (the words, immediates, name and source it is loaded back with)
-// written as zeros, so that the same compilation makes the same file in any process -- a seed compiled elsewhere is
-// checked against the phone's by its bytes
-Stage fileStage(const Stage& stage) {
-    Stage f = stage;
-    f.k.words = nullptr;
-    f.k.immediates = nullptr;
-    f.k.name = nullptr;
-    f.k.source = nullptr;
-    return f;
-}
-
+// (the payload is shader_cache.hpp's stageBytes: the Stage's pointers and inline samplers' ids written as zeros, so
+// that the same compilation makes the same file in any process -- a seed compiled elsewhere is checked against the
+// phone's by its bytes; sealed in the shared layout)
 void stageCacheSave(const std::string& path, const CompiledStage& s) {
-    CacheWriter w;
-    w.u32(kCacheMagic);
-    const Stage stage = fileStage(s.stage);
-    w.raw(&stage, sizeof(stage));
-    w.u32(uint32_t(s.words.size()));
-    w.raw(s.words.data(), s.words.size() * 4);
-    w.u32(uint32_t(s.immediates.size()));
-    w.raw(s.immediates.data(), s.immediates.size() * 4);
-    w.u32(uint32_t(s.resources.size()));
-    for (const Resource& r : s.resources) {
-        w.u32(uint32_t(r.kind));
-        w.u32(r.index);
-        w.u32(r.sizeBytes);
-        const uint8_t flags[8] = {r.read, r.write, r.irWrite, r.textureDim, r.textureArray, r.element, r.nullTexture, r.inlineSampler};
-        w.raw(flags, sizeof(flags));
-        w.str(r.typeName);
-        w.u32(r.argbufSet);
-        w.u32(r.argbufOffset);
-    }
-    w.u32(uint32_t(s.varyingNames.size()));
-    for (const std::string& v : s.varyingNames) w.str(v);
-    w.u32(uint32_t(s.inlineSamplers.size()));
-    for (const auto& is : s.inlineSamplers) {
-        // (the sampler's id is makeSampler's count in the process that compiled it: nothing binds an inline sampler by
-        // it, and written as it was it made the same compilation two different files)
-        Sampler sampler = is.second;
-        sampler.id = 0;
-        w.u32(is.first);
-        w.raw(&sampler, sizeof(sampler));
-    }
-    w.u32(s.iboBase);
-    w.u32(s.writesMemory ? 1 : 0);
-    w.str(s.name);
-    w.str(s.listing);
-    const std::string tmp = path + ".tmp";
-    FILE* f = fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return;
-    const bool written = fwrite(w.out.data(), 1, w.out.size(), f) == w.out.size();
-    fclose(f);
-    if (!written || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
+    cacheWriteFile(path, stageBytes(s), sharedCacheLayout());
 }
 
 std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (f == nullptr) return nullptr;
     std::string data;
-    char chunk[65536];
-    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data.append(chunk, n);
-    fclose(f);
-    CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
-    auto s = std::make_unique<CompiledStage>();
-    if (r.u32() != kCacheMagic || !r.raw(&s->stage, sizeof(s->stage))) return nullptr;
-    s->words.resize(r.u32());
-    r.raw(s->words.data(), s->words.size() * 4);
-    s->immediates.resize(r.u32());
-    r.raw(s->immediates.data(), s->immediates.size() * 4);
-    s->resources.resize(r.u32());
-    for (Resource& res : s->resources) {
-        res.kind = Resource::Kind(r.u32());
-        res.index = r.u32();
-        res.sizeBytes = r.u32();
-        uint8_t flags[8] = {};
-        r.raw(flags, sizeof(flags));
-        res.read = flags[0], res.write = flags[1], res.irWrite = flags[2], res.textureDim = flags[3];
-        res.textureArray = flags[4], res.element = flags[5], res.nullTexture = flags[6], res.inlineSampler = flags[7];
-        res.typeName = r.str();
-        res.argbufSet = r.u32();
-        res.argbufOffset = r.u32();
-    }
-    s->varyingNames.resize(r.u32());
-    for (std::string& v : s->varyingNames) v = r.str();
-    s->inlineSamplers.resize(r.u32());
-    for (auto& is : s->inlineSamplers) {
-        is.first = r.u32();
-        r.raw(&is.second, sizeof(is.second));
-    }
-    s->iboBase = r.u32();
-    s->writesMemory = r.u32() != 0;
-    s->name = r.str();
-    s->listing = r.str();
-    if (!r.ok || r.p != r.end) return nullptr;
-    s->stage.k.words = s->words.data();
-    s->stage.k.numWords = uint32_t(s->words.size());
-    s->stage.k.immediates = s->immediates.empty() ? nullptr : s->immediates.data();
-    s->stage.k.numImmediates = uint32_t(s->immediates.size());
-    s->stage.k.name = s->name.c_str();
-    s->stage.k.source = "";
+    if (!cacheReadFile(path, &data)) return nullptr;
+    std::unique_ptr<CompiledStage> s = stageFromBytes(data);
+    if (s != nullptr && sharedCacheLayout()) cacheTouch(path);
     return s;
 }
 }  // namespace
@@ -1455,6 +1439,20 @@ std::string knownIndexName(const void* bitcode, size_t size, const FunctionConst
 }
 constexpr size_t kStageNameBytes = 40;   // "/" + 32 hex digits + ".stage", and the rest zeros
 
+// a record's stage, NAME ("/<hash>.stage"), as a path under DIR: beside the index in the old layout, under this
+// generation's tree in the shared one (where a record keeps the stage's own name, not its tree: kStageNameBytes)
+std::string knownStagePath(const std::string& dir, const char* name) {
+    if (!sharedCacheLayout()) return dir + name;
+    const std::string hex(name + 1, strnlen(name + 1, kStageNameBytes - 1));
+    if (hex.size() < 32 + 6) return dir + name;
+    return dir + cacheRelativePath(hex.substr(0, 32), ".stage");
+}
+// the stage's own name of a cache name (its last component, with its '/')
+std::string stageBaseName(const std::string& name) {
+    const size_t at = name.rfind('/');
+    return at == std::string::npos ? name : name.substr(at);
+}
+
 std::unique_ptr<CompiledStage> knownIndexFind(const std::string& dir, const std::string& index, const KnownBuffer& known) {
     if (dir.empty() || index.empty()) return nullptr;
     FILE* f = fopen((dir + index).c_str(), "rb");
@@ -1473,7 +1471,7 @@ std::unique_ptr<CompiledStage> knownIndexFind(const std::string& dir, const std:
         char name[kStageNameBytes + 1] = {};
         memcpy(name, values + length, kStageNameBytes);
         if (name[0] != '/' || strchr(name + 1, '/') != nullptr) continue;   // (a file of this directory, nothing else)
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) {
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(knownStagePath(dir, name))) {
             s->knownReads.assign(mask, mask + length);
             return s;
         }
@@ -1498,7 +1496,8 @@ std::unique_ptr<CompiledStage> knownIndexFindAnywhere(const std::string& index, 
 }
 
 // one record more, in the writable cache: written whole in one append, so that two processes' records do not mix
-void knownIndexNote(const std::string& index, const KnownBuffer& known, const std::vector<uint8_t>& reads, const std::string& stageName) {
+void knownIndexNote(const std::string& index, const KnownBuffer& known, const std::vector<uint8_t>& reads, const std::string& stagePath) {
+    const std::string stageName = stageBaseName(stagePath);
     const char* dir = getenv("HAKIOS_METAL_CACHE");
     if (dir == nullptr || dir[0] == 0 || index.empty() || stageName.empty() || stageName.size() > kStageNameBytes ||
         reads.size() != known.bytes.size()) {
@@ -1508,10 +1507,7 @@ void knownIndexNote(const std::string& index, const KnownBuffer& known, const st
     for (size_t i = 0; i < known.bytes.size(); i++) record.push_back(char(known.bytes[i] & reads[i]));
     record.append(stageName);
     record.append(kStageNameBytes - stageName.size(), char(0));
-    FILE* f = fopen((std::string(dir) + index).c_str(), "ab");
-    if (f == nullptr) return;
-    fwrite(record.data(), 1, record.size(), f);
-    fclose(f);
+    cacheAppendRecord(std::string(dir) + index, record);
 }
 }  // namespace
 
@@ -1560,18 +1556,9 @@ bool fileExists(const std::string& path) {
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-// written whole or not at all: to a temporary name, then renamed (two processes writing the same file write the same bytes)
+// written whole or not at all: to a temporary name of this writer's own, then renamed (shader_cache.hpp)
 bool writeWhole(const std::string& path, const void* data, size_t size) {
-    const std::string tmp = path + ".tmp" + std::to_string(uint64_t(uintptr_t(&tmp)) & 0xffff);
-    FILE* f = fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return false;
-    const bool written = fwrite(data, 1, size, f) == size;
-    fclose(f);
-    if (!written || rename(tmp.c_str(), path.c_str()) != 0) {
-        remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    return cacheWriteFile(path, std::string(static_cast<const char*>(data), size), false);
 }
 
 bool readWhole(const std::string& path, std::string* out) {
@@ -1700,13 +1687,18 @@ std::string kernelCacheName(const void* bitcode, size_t size, const FunctionCons
     const uint32_t layout[2] = {uint32_t(sizeof(Kernel)), uint32_t(sizeof(Resource))};
     h.mix(tag, sizeof(tag));
     h.mix(kCacheBuild, strlen(kCacheBuild));
+    const bool shared = sharedCacheLayout();
+    if (shared) {
+        const std::string g = "v2:" + cacheGeneration();
+        h.mix(g.data(), g.size());
+    }
     h.mix(layout, sizeof(layout));
     h.mix(bitcode, size);
-    for (const FunctionConstant& c : constants) {
+    for (const FunctionConstant& c : shared ? declaredConstants(bitcode, size, constants) : constants) {
         h.mix(&c.index, sizeof(c.index));
         h.mix(&c.bits, sizeof(c.bits));
     }
-    return "/" + h.hex() + ".kernel";
+    return cacheRelativePath(h.hex(), ".kernel");
 }
 
 void kernelCacheSave(const std::string& path, const CompiledKernel& k) {
@@ -1745,12 +1737,12 @@ void kernelCacheSave(const std::string& path, const CompiledKernel& k) {
     w.u32(k.threadgroupArgBase);
     w.str(k.name);
     w.str(k.listing);
-    writeWhole(path, w.out.data(), w.out.size());
+    cacheWriteFile(path, w.out, sharedCacheLayout());
 }
 
 std::unique_ptr<CompiledKernel> kernelCacheLoad(const std::string& path) {
     std::string data;
-    if (!readWhole(path, &data)) return nullptr;
+    if (!cacheReadFile(path, &data)) return nullptr;
     CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
     auto k = std::make_unique<CompiledKernel>();
     if (r.u32() != kKernelMagic || !r.raw(&k->kernel, sizeof(k->kernel))) return nullptr;
@@ -1832,9 +1824,57 @@ bool knownIndexHas(const std::string& dir, const std::string& index, const Known
         if (!same) continue;
         char name[kStageNameBytes + 1] = {};
         memcpy(name, values + length, kStageNameBytes);
-        if (name[0] == '/' && strchr(name + 1, '/') == nullptr && fileExists(dir + name)) return true;
+        if (name[0] == '/' && strchr(name + 1, '/') == nullptr && fileExists(knownStagePath(dir, name))) return true;
     }
     return false;
+}
+}  // namespace
+
+namespace {
+// One compilation of a name at a time in the process, whatever the lane: a thread that needs a stage another thread
+// is compiling waits for that one (it began earlier; a second copy would end no sooner and hold a compiler meanwhile)
+// and then reads the file it left. NAME "" (no cache configured) is never shared.
+struct InFlight {
+    std::mutex lock;
+    std::condition_variable done;
+    std::set<std::string> names;
+};
+InFlight gInFlight;
+struct InFlightClaim {
+    std::string name;
+    bool owner = false;
+    double waitedUs = 0;
+    explicit InFlightClaim(const std::string& n) : name(n) {
+        if (name.empty()) {
+            owner = true;
+            return;
+        }
+        std::unique_lock<std::mutex> g(gInFlight.lock);
+        if (gInFlight.names.insert(name).second) {
+            owner = true;
+            return;
+        }
+        const auto began = std::chrono::steady_clock::now();
+        gInFlight.done.wait(g, [&] { return gInFlight.names.count(name) == 0; });
+        waitedUs = microsecondsSince(began);
+        owner = gInFlight.names.insert(name).second;   // (its file may not be there -- it failed: this thread compiles it)
+    }
+    ~InFlightClaim() {
+        if (!owner || name.empty()) return;
+        {
+            std::lock_guard<std::mutex> g(gInFlight.lock);
+            gInFlight.names.erase(name);
+        }
+        gInFlight.done.notify_all();
+    }
+};
+void noteHold(const CompilerHold& hold) {
+    tCompileTimes.waitedUs += hold.waitedUs();
+    tCompileTimes.lane = uint8_t(currentCompileLane());
+    if (!hold.behind().empty() && hold.waitedUs() >= tCompileTimes.behindUs) {
+        tCompileTimes.behind = hold.behind();
+        tCompileTimes.behindUs = hold.waitedUs();
+    }
 }
 }  // namespace
 
@@ -1845,7 +1885,12 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
         recipeNote(kRecipeKernel, bitcode, size, constants, 0, nullptr, nullptr);
         return k;
     }
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    InFlightClaim claim(name);
+    if (!claim.owner) {
+        if (std::unique_ptr<CompiledKernel> k = kernelCacheFind(name)) return k;
+    }
+    HeldCompiler held(currentCompileLane());
+    noteHold(held.hold);
     if (std::unique_ptr<CompiledKernel> k = kernelCacheFind(name)) return k;
     std::unique_ptr<CompiledKernel> k = compileAirOnce(bitcode, size, why, constants);
     const char* dir = getenv("HAKIOS_METAL_CACHE");
@@ -1890,9 +1935,18 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         return s;
     }
     tCompileTimes.loadedUs += microsecondsSince(began);
-    const std::chrono::steady_clock::time_point asked = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> g(gCompilerLock);
-    tCompileTimes.waitedUs += microsecondsSince(asked);
+    // another thread compiling this very stage (the background lane, say, as the render thread comes to need it): its
+    // file, once it is done
+    InFlightClaim claim(name);
+    tCompileTimes.sameStageUs += claim.waitedUs;
+    if (!claim.owner || claim.waitedUs > 0) {
+        if (std::unique_ptr<CompiledStage> s = found()) {
+            tCompileTimes.cached++;
+            return s;
+        }
+    }
+    HeldCompiler held(currentCompileLane());
+    noteHold(held.hold);
     // (while this thread waited another may have compiled the very stage: its file is there now)
     if (std::unique_ptr<CompiledStage> s = found()) {
         tCompileTimes.cached++;
@@ -1931,9 +1985,23 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
 
 
 
-WarmUpReport warmUp() {
-    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
-    WarmUpReport report;
+namespace {
+// one recipe the warm-up compiles: what compileStage or compileAir is to be called with
+struct RecipeWork {
+    std::string name;                          // the recipe's file name, for a failure's sentence
+    uint32_t kind = 0;
+    std::shared_ptr<const std::string> bitcode;
+    FunctionConstants constants;
+    uint32_t iboBase = 0;
+    bool known = false;
+    KnownBuffer buffer;
+    uint64_t ycbcr = 0;                        // the stage's YCbCr slots' word (compiler.hpp: kYcbcrSlotBits), 0 for none
+};
+
+// every recipe of the writable cache and the seeds whose result is not filed for this build: REPORT counts what was
+// read, filed already and unreadable
+std::vector<RecipeWork> recipesToCompile(WarmUpReport& report) {
+    std::vector<RecipeWork> out;
     std::vector<std::string> dirs;
     if (const char* dir = getenv("HAKIOS_METAL_CACHE"); dir != nullptr && dir[0] != 0) dirs.push_back(dir);
     for (const std::string& d : seedDirectories()) dirs.push_back(d);
@@ -1948,8 +2016,8 @@ WarmUpReport warmUp() {
         }
         closedir(listing);
     }
-    std::map<std::string, std::string> bitcodes;   // by hash, read once
-    auto bitcodeOf = [&](const Recipe& r, std::string** out) {
+    std::map<std::string, std::shared_ptr<const std::string>> bitcodes;   // by hash, read once
+    auto bitcodeOf = [&](const Recipe& r) -> std::shared_ptr<const std::string> {
         const std::string hex = r.bitcode.hex();
         auto it = bitcodes.find(hex);
         if (it == bitcodes.end()) {
@@ -1961,10 +2029,9 @@ WarmUpReport warmUp() {
             Hash128 check;
             check.mix(bytes.data(), bytes.size());
             if (bytes.size() != r.bitcodeSize || check.a != r.bitcode.a || check.b != r.bitcode.b) bytes.clear();
-            it = bitcodes.emplace(hex, std::move(bytes)).first;
+            it = bitcodes.emplace(hex, std::make_shared<const std::string>(std::move(bytes))).first;
         }
-        *out = &it->second;
-        return !it->second.empty();
+        return it->second;
     };
     auto fail = [&](const std::string& name, const std::string& why) {
         report.failed++;
@@ -1974,54 +2041,117 @@ WarmUpReport warmUp() {
         report.recipes++;
         std::string data;
         Recipe r;
-        std::string* bitcode = nullptr;
         if (!readWhole(dir + "/recipes/" + name, &data) || !recipeParse(data, &r)) {
             fail(name, "the recipe does not read back");
             continue;
         }
-        if (!bitcodeOf(r, &bitcode)) {
+        std::shared_ptr<const std::string> bitcode = bitcodeOf(r);
+        if (bitcode->empty()) {
             fail(name, "its bitcode " + r.bitcode.hex() + ".air is missing or not what the recipe names");
             continue;
         }
+        RecipeWork w;
+        w.name = name;
+        w.kind = r.kind;
+        w.bitcode = bitcode;
+        w.constants = r.constants;
+        w.iboBase = r.iboBase;
+        w.known = r.known;
+        w.buffer.binding = r.binding;
+        w.buffer.bytes = r.values;
+        w.ycbcr = r.ycbcr;
         if (r.kind == kRecipeKernel) {
             if (cachedAnywhere(kernelCacheName(bitcode->data(), bitcode->size(), r.constants))) {
                 report.cached++;
                 continue;
             }
         } else {
-            KnownBuffer known;
-            known.binding = r.binding;
-            known.bytes = r.values;
-            const std::string stage = stageCacheName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, r.known ? &known : nullptr, r.ycbcr);
+            const std::string stage = stageCacheName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, r.known ? &w.buffer : nullptr, r.ycbcr);
             bool there = cachedAnywhere(stage);
             if (!there && r.known) {
-                const std::string index = knownIndexName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, known, r.ycbcr);
-                for (const std::string& d : dirs) there = there || knownIndexHas(d, index, known);
+                const std::string index = knownIndexName(bitcode->data(), bitcode->size(), r.constants, r.iboBase, w.buffer, r.ycbcr);
+                for (const std::string& d : dirs) there = there || knownIndexHas(d, index, w.buffer);
             }
             if (there) {
                 report.cached++;
                 continue;
             }
         }
+        out.push_back(std::move(w));
+    }
+    return out;
+}
+
+// compile one, on the calling thread's lane; false with *why
+bool compileRecipe(const RecipeWork& w, std::string* why) {
+    if (w.kind == kRecipeKernel) return compileAir(w.bitcode->data(), w.bitcode->size(), why, w.constants) != nullptr;
+    return compileStage(w.bitcode->data(), w.bitcode->size(), why, w.constants, w.iboBase, w.known ? &w.buffer : nullptr, w.ycbcr) != nullptr;
+}
+}  // namespace
+
+WarmUpReport warmUp() {
+    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    WarmUpReport report;
+    for (const RecipeWork& w : recipesToCompile(report)) {
         const std::chrono::steady_clock::time_point compiling = std::chrono::steady_clock::now();
         std::string why;
-        bool made;
-        if (r.kind == kRecipeKernel) {
-            made = compileAir(bitcode->data(), bitcode->size(), &why, r.constants) != nullptr;
-        } else {
-            KnownBuffer known;
-            known.binding = r.binding;
-            known.bytes = r.values;
-            made = compileStage(bitcode->data(), bitcode->size(), &why, r.constants, r.iboBase, r.known ? &known : nullptr, r.ycbcr) != nullptr;
-        }
+        const bool made = compileRecipe(w, &why);
         report.compileMilliseconds += microsecondsSince(compiling) / 1000.0;
         if (made) {
             report.compiled++;
         } else {
-            fail(name, why);
+            report.failed++;
+            if (report.firstFailure.empty()) report.firstFailure = w.name + ": " + why;
         }
     }
     (void)takeCompileTimes();   // (the warm-up's own: not a pipeline's)
+    report.milliseconds = microsecondsSince(began) / 1000.0;
+    return report;
+}
+
+WarmUpReport warmUpAsync(CompileQueue& queue, CompilePriority priority, void (*done)(const WarmUpReport&)) {
+    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    WarmUpReport report;
+    std::vector<RecipeWork> work = recipesToCompile(report);
+    // what the jobs did, told once the last one is done (in the order the queue ran them: anything else that came in at
+    // a higher priority meanwhile ran first)
+    struct Totals {
+        std::mutex lock;
+        WarmUpReport r;
+        size_t left = 0;
+        std::chrono::steady_clock::time_point began;
+    };
+    auto totals = std::make_shared<Totals>();
+    totals->r = report;
+    totals->left = work.size();
+    totals->began = began;
+    for (RecipeWork& w : work) {
+        auto job = std::make_shared<RecipeWork>(std::move(w));
+        const std::string what = "warm-up " + job->name;
+        queue.submit("recipe:" + job->name, priority, what, [job, totals, done] {
+            const std::chrono::steady_clock::time_point compiling = std::chrono::steady_clock::now();
+            std::string why;
+            const bool made = compileRecipe(*job, &why);
+            (void)takeCompileTimes();
+            std::lock_guard<std::mutex> g(totals->lock);
+            totals->r.compileMilliseconds += microsecondsSince(compiling) / 1000.0;
+            if (made) {
+                totals->r.compiled++;
+            } else {
+                totals->r.failed++;
+                if (totals->r.firstFailure.empty()) totals->r.firstFailure = job->name + ": " + why;
+            }
+            if (--totals->left == 0 && done != nullptr) {
+                totals->r.milliseconds = microsecondsSince(totals->began) / 1000.0;
+                done(totals->r);
+            }
+        });
+        report.compiled++;
+    }
+    if (work.empty() && done != nullptr) {
+        report.milliseconds = microsecondsSince(began) / 1000.0;
+        done(report);
+    }
     report.milliseconds = microsecondsSince(began) / 1000.0;
     return report;
 }
@@ -2275,8 +2405,9 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
 bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::vector<std::pair<uint32_t, uint32_t>>* members, std::string* why) {
     // under the compilers' lock as well: the front end and theCompiler() are the same ones compileAir uses, and Resident
     // Evil 4 asks for encoders on one thread while it compiles on others -- unlocked, the same function's layout came
-    // back with 23 members, then 12, its set numbers garbage, and the encoders built from it wrote nothing
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    // back with 23 members, then 12, its set numbers garbage, and the encoders built from it wrote nothing (the calling
+    // thread's lane: the same compiler its compilations use)
+    HeldCompiler held(currentCompileLane());
     // the interface alone: a body the front end cannot translate yet does not keep a set's layout from being known
     Translation t;
     t.mem = ralloc_context(nullptr);

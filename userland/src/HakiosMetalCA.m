@@ -1433,6 +1433,7 @@ HM_REFUSES_OUT_LOUD
 	uint64_t _ycbcrWords[HM_YCBCR_MOST];
 	int _ycbcrSpecs[HM_YCBCR_MOST];
 	hakios_metal_program *_ycbcrPrograms[HM_YCBCR_MOST];
+	hakios_metal_spec_table *_specTable; /* metal_async_compile=1: the same, kept by the core and compiled by its queue */
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
 			  descriptor:(MTLRenderPipelineDescriptor *)descriptor;
@@ -3222,6 +3223,74 @@ hm_cpu_access_switch(void)
 	}
 }
 
+/* a switch's number, NAME=N among the boot-args and /var/tmp/metal.args (the last one given wins), or FALLBACK */
+static long
+hm_arg_long(const char *name, long fallback)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const size_t n = strlen(name);
+	long value = fallback;
+
+	if (hm_bootargs(args, &size) != 0) return fallback;
+	for (const char *at = args; (at = strstr(at, name)) != NULL; at += n) {
+		if ((at == args || at[-1] == ' ') && at[n] == '=') value = strtol(at + n + 1, NULL, 0);
+	}
+	return value;
+}
+
+/*
+ * Compiling without stalling the window server (hakios-metal compile_queue.hpp, specialize.hpp, shader_cache.hpp).
+ * metal_async_compile=1: two compilers -- the foreground one for a thread that waits for its stage (a pipeline made on
+ * the render thread), the background one for the queue's worker -- so that no background compilation (an uber shader's
+ * specialisation, 0.4 to 1.1 s on the phone; the warm-up) holds the compiler a pipeline waits for; the specialisations
+ * go to the queue at priority 1 (something draws the generic program until they are done) and the warm-up at
+ * priority 3, one job a recipe, after the device is made instead of before it is returned. metal_async_compile=0 (the
+ * default): one compiler and one lock, as before.
+ * metal_shared_cache=1: the cache's shared layout (v2/<generation>/: the compiler's identity, sealed files written under
+ * a name of the writer's own, a stage keyed by the constants its module declares), trimmed to metal_cache_mb (128 by
+ * default) in the background; a process that may read the system's cache but not write it (an app's sandbox) reads it
+ * as a seed and writes its own under its caches directory.
+ */
+static int
+hm_async_compile(void)
+{
+	static int on = -1;
+
+	if (on < 0) on = hm_arg_long("metal_async_compile", 0) != 0;
+	return on;
+}
+
+static int
+hm_shared_cache(void)
+{
+	static int on = -1;
+
+	if (on < 0) on = hm_arg_long("metal_shared_cache", 0) != 0;
+	return on;
+}
+
+static void
+hm_warm_up_done(const hakios_metal_warmup_report *r)
+{
+	hm_print("warm-up (background): %u recipes, %u filed already, %u compiled in %.0f ms, %u failed, %.0f ms since it was queued%s%s\n",
+		 r->recipes, r->cached, r->compiled, r->compile_milliseconds, r->failed, r->milliseconds,
+		 r->first_failure[0] != 0 ? "; first failure: " : "", r->first_failure);
+}
+
+static void
+hm_cache_trim_job(void *context)
+{
+	hakios_metal_cache_trim_report t;
+
+	(void)context;
+	hakios_metal_cache_trim((unsigned)hm_arg_long("metal_cache_mb", 128), &t);
+	if (t.removed != 0 || t.generations_removed != 0) {
+		hm_print("cache: trimmed to %u MB: %llu -> %llu bytes, %u of %u files removed (%u old generations)\n", (unsigned)hm_arg_long("metal_cache_mb", 128),
+			 (unsigned long long)t.bytes_before, (unsigned long long)t.bytes_after, t.removed, t.files, t.generations_removed);
+	}
+}
+
 static void
 hm_warm_up(void)
 {
@@ -3230,6 +3299,12 @@ hm_warm_up(void)
 	hakios_metal_warmup_report r;
 
 	if (!hakios_metal_has_compiler() || (hm_bootargs(args, &size) == 0 && strstr(args, "metal_warmup=0") != NULL)) {
+		return;
+	}
+	if (hm_async_compile()) {
+		hakios_metal_warmup_async(3, &r, hm_warm_up_done);
+		hm_print("warm-up: %u recipes, %u filed already, %u queued for the background compiler (priority 3), %.0f ms to look%s%s\n", r.recipes,
+			 r.cached, r.compiled, r.milliseconds, r.first_failure[0] != 0 ? "; first failure: " : "", r.first_failure);
 		return;
 	}
 	hakios_metal_warmup(&r);
@@ -3683,14 +3758,50 @@ hm_boot_arg_set(const char *what)
 	/* (the skeleton makes HM_CACHE_DIR 1777, init.c from var.skel; an image without that line, or a process that may not
 	 * write there, falls back on /var/tmp as before: a cache for this boot only is better than none) */
 	mkdir(HM_CACHE_DIR, 01777);
-	setenv("HAKIOS_METAL_CACHE", access(HM_CACHE_DIR, W_OK | X_OK) == 0 ? HM_CACHE_DIR : (mkdir("/var/tmp/hakios-metal-cache", 0755),
-												 "/var/tmp/hakios-metal-cache"), 0);
-	{
+	if (hm_shared_cache()) {
+		/* one cache for every GPU client: the system's directory when this process may write it; when it may only read
+		 * it (a sandboxed app), the system's as a seed and this process's own caches directory for what it compiles */
+		char own[PATH_MAX] = "", seeds[2 * PATH_MAX] = "";
 		struct stat st;
+		const char *writable = NULL;
 
-		if (stat(HM_CACHE_SEED, &st) == 0 && S_ISDIR(st.st_mode)) {
-			setenv("HAKIOS_METAL_CACHE_SEED", HM_CACHE_SEED, 0);
+		setenv("HAKIOS_METAL_CACHE_V2", "1", 1);
+		if (access(HM_CACHE_DIR, W_OK | X_OK) == 0) {
+			writable = HM_CACHE_DIR;
+		} else {
+			if (access(HM_CACHE_DIR, R_OK | X_OK) == 0) strlcpy(seeds, HM_CACHE_DIR, sizeof(seeds));
+			if (confstr(_CS_DARWIN_USER_CACHE_DIR, own, sizeof(own)) != 0 && own[0] != 0) {
+				strlcat(own, "hakios-metal-cache", sizeof(own));
+				mkdir(own, 0755);
+				if (access(own, W_OK | X_OK) == 0) writable = own;
+			}
+			if (writable == NULL) {
+				mkdir("/var/tmp/hakios-metal-cache", 0755);
+				writable = "/var/tmp/hakios-metal-cache";
+			}
 		}
+		if (stat(HM_CACHE_SEED, &st) == 0 && S_ISDIR(st.st_mode)) {
+			if (seeds[0] != 0) strlcat(seeds, ":", sizeof(seeds));
+			strlcat(seeds, HM_CACHE_SEED, sizeof(seeds));
+		}
+		setenv("HAKIOS_METAL_CACHE", writable, 1);
+		if (seeds[0] != 0) setenv("HAKIOS_METAL_CACHE_SEED", seeds, 1);
+		hm_print("cache: shared layout v2, generation %s; written to %s%s%s\n", hakios_metal_cache_generation(), writable,
+			 seeds[0] != 0 ? "; read also from " : "", seeds);
+	} else {
+		setenv("HAKIOS_METAL_CACHE", access(HM_CACHE_DIR, W_OK | X_OK) == 0 ? HM_CACHE_DIR : (mkdir("/var/tmp/hakios-metal-cache", 0755),
+													 "/var/tmp/hakios-metal-cache"), 0);
+		{
+			struct stat st;
+
+			if (stat(HM_CACHE_SEED, &st) == 0 && S_ISDIR(st.st_mode)) {
+				setenv("HAKIOS_METAL_CACHE_SEED", HM_CACHE_SEED, 0);
+			}
+		}
+	}
+	if (hm_async_compile()) {
+		hakios_metal_compile_set_lanes(2);
+		hm_print("metal_async_compile=1: a foreground and a background compiler; specialisations at priority 1 and the warm-up at 3 in the background\n");
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
 	hm_ensure_spi([self class]);
@@ -3734,6 +3845,7 @@ hm_boot_arg_set(const char *what)
 		 _targetName);
 	hm_cpu_access_switch();
 	hm_warm_up();
+	if (hm_shared_cache()) hakios_metal_compile_submit("cache-trim", 3, "cache trim", hm_cache_trim_job, NULL);
 	return self;
 }
 
@@ -4763,6 +4875,13 @@ hm_describe_function(id f)
 	}
 	format = (unsigned)[[[descriptor colorAttachments] objectAtIndexedSubscript:0] pixelFormat];
 	{
+		char activity[200];
+
+		/* what this thread compiles, for whoever waits behind it (the console's "behind") */
+		snprintf(activity, sizeof(activity), "pipeline %s+%s", [[vs name] UTF8String] ?: "?", fs != nil ? ([[fs name] UTF8String] ?: "?") : "none");
+		hakios_metal_compile_set_activity(activity);
+	}
+	{
 		hakios_metal_constant vsConstants[64], fsConstants[64];
 		unsigned vsCount = hm_function_constants(vs, vsConstants, 64), fsCount = hm_function_constants(fs, fsConstants, 64);
 
@@ -4885,14 +5004,27 @@ hm_describe_function(id f)
 		}
 		/* what it took, and why: the stages read from the cache and those compiled, the wait for the compiler while another
 		 * thread had it, the compiling itself (hakios_metal_compile_times: this thread's since it last asked) */
-		hakios_metal_compile_times(&ccStages, &ccCached, &ccCompiled, &ccWaited, &ccLoaded, &ccCompiling);
+		hakios_metal_compile_report cc;
+		char behind[260] = "";
+
+		hakios_metal_compile_report_take(&cc);
+		hakios_metal_compile_set_activity(NULL);
+		ccStages = cc.stages, ccCached = cc.cached, ccCompiled = cc.compiled;
+		ccWaited = cc.waited_us, ccLoaded = cc.loaded_us, ccCompiling = cc.compiled_us;
 		hm_ft_cc.stages = ccStages, hm_ft_cc.cached = ccCached, hm_ft_cc.compiled = ccCompiled;
 		hm_ft_cc.waitedUs = ccWaited, hm_ft_cc.loadedUs = ccLoaded, hm_ft_cc.compiledUs = ccCompiling;
+		/* who held the compiler, when it was held (the background specialisations, the warm-up, another pipeline), and the
+		 * wait for another thread compiling this very stage */
+		if (cc.behind[0] != 0) snprintf(behind, sizeof(behind), "; behind %s for %.1f ms", cc.behind, cc.behind_us / 1e3);
+		if (cc.same_stage_us > 0) {
+			size_t at = strlen(behind);
+			snprintf(behind + at, sizeof(behind) - at, "; %.1f ms for another thread compiling the same stage", cc.same_stage_us / 1e3);
+		}
 		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s; "
-			 "made in %.1f ms (%u of %u stages from the cache in %.1f ms, %u compiled in %.1f ms after %.1f ms waiting for the compiler)\n",
+			 "made in %.1f ms (%u of %u stages from the cache in %.1f ms, %u compiled in %.1f ms after %.1f ms waiting for the compiler%s; lane %s)\n",
 			 hakios_metal_program_name(program), (void *)program, format, hakios_metal_program_resource_count(program, 0),
 			 hakios_metal_program_resource_count(program, 1), [set UTF8String], (hm_now() - madeBegan) * 1e3, ccCached, ccStages,
-			 ccLoaded / 1e3, ccCompiled, ccCompiling / 1e3, ccWaited / 1e3);
+			 ccLoaded / 1e3, ccCompiled, ccCompiling / 1e3, ccWaited / 1e3, behind, cc.lane != 0 ? "background" : (hm_async_compile() ? "foreground" : "single"));
 		hm_ft_worked(HM_FT_W_PIPELINE, ftBegan, 0);
 	}
 	{
@@ -9695,6 +9827,7 @@ HM_REFUSES_OUT_LOUD
 
 - (void)dealloc
 {
+	if (_specTable != NULL) hakios_metal_spec_table_free(_specTable);   /* (its jobs hold their own handle on _program) */
 	for (unsigned i = 0; i < _specCount; i++) {
 		if (_specPrograms[i] != NULL) hakios_metal_program_free(_specPrograms[i]);
 	}
@@ -9749,6 +9882,54 @@ hm_spec_off(void)
 	return off != 0;
 }
 
+/* metal_async_compile=1: what a specialisation job of the core's queue needs, held by the job itself (the pipeline may
+ * be gone before it runs): its own handle on the pipeline's program, the fragment function and its constants */
+struct hm_spec_job {
+	hakios_metal_program *base;
+	NSData *fsAir;
+	hakios_metal_constant constants[64];
+	unsigned constantCount, binding;
+	char name[160];
+};
+
+static BOOL hm_spec_exact(void);
+
+static hakios_metal_program *
+hm_spec_compile(void *context, const unsigned char *bytes, size_t length)
+{
+	struct hm_spec_job *job = context;
+	struct timespec t0, t1;
+	hakios_metal_program *p;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	p = hakios_metal_program_specialize(job->base, [job->fsAir bytes], [job->fsAir length], job->constants, job->constantCount, job->binding, bytes,
+					    length);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (p == NULL) {
+		hm_print("specialise: %s for its buffer %u: %s; its own program goes on\n", hakios_metal_program_name(job->base), job->binding,
+			 hakios_metal_error());
+	} else {
+		hakios_metal_compile_report cc;
+
+		hakios_metal_compile_report_take(&cc);
+		hm_print("specialise (background): %s for %zu bytes of its buffer %u: %u instruction words, not %u, in %.0f ms (%u compiled, %u from the cache%s%s)\n",
+			 hakios_metal_program_name(job->base), length, job->binding, hakios_metal_program_stage_words(p, 1),
+			 hakios_metal_program_stage_words(job->base, 1), (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, cc.compiled, cc.cached,
+			 cc.behind[0] != 0 ? "; waited behind " : "", cc.behind);
+	}
+	return p;
+}
+
+static void
+hm_spec_job_release(void *context)
+{
+	struct hm_spec_job *job = context;
+
+	hakios_metal_program_free(job->base);
+	[job->fsAir release];
+	free(job);
+}
+
 /* An uber shader -- a fragment stage of thousands of instructions that reads a small constant buffer -- takes its path
  * through them by that buffer's bytes in every fragment: CoreAnimation's fixed_frag_lph_cpf is 15 000 instructions and
  * one of its draws took 9.6 ms over 1.2 million pixels with its textures' reads gone or not, when the path its
@@ -9783,6 +9964,21 @@ hm_spec_off(void)
 	_fsAir = [air retain];
 	_fsConstantCount = count < 64 ? count : 64;
 	memcpy(_fsConstants, constants, _fsConstantCount * sizeof(*constants));
+	if (hm_async_compile()) {
+		struct hm_spec_job *job = calloc(1, sizeof(*job));
+
+		if (job != NULL) {
+			job->base = hakios_metal_program_share(_program);
+			job->fsAir = [air retain];
+			job->constantCount = _fsConstantCount;
+			memcpy(job->constants, _fsConstants, _fsConstantCount * sizeof(*constants));
+			job->binding = (unsigned)_specBinding;
+			snprintf(job->name, sizeof(job->name), "specialise %s", hakios_metal_program_name(_program));
+			_specTable = hakios_metal_spec_table_new(_program, _specLength, HM_SPEC_MOST, 1, job->name, hm_spec_exact(), hm_spec_compile, job,
+								 hm_spec_job_release);
+			if (_specTable == NULL) hm_spec_job_release(job);
+		}
+	}
 }
 
 /* LENGTH bytes at P as one number, eight at a time (a content of at most 256 bytes, asked once a draw) */
@@ -9850,6 +10046,14 @@ hm_spec_queue(void)
 	const uint8_t *bytes = (const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]);
 	const uint64_t length = hakios_metal_buffer_length(buffers[_specBinding]), at = offsets[_specBinding];
 	if (bytes == NULL || at > length || length - at < _specLength) return _program;
+	if (_specTable != NULL) {
+		/* the core's table: the same matching (masks, aliases), compiled by its queue at priority 1 on the background
+		 * compiler; the generic program draws until then, never a wait */
+		uint8_t content[256];
+
+		memcpy(content, bytes + at, _specLength);
+		return hakios_metal_spec_table_program(_specTable, content, NULL);
+	}
 	/* Every draw of the pipeline comes through here, so the content is looked up with nothing made and nothing waited
 	 * for: its bytes read once (the buffer may be memory that is slow to read), hashed, and found among the contents
 	 * seen under a lock held for that search alone. An NSData for the key, an NSDictionary's lookup and @synchronized
