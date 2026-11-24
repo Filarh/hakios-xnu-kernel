@@ -523,6 +523,12 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *
 /* ...and of a tiled pass, apart: the attachments its draws' fragment stages have an output for (WROTE) and those a draw
  * reads through framebuffer fetch (READ), as masks; -1 past the profiled passes */
 int hakios_metal_cb_pass_access(hakios_metal_cb *cb, unsigned i, unsigned *wrote, unsigned *read);
+/* With profiling on, also the GPU's performance counters around each pass (CommandBuffer::setPerf): what each of
+ * them counted over pass I, COUNT of them at most into OUT, the number given back; -1 past the passes. Their names,
+ * by index: hakios_metal_perf_counter_name ("gbif_rd0" ... "rb_stall_ccu_w"; 13 of them) */
+void hakios_metal_cb_set_perf(hakios_metal_cb *cb, int on);
+int hakios_metal_cb_pass_counters(hakios_metal_cb *cb, unsigned i, uint32_t *out, unsigned count);
+const char *hakios_metal_perf_counter_name(unsigned i);
 /* the attachments the tiles of profiled pass I loaded and stored, as masks (0 and 0 for a sysmem pass); -1 past the passes */
 int hakios_metal_cb_pass_moved(hakios_metal_cb *cb, unsigned i, unsigned *loaded, unsigned *stored);
 int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);

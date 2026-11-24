@@ -290,6 +290,7 @@ a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned submits 0 words 0 
 a_fetchs_barrier_runs_where_a_tile_draws_the_fetch submits 5 words 109840 draws 500 loads 1300 stream 003ad3c00efcbda5 state c2bc8fdaa4cf0a01 names 30 7b3e8fd04d1dff98
 draw_states_keep_each_groups_registers_whole submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_fake_runs_draw_state_groups_as_the_microcode_does submits 6 words 3597 draws 8 loads 12 stream f2ceb65085b181a9 state 54e81470edcf5a2d names 0 0000000000000000
+perf_counters_are_selected_once_and_read_around_each_pass submits 2 words 3614 draws 10 loads 20 stream f5f3592fe94f7b4c state 12bc3357a14e6a3d names 13 77f575b2759bd8f0
 texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_make_lays_the_memory_out_and_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 texture_replace_and_read_convert_the_callers_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

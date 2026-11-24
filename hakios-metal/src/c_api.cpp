@@ -984,6 +984,22 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned* 
     return 0;
 }
 
+void hakios_metal_cb_set_perf(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setPerf(on != 0); });
+    cb->cb->setPerf(on != 0);
+}
+
+int hakios_metal_cb_pass_counters(hakios_metal_cb* cb, unsigned i, uint32_t* out, unsigned count) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    if (i >= t.size()) return -1;
+    const unsigned n = count < CommandBuffer::kPerfCounters ? count : CommandBuffer::kPerfCounters;
+    for (unsigned k = 0; k < n; k++) out[k] = t[i].ctr[k];
+    return int(n);
+}
+
+const char* hakios_metal_perf_counter_name(unsigned i) { return CommandBuffer::perfCounterName(i); }
+
 int hakios_metal_cb_pass_access(hakios_metal_cb* cb, unsigned i, unsigned* wrote, unsigned* read) {
     syncOne(cb);
     const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();

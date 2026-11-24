@@ -6854,3 +6854,43 @@ TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
         CHECK(has(st.lastFault, "a draw of the stream itself with draw-state group 5 still set by a tiled pass's draws"));
     }
 }
+
+// setPerf: the performance counters read beside each pass's stamps -- the selectors written once from the stream after a
+// wait for idle, the counters read by CP_REG_TO_MEM at each stamp -- in a sysmem pass and a GMEM pass. The fake counts
+// nothing (zeros) but judges every read; the twin is the same buffer without setPerf, whose stream has none of it.
+TEST(perf_counters_are_selected_once_and_read_around_each_pass) {
+    Rig r;
+    auto t = target(r, 256, 256);
+    RenderPass pass;
+    pass.color0 = t.get();
+    render::Options sysmem;
+    sysmem.gmem = false;
+    size_t words[2] = {0, 0};
+    for (int perf = 0; perf < 2; perf++) {
+        const uint64_t before = r.fake->stats().cpWords;
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setPerf(perf != 0);
+        CHECK(cb->draw(flatProgram(), pass, wholeDraw(3, 256, 256), Bindings{}, Bindings{}, sysmem));
+        RenderPass other;
+        auto t2 = target(r, 256, 256);
+        other.color0 = t2.get();
+        CHECK(cb->draw(flatProgram(), other, wholeDraw(3, 256, 256), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), other, wholeDraw(3, 256, 256), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        const auto times = cb->passTimes();
+        CHECK_EQ(times.size(), 2u);
+        for (const auto& pt : times) {
+            for (uint32_t k = 0; k < CommandBuffer::kPerfCounters; k++) CHECK_EQ(pt.ctr[k], 0u);
+        }
+        words[perf] = r.fake->stats().cpWords - before;
+    }
+    // the reads and the selection are in the stream with setPerf alone: per pass two stamps of 1 + 9 reads of 4 words, and
+    // the selection once (RBBM_PERFCTR_CNTL, the GBIF's two, nine selectors, two waits: 13 * 2 + 2 words)
+    CHECK(words[1] > words[0] + 2 * 2 * 10 * 4);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK(std::string(CommandBuffer::perfCounterName(0)) == "gbif_rd0" && std::string(CommandBuffer::perfCounterName(12)) == "rb_stall_ccu_w");
+}
