@@ -554,7 +554,25 @@ int hakios_metal_texture_memoryless(hakios_metal_texture* t) { return t != nullp
 
 unsigned hakios_metal_texture_origin(hakios_metal_texture* t) {
     const Texture& x = *t->texture;
-    return x.compressed() ? 3 : x.overBufferRows() ? 2 : x.surface() != 0 ? 1 : 0;
+    return x.compressed() ? 3 : x.tiled() ? 4 : x.overBufferRows() ? 2 : x.surface() != 0 ? 1 : 0;
+}
+
+hakios_metal_texture* hakios_metal_texture_new_tiled(hakios_metal_device* d, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage) {
+    TextureDesc desc;
+    desc.format = PixelFormat(pixelFormat);
+    desc.width = width;
+    desc.height = height;
+    desc.usage = usage;
+    desc.tiled = true;
+    std::string why;
+    std::shared_ptr<Texture> t = Texture::make(*d->gpu, desc, &why);
+    if (t == nullptr) {
+        failed(why);
+        return nullptr;
+    }
+    auto* r = new hakios_metal_texture;
+    r->texture = std::move(t);
+    return r;
 }
 
 hakios_metal_texture* hakios_metal_texture_new_compressed(hakios_metal_device* d, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage) {
@@ -983,6 +1001,22 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned* 
     *touched = t[i].touched;
     return 0;
 }
+
+void hakios_metal_cb_set_perf(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setPerf(on != 0); });
+    cb->cb->setPerf(on != 0);
+}
+
+int hakios_metal_cb_pass_counters(hakios_metal_cb* cb, unsigned i, uint32_t* out, unsigned count) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    if (i >= t.size()) return -1;
+    const unsigned n = count < CommandBuffer::kPerfCounters ? count : CommandBuffer::kPerfCounters;
+    for (unsigned k = 0; k < n; k++) out[k] = t[i].ctr[k];
+    return int(n);
+}
+
+const char* hakios_metal_perf_counter_name(unsigned i) { return CommandBuffer::perfCounterName(i); }
 
 int hakios_metal_cb_pass_access(hakios_metal_cb* cb, unsigned i, unsigned* wrote, unsigned* read) {
     syncOne(cb);

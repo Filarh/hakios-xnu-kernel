@@ -568,7 +568,17 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
         }
         return true;
     }
-    if (tile != TILE6_LINEAR && (tile != TILE6_3 || !sampled || bpp != 4 || (d[3] & A6XX_TEX_CONST_3_TILE_ALL) == 0)) {
+    // ...or a tiled colour texture (TextureDesc::tiled: TILE6_3 without flags, 4 bytes a texel, WZYX), sampled: its rows
+    // counted to 16 and its pitch a multiple of 256 bytes as fdl6_tile_alignment has them for cpp 4. Its bytes are in an
+    // order this model does not reproduce: the read is judged, what it returns is not modelled
+    const bool tiledColour = tile == TILE6_3 && sampled && bpp == 4 && (d[3] & A6XX_TEX_CONST_3_TILE_ALL) == 0 &&
+                             fieldOf(d[0], A6XX_TEX_CONST_0_FMT__MASK, A6XX_TEX_CONST_0_FMT__SHIFT) == FMT6_8_8_8_8_UNORM &&
+                             fieldOf(d[0], A6XX_TEX_CONST_0_SWAP__MASK, A6XX_TEX_CONST_0_SWAP__SHIFT) == WZYX;
+    if (tiledColour && pitch % 256 != 0) {
+        fault(who + text(": a tiled colour texture of pitch %llu: not a multiple of 256 bytes (fdl6_tile_alignment for cpp 4)", pitch));
+        return false;
+    }
+    if (tile != TILE6_LINEAR && !tiledColour && (tile != TILE6_3 || !sampled || bpp != 4 || (d[3] & A6XX_TEX_CONST_3_TILE_ALL) == 0)) {
         fault(who + text(": tile mode %llu", tile) + ((d[3] & A6XX_TEX_CONST_3_TILE_ALL) ? " with TILE_ALL" : " without TILE_ALL") +
               ": linear, or a sampled 32-bit depth layout (TILE6_3, TILE_ALL), is what this GPU model reads");
         return false;
@@ -913,7 +923,10 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     // ...or a UBWC one (TILE6_3 with FLAGS, RGBA8-sized, WZYX): what a copy fills a compressed texture through
     const bool ubwc = copy && tile == TILE6_3 && (info & A6XX_RB_2D_DST_INFO_FLAGS) != 0 && fmt == FMT6_8_8_8_8_UNORM &&
                       fieldOf(info, A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_2D_DST_INFO_COLOR_SWAP__SHIFT) == WZYX;
-    if (bpp == 0 || (tile != TILE6_LINEAR && !tiled && !ubwc)) {
+    // ...or a tiled colour image (TextureDesc::tiled, or a compressed one's fill): TILE6_3, 4 bytes a pixel, WZYX
+    const bool tiledColour = tile == TILE6_3 && !tiled && !ubwc && fmt == FMT6_8_8_8_8_UNORM &&
+                             fieldOf(info, A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_2D_DST_INFO_COLOR_SWAP__SHIFT) == WZYX;
+    if (bpp == 0 || (tile != TILE6_LINEAR && !tiled && !ubwc && !tiledColour)) {
         fault(text("a fill into format %llu, tile mode %llu: a linear image of a known format (or a TILE6_3 depth texture) is what this GPU model fills", fmt, tile));
         return false;
     }
@@ -950,6 +963,30 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     if (x1 < x0 || y1 < y0 || pitch < uint64_t(x1 + 1) * bpp || base % 64 != 0) {
         fault(text("a fill of (%llu, %llu) to ", x0, y0) + text("(%llu, %llu) with a pitch of ", x1, y1) + text("%llu bytes at %#llx: an empty rectangle, rows wider than the pitch or a base not 64-aligned", pitch, base));
         return false;
+    }
+    if (tiledColour) {
+        // Its bytes (and a compressed one's flags) are in an order this model does not reproduce: the fill or the copy is
+        // judged -- the pitch a multiple of 256 bytes, the rows counted to 16 in reach, a flag buffer in reach -- and not
+        // carried out; a compressed image a fill wrote counts as written, which a sample of it then requires
+        const uint64_t rows = (uint64_t(y1) + 1 + 15) / 16 * 16;
+        const bool flagged = (info & A6XX_RB_2D_DST_INFO_FLAGS) != 0;
+        if (base % 256 != 0 || pitch % 256 != 0 || at(base, rows * pitch) == nullptr || (flagged && at(reg64(REG_A6XX_RB_2D_DST_FLAGS), 64) == nullptr)) {
+            fault(std::string("a tiled colour ") + (copy ? "copy" : "fill") + text(" at %#llx ", base) +
+                  text("with a pitch of %llu bytes, %llu rows: not 256-aligned, not a multiple of 256, or outside every buffer", pitch, rows));
+            return false;
+        }
+        if (flagged) ubwcWritten_.insert(base);
+        stats_.tiledFills += copy ? 0 : 1;
+        stats_.tiledCopies += copy ? 1 : 0;
+        if (copy) {
+            stats_.copies++;
+        } else {
+            stats_.fills++;
+        }
+        drawsInSubmission_++;
+        drawsWithoutCcuFlush_++;
+        drawsWithoutCacheFlush_++;
+        return true;
     }
     if (copy && ubwc) {
         // Its bytes and flags are in an order this model does not reproduce: the copy is judged (the source linear and
@@ -1037,6 +1074,28 @@ bool FakeGpu::execCopy(uint32_t fmt, uint32_t bpp, uint32_t ifmt, uint32_t x0, u
         return false;
     }
     const uint32_t info = reg(REG_A6XX_SP_PS_2D_SRC_INFO), size = reg(REG_A6XX_SP_PS_2D_SRC_SIZE);
+    if (fieldOf(info, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__SHIFT) == TILE6_3 &&
+        (info & A6XX_SP_PS_2D_SRC_INFO_COLOR_FORMAT__MASK) == FMT6_8_8_8_8_UNORM && fmt == FMT6_8_8_8_8_UNORM &&
+        fieldOf(info, A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__MASK, A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__SHIFT) == WZYX) {
+        // a tiled colour source (TextureDesc::tiled or compressed): its texels are in an order this model does not
+        // reproduce -- judged (its base and pitch, a flag buffer in reach when it has one) and not carried out
+        const uint64_t sbase = reg64(REG_A6XX_SP_PS_2D_SRC);
+        const uint64_t spitch = uint64_t(fieldOf(reg(REG_A6XX_SP_PS_2D_SRC_PITCH), A6XX_SP_PS_2D_SRC_PITCH_PITCH__MASK, A6XX_SP_PS_2D_SRC_PITCH_PITCH__SHIFT)) << 6;
+        const uint32_t sh = fieldOf(size, A6XX_SP_PS_2D_SRC_SIZE_HEIGHT__MASK, A6XX_SP_PS_2D_SRC_SIZE_HEIGHT__SHIFT);
+        const bool flagged = (info & A6XX_SP_PS_2D_SRC_INFO_FLAGS) != 0;
+        if (sbase % 256 != 0 || spitch % 256 != 0 || at(sbase, (uint64_t(sh) + 15) / 16 * 16 * spitch) == nullptr ||
+            (flagged && at(reg64(REG_A6XX_SP_PS_2D_SRC_FLAGS), 64) == nullptr) || at(base + uint64_t(y0) * pitch, uint64_t(y1 - y0) * pitch + uint64_t(x1 + 1) * bpp) == nullptr) {
+            fault(text("a copy from a tiled source at %#llx of pitch %llu: not 256-aligned, or outside every buffer", sbase, spitch));
+            return false;
+        }
+        (void)ifmt;
+        stats_.copies++;
+        stats_.tiledCopies++;
+        drawsInSubmission_++;
+        drawsWithoutCcuFlush_++;
+        drawsWithoutCacheFlush_++;
+        return true;
+    }
     const uint32_t sfmt = info & A6XX_SP_PS_2D_SRC_INFO_COLOR_FORMAT__MASK;
     // (the TP's format at the source, the colour column's at the destination: they differ for RGB10A2 alone)
     const bool sameFormat = sfmt == fmt || (sfmt == FMT6_10_10_10_2_UNORM && fmt == FMT6_10_10_10_2_UNORM_DEST);
@@ -1197,9 +1256,36 @@ bool FakeGpu::eventBlit() {
     const uint64_t dst = reg64(REG_A6XX_RB_BLIT_DST), pitch = uint64_t(reg(REG_A6XX_RB_BLIT_DST_PITCH) & 0xffff) << 6;
     const uint32_t gbase = reg(REG_A6XX_RB_BLIT_BASE_GMEM);
     const uint32_t stl = reg(REG_A6XX_RB_BLIT_SCISSOR_TL), sbr = reg(REG_A6XX_RB_BLIT_SCISSOR_BR);
-    if (bpp == 0 || (dstInfo & A6XX_RB_BLIT_DST_INFO_TILE_MODE__MASK) != TILE6_LINEAR || reg(REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL) != 0) {
-        fault(text("RB_BLIT_DST_INFO %#llx: a linear, single-sampled destination of a known format", dstInfo));
+    const bool tiledColour = (dstInfo & A6XX_RB_BLIT_DST_INFO_TILE_MODE__MASK) == TILE6_3 &&
+                             fieldOf(dstInfo, A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__MASK, A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__SHIFT) == FMT6_8_8_8_8_UNORM &&
+                             fieldOf(dstInfo, A6XX_RB_BLIT_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_BLIT_DST_INFO_COLOR_SWAP__SHIFT) == WZYX;
+    if (bpp == 0 || ((dstInfo & A6XX_RB_BLIT_DST_INFO_TILE_MODE__MASK) != TILE6_LINEAR && !tiledColour) || reg(REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL) != 0) {
+        fault(text("RB_BLIT_DST_INFO %#llx: a linear (or tiled 8_8_8_8 WZYX), single-sampled destination of a known format", dstInfo));
         return false;
+    }
+    if (tiledColour) {
+        // a tiled (or compressed) attachment's load or store: its bytes in an order this model does not reproduce. Judged
+        // -- the pitch a multiple of 256, its rows counted to 16 in reach, a flag buffer in reach when FLAGS says so --
+        // and counted, not carried out
+        const uint32_t x2 = std::min(win[2], sbr & 0x3fff), y2 = std::min(win[3], sbr >> 16 & 0x3fff);
+        const bool flagged = (dstInfo & A6XX_RB_BLIT_DST_INFO_FLAGS) != 0;
+        if (pitch % 256 != 0 || dst % 256 != 0 || at(dst, (uint64_t(y2) + 16) / 16 * 16 * pitch) == nullptr ||
+            (flagged && at(reg64(REG_A6XX_RB_BLIT_FLAG_DST), 64) == nullptr) || uint64_t(gbase) + uint64_t(binW) * binH * bpp > gmem_.size()) {
+            fault(text("an event blit of a tiled image at %#llx of pitch %llu: not 256-aligned, outside every buffer, or past GMEM's end", dst, pitch));
+            return false;
+        }
+        if (flagged && type != BLIT_EVENT_LOAD) ubwcWritten_.insert(dst);
+        const uint32_t x1 = std::max(win[0], stl & 0x3fff), y1 = std::max(win[1], stl >> 16 & 0x3fff);
+        if (x1 <= x2 && y1 <= y2) {
+            if (type == BLIT_EVENT_LOAD) {
+                stats_.tileLoads++;
+                stats_.loadedPixels += uint64_t(x2 - x1 + 1) * (y2 - y1 + 1);
+            } else {
+                stats_.tileStores++;
+                stats_.storedPixels += uint64_t(x2 - x1 + 1) * (y2 - y1 + 1);
+            }
+        }
+        return true;
     }
     const uint32_t x1 = std::max(win[0], stl & 0x3fff), y1 = std::max(win[1], stl >> 16 & 0x3fff);
     const uint32_t x2 = std::min(win[2], sbr & 0x3fff), y2 = std::min(win[3], sbr >> 16 & 0x3fff);
@@ -1408,12 +1494,20 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             fault("RB_MRT_BUF_INFO[" + which + "]: " + text("COLOR_FORMAT %llu is not one this GPU model knows", format));
             return false;
         }
-        if (tile != TILE6_LINEAR) {
-            fault("RB_MRT_BUF_INFO[" + which + "]: " + text("tile mode %llu: only linear targets are what this GPU model runs", tile));
+        const bool tiledTarget = tile == TILE6_3 && format == FMT6_8_8_8_8_UNORM &&
+                                 fieldOf(bufInfo, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__SHIFT) == WZYX;
+        if (tile != TILE6_LINEAR && !tiledTarget) {
+            fault("RB_MRT_BUF_INFO[" + which + "]: " + text("tile mode %llu: linear targets, or tiled 8_8_8_8 ones in WZYX, are what this GPU model runs", tile));
             return false;
         }
         const uint64_t pitch = uint64_t(fieldOf(reg(regRbMrt(REG_A6XX_RB_MRT_PITCH, t)), A6XX_RB_MRT_PITCH__MASK, A6XX_RB_MRT_PITCH__SHIFT)) << A6XX_RB_MRT_PITCH__SCALE;
         const uint64_t base = reg64(regRbMrt(REG_A6XX_RB_MRT_BASE, t));
+        if (tiledTarget && (pitch % 256 != 0 || at(base, ((rows + 15) & ~uint64_t(15)) * pitch) == nullptr)) {
+            fault("RB_MRT[" + which + "]: " + text("a tiled target of pitch %llu: not a multiple of 256, or its rows counted to 16 outside every buffer", pitch));
+            return false;
+        }
+        // (a compressed target, its flag buffer named: drawn into, it is written in compressed form, which a sample needs)
+        if (tiledTarget && reg64(regRbMrtFlagBuffer(REG_A6XX_RB_MRT_FLAG_BUFFER_ADDR, t)) != 0) ubwcWritten_.insert(base);
         if (pitch < width * bpp * d.samples) {
             fault("RB_MRT_PITCH[" + which + "] " + text("%llu bytes for rows of %llu pixels", pitch, width) + text(" of %llu bytes", bpp) +
                   text(" and %llu sample(s): shorter than a row", d.samples));
@@ -2621,6 +2715,21 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 }
                 const uint32_t reg = p[0] & CP_REG_TO_MEM_0_REG__MASK;
                 const uint64_t to = p[1] | uint64_t(p[2]) << 32;
+                // ...or the performance counters a command buffer with setPerf reads beside it, 32 bits each: the GBIF's four
+                // (0x3cc4-0x3cc7) and the RBBM's UCHE, TP, CCU and RB counters (0x400-0x4ff). The fake counts nothing:
+                // they read as zero, the reads judged for their place and size
+                const uint32_t cnt = (p[0] & CP_REG_TO_MEM_0_CNT__MASK) >> CP_REG_TO_MEM_0_CNT__SHIFT;
+                const bool perfCtr = !(p[0] & CP_REG_TO_MEM_0_64B) && cnt >= 1 && cnt <= 4 &&
+                                     ((reg >= 0x3cc4 && reg + cnt <= 0x3cc8) || (reg >= 0x400 && reg + cnt <= 0x500));
+                if (perfCtr) {
+                    uint8_t* w = at(to, 4ull * cnt);
+                    if (w == nullptr || to % 4 != 0) {
+                        fault(text("CP_REG_TO_MEM of counter %#x to %#llx: outside every buffer or not 4-byte aligned", reg, to));
+                        return false;
+                    }
+                    memset(w, 0, 4ull * cnt);
+                    break;
+                }
                 uint8_t* d = at(to, 8);
                 if (reg != 0x0980 || !(p[0] & CP_REG_TO_MEM_0_64B) || d == nullptr || to % 8 != 0) {
                     fault(text("CP_REG_TO_MEM of register %#x to %#llx: the fake serves CP_ALWAYS_ON_COUNTER, 64-bit, into a buffer", reg, to));

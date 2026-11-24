@@ -403,6 +403,23 @@ bool Texture::plan(const TextureDesc& desc, const FormatInfo** infoOut, uint64_t
         pitch = (uint64_t(desc.width) * cpp + 64 * cpp - 1) / (64 * cpp) * (64 * cpp);
         bytes = ((uint64_t(desc.height) + 15) / 16 * 16 * pitch + 4095) / 4096 * 4096;
     }
+    if (desc.tiled && !desc.compressed) {
+        // TILE6_3 without UBWC (fdl6_layout with tile_mode 3 and ubwc false): what is laid out so here and nowhere else
+        if (desc.type != TextureType::k2D || desc.mipLevels != 1 || desc.samples != 1 || info->bytesPerPixel != 4 || info->depth || info->twoPlane ||
+            info->blockW != 1 || info->pvrtcBpp != 0 || info->element != kElemFloat || desc.width < 16 ||
+            (desc.usage & kTextureUsageWrite) != 0) {
+            refuse(why, std::string("a tiled ") + info->name + " texture of type " + n(uint32_t(desc.type)) + ", " + n(desc.mipLevels) + " level(s), " +
+                            n(desc.width) + " wide, usage " + n(desc.usage) + ": one level of 2D, single-sampled, a 4-byte unorm or float colour " +
+                            "format, at least 16 wide (FDL_MIN_UBWC_WIDTH: narrower, fdl6 lays it linear), not stored by a kernel, is what is served");
+            return false;
+        }
+        // fdl6_tile_alignment for cpp 4 (fd6_layout.c:86-111): pitchalign log2(cpp) = 2, so the pitch is a multiple of
+        // 64 << 2 = 256 bytes (64 pixels: two macrotiles of 32 x 16), and the rows a multiple of 16 (heightalign); one
+        // level, so its rows are also the last level's, already a multiple of 4 (fd6_layout.c:241-248); the layer
+        // 4096-aligned (layer_first, :297-300). The pitch is the linear layout's for cpp 4; only the rows differ
+        pitch = (uint64_t(desc.width) * 4 + 255) / 256 * 256;
+        bytes = (((uint64_t(desc.height) + 15) / 16 * 16) * pitch + 4095) / 4096 * 4096;
+    }
     *infoOut = info;
     *pitchOut = pitch;
     *bytesOut = bytes;
@@ -501,7 +518,36 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
     if (buffer == nullptr) {
         return nullptr;
     }
+    if (desc.tiled) {
+        // (plan worked the layout out: the pitch and the bytes; PITCHALIGN is log2(cpp) as for the linear layout of cpp
+        // 4, fdl6_view_init's pitchalign - 6 with fdl6_tile_alignment's pitchalign + 6)
+        Texture* t = new Texture(std::move(buffer), desc, info, pitch, 0, 2);
+        t->tiled_ = true;
+        return adopt(t);
+    }
     return adopt(new Texture(std::move(buffer), desc, info, pitch));
+}
+
+uint32_t Texture::flagPitchWord() const {
+    return ubwc_ ? a6xx::A6XX_RB_MRT_FLAG_BUFFER_PITCH_PITCH(ubwcPitch_) | a6xx::A6XX_RB_MRT_FLAG_BUFFER_PITCH_ARRAY_PITCH(ubwcLayerSize_ >> 2) : 0u;
+}
+
+void Texture::layoutInto(a6xx::TexConst& d) const {
+    using namespace a6xx;
+    if (!ubwc_ && !tiled_) return;
+    // TILE6_3, and WZYX: a tiled layout holds every 8-bit format in WZYX order (fd6_texture_swap gives WZYX for one that is
+    // not linear; the CCU writes it so whatever RB_MRT_BUF_INFO's swap says, fd6_format_table.c:370-375)
+    d.dword[0] = (d.dword[0] & ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK)) | A6XX_TEX_CONST_0_TILE_MODE(TILE6_3) |
+                 A6XX_TEX_CONST_0_SWAP(WZYX);
+    if (!ubwc_) return;
+    // a UBWC texture (fdl6_view_init, fd6_view.c:251-306): TILE_ALL (fdl6_layout sets it for UBWC on a chip without
+    // has_ubwc_linear_mipmap_fallback), and the flag buffer's address, pitch, layer and blocks
+    d.dword[3] |= A6XX_TEX_CONST_3_TILE_ALL | A6XX_TEX_CONST_3_FLAG;
+    const uint64_t flags = flagAddress();
+    d.dword[7] = uint32_t(flags);
+    d.dword[8] = uint32_t(flags >> 32);
+    d.dword[9] |= A6XX_TEX_CONST_9_FLAG_BUFFER_ARRAY_PITCH(ubwcLayerSize_ >> 2);
+    d.dword[10] |= A6XX_TEX_CONST_10_FLAG_BUFFER_PITCH(ubwcPitch_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGW(ubwcLogW_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGH(ubwcLogH_);
 }
 
 namespace {
@@ -652,6 +698,7 @@ bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32
         return ok;
     }
     if (ubwc_) return refuse(why, "a compressed render target: its pixels are the GPU's alone, in a layout this processor does not write");
+    if (tiled_) return refuse(why, "a tiled texture (TILE6_3): its pixels are the GPU's alone (private storage: \"never accessed by the CPU directly\", MTLResource.h), in a layout this processor does not write");
     if (info_->pvrtcBpp != 0) {
         // PVRTC: the whole level, as Metal requires of it (its blocks are read by their neighbours' texels), decoded
         // into the RGBA8 this texture holds
@@ -697,6 +744,7 @@ bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32
 bool Texture::read(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h, void* bytes, uint64_t bytesPerRow, std::string* why) const {
     if (staging_ != nullptr) return staging_->read(level, x, y, w, h, bytes, bytesPerRow, why);   // (the GPU never writes it: read-only usage)
     if (ubwc_) return refuse(why, "a compressed render target: its pixels are the GPU's alone, in a layout this processor does not read");
+    if (tiled_) return refuse(why, "a tiled texture (TILE6_3): its pixels are the GPU's alone (private storage: \"never accessed by the CPU directly\", MTLResource.h), in a layout this processor does not read");
     if (desc_.samples != 1) {
         return refuse(why, "a multisample texture's samples are the GPU's alone: resolve it into a texture of one sample first (Metal refuses this too)");
     }
@@ -813,21 +861,9 @@ a6xx::TexConst Texture::sampledDescriptor() const {
         d.dword[0] = (d.dword[0] & ~A6XX_TEX_CONST_0_SAMPLES__MASK) |
                      A6XX_TEX_CONST_0_SAMPLES(desc_.samples == 4 ? MSAA_FOUR : MSAA_TWO);
     }
-    if (ubwc_) {
-        // a UBWC texture (fdl6_view_init, fd6_view.c:251-306): TILE6_3, TILE_ALL (fdl6_layout sets it for UBWC on a
-        // chip without has_ubwc_linear_mipmap_fallback), and the flag buffer's address, pitch, layer and blocks
-        // (a tiled layout holds every 8-bit format in WZYX order: fd6_texture_swap gives WZYX for one that is not linear,
-        // and the 2D copy that fills it from the linear rows reorders a BGRA texture's bytes so)
-        d.dword[0] = (d.dword[0] & ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK)) | A6XX_TEX_CONST_0_TILE_MODE(TILE6_3) |
-                     A6XX_TEX_CONST_0_SWAP(WZYX);
-        d.dword[3] |= A6XX_TEX_CONST_3_TILE_ALL | A6XX_TEX_CONST_3_FLAG;
-        const uint64_t flags = flagAddress();
-        d.dword[7] = uint32_t(flags);
-        d.dword[8] = uint32_t(flags >> 32);
-        d.dword[9] |= A6XX_TEX_CONST_9_FLAG_BUFFER_ARRAY_PITCH(ubwcLayerSize_ >> 2);
-        d.dword[10] |= A6XX_TEX_CONST_10_FLAG_BUFFER_PITCH(ubwcPitch_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGW(ubwcLogW_) |
-                       A6XX_TEX_CONST_10_FLAG_BUFFER_LOGH(ubwcLogH_);
-    }
+    // a compressed or tiled texture: TILE6_3 and WZYX, and a compressed one's flag buffer (layoutInto; the 2D copy that
+    // fills a compressed texture from its linear rows reorders a BGRA texture's bytes into that order)
+    layoutInto(d);
     if (info_->depth) {
         // the depth plane as the TP reads it (fdl6_view_init over a depth layout): TILE6_3, and TILE_ALL since every level
         // of a depth layout is tiled (fd6_layout.c:157-164 "Linear D/S is not supported by HW"); FMT6_32_FLOAT, the depth
@@ -867,6 +903,9 @@ a6xx::TexConst Texture::levelDescriptor(uint32_t level) const {
     const TextureLevel L = this->level(level);
     a6xx::TexConst d = texture2d(levelAddress(level), L.width, L.height, uint32_t(L.pitch), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),
                                  info_->fmt6, info_->swap, info_->hasAlpha, info_->srgb);
+    // (a tiled or compressed texture has the one level: what a framebuffer fetch in sysmem reads is its layout, flags
+    // and all -- read as linear rows it was another picture)
+    layoutInto(d);
     d.dword[0] = swizzleWord(d.dword[0]);
     return d;
 }
@@ -900,6 +939,7 @@ std::shared_ptr<Texture> Texture::swizzled(const std::shared_ptr<Texture>& textu
     t->chroma_ = p.chroma_;
     t->layerPitch_ = p.layerPitch_;
     t->memoryless_ = p.memoryless_;
+    t->copyLayout(p);   // (a tiled or compressed render target read through a swizzle is still its own layout)
     // over the parent's: a component naming red reads what the parent's red reads
     for (int c = 0; c < 4; c++) t->swizzle_[c] = swizzle[c] < 2 ? swizzle[c] : p.swizzle_[swizzle[c] - 2];
     return t;
@@ -922,6 +962,10 @@ a6xx::TexConst Texture::storageDescriptor() const {
         // a 2D store, so the view is the 2D image whose rows are the layers -- each one row, a slice apart
         d = image2d(gpuAddress(), desc_.width, desc_.depth, uint32_t(sliceBytes()), info_->fmt6, info_->swap, info_->hasAlpha, info_->srgb);
     }
+    // (fdl6_view_init's storage descriptor carries the tile mode and the swap as the sampled one does, fd6_view.c:390-404.
+    // A tiled texture is not made with ShaderWrite; this is for a kernel that reads one through its IBO. A compressed
+    // one keeps the descriptor it always had here: whether the IBO path reads the flags is not what this changes)
+    if (tiled_) layoutInto(d);
     return d;
 }
 
@@ -1091,6 +1135,24 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
     if (parent->staging_ != nullptr) return view(parent->staging_, format, type, baseLevel, levels, baseSlice, slices, why);
     const Texture& p = *parent;
     const FormatInfo* info = formatInfo(format);
+    if (p.tiled_ || p.ubwc_) {
+        // A tiled or compressed render target (one of its own layout, no rows): the whole of it, in its own format or the
+        // other of its sRGB pair -- the same bytes in the same WZYX order. Another format of the same size would read the
+        // tiled bytes in the parent's order, not its own: Mesa lays such a texture out "mutable" (fd6_pipe2swap's
+        // is_mutable, fd6_format_table.c:374) and the plug-in does not tile one made with PixelFormatView usage
+        if (info != nullptr && info->fmt6 == p.info().fmt6 && info->swap == p.info().swap && info->bytesPerPixel == p.info().bytesPerPixel &&
+            type == p.type() && baseLevel == 0 && levels == p.levels() && baseSlice == 0 && slices == 1) {
+            TextureDesc d = p.desc_;
+            d.format = format;
+            std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_));
+            t->memoryless_ = p.memoryless_;
+            t->copyLayout(p);
+            return t;
+        }
+        refuse(why, "a view in pixel format " + n(uint32_t(format)) + ", type " + n(uint32_t(type)) + " of a " + (p.tiled_ ? "tiled " : "compressed ") +
+                        p.info().name + " texture: its whole self in its own format, or the other of its sRGB pair, is what is served");
+        return nullptr;
+    }
     const bool layered = p.type() == TextureType::k2DArray || p.type() == TextureType::kCube || p.type() == TextureType::kCubeArray;
     const uint32_t parentSlices = layered ? p.depth() : 1;
     const std::string asked = "a view in pixel format " + n(uint32_t(format)) + ", type " + n(uint32_t(type)) + ", levels " + n(baseLevel) + "+" + n(levels) +
