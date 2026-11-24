@@ -151,9 +151,11 @@ unsigned hakios_metal_kernel_threadgroup_memory(hakios_metal_kernel *kernel);   
  * buffer the command buffers keep alive while they use it) */
 hakios_metal_texture *hakios_metal_texture_new(hakios_metal_device *device, unsigned type, unsigned pixel_format,
     unsigned width, unsigned height, unsigned usage);
-/* a 2D, one-level RGBA8Unorm (70) or BGRA8Unorm (80) texture the GPU reads compressed (UBWC): what replace and read see
- * are its rows, copied in by the GPU before a draw or a dispatch samples it after they changed. For a texture that is
- * sampled and never drawn into or written by a kernel. NULL with the reason. */
+/* a 2D, one-level RGBA8Unorm (70) or BGRA8Unorm (80) texture the GPU reads compressed (UBWC). Without render-target
+ * usage, what replace and read see are its rows, copied in by the GPU before a draw or a dispatch samples it after they
+ * changed. With it (USAGE holds 4), a render target in the compressed layout alone, the GPU's: no rows, replace and read
+ * refuse it, and a pass into it runs in sysmem unless hakios_metal_cb_set_gmem_compressed. Never for a texture a kernel
+ * writes. NULL with the reason. */
 hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
     unsigned usage);
 /* MTLStorageModeMemoryless: TEXTURE's contents exist only while a render pass draws into it. It keeps its rows (a pass
@@ -161,7 +163,13 @@ hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *d
  * the pass names for it. Set before the texture is first attached. */
 void hakios_metal_texture_set_memoryless(hakios_metal_texture *texture, int memoryless);
 int hakios_metal_texture_memoryless(hakios_metal_texture *texture);
-/* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own) */
+/* A 2D, one-level, single-sample render target of a 4-byte colour format, at least 16 wide, laid out TILE6_3 without
+ * compression (texture.hpp: TextureDesc::tiled): the GPU's alone -- no rows for the processor, replace and read refuse it.
+ * NULL with the reason in hakios_metal_error otherwise. */
+hakios_metal_texture *hakios_metal_texture_new_tiled(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
+                                                     unsigned usage);
+/* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own,
+ * or none for a render target), 4 tiled (TILE6_3, the GPU's alone) */
 unsigned hakios_metal_texture_origin(hakios_metal_texture *texture);
 /* whether TEXTURE's rows are a program's own memory (a texture over a no-copy buffer) */
 int hakios_metal_texture_is_program_memory(hakios_metal_texture *texture);
@@ -552,6 +560,12 @@ void hakios_metal_cb_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *dra
 void hakios_metal_cb_set_gmem(hakios_metal_cb *cb, int on);
 /* GMEM's refinements turned off (CommandBuffer::setGmemOff's bits: 1 whole area, 2 every attachment, 4 fetch barrier) */
 void hakios_metal_cb_set_gmem_off(hakios_metal_cb *cb, unsigned bits);
+/* a pass with a compressed (UBWC) colour attachment in GMEM too, loaded and stored in its layout (CommandBuffer::
+ * setGmemCompressed); off by default, when such a pass runs in sysmem */
+void hakios_metal_cb_set_gmem_compressed(hakios_metal_cb *cb, int on);
+/* a pass one of whose draws reads its target (framebuffer fetch) tiled whatever its draws when its area is large enough,
+ * and its like recorded both ways whatever its history (CommandBuffer::setGmemFetchFirst); off by default */
+void hakios_metal_cb_set_gmem_fetch_first(hakios_metal_cb *cb, int on);
 /* GMEM or sysmem for each of CB's passes by what such passes cost the queue before (CommandBuffer::setGmemTuned) */
 void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb *cb, int on);
 /* GMEM only for a pass whose like had at least DRAWS draws the last time (CommandBuffer::setGmemMinDraws); 0: off */
@@ -578,6 +592,12 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *
 /* ...and of a tiled pass, apart: the attachments its draws' fragment stages have an output for (WROTE) and those a draw
  * reads through framebuffer fetch (READ), as masks; -1 past the profiled passes */
 int hakios_metal_cb_pass_access(hakios_metal_cb *cb, unsigned i, unsigned *wrote, unsigned *read);
+/* With profiling on, also the GPU's performance counters around each pass (CommandBuffer::setPerf): what each of
+ * them counted over pass I, COUNT of them at most into OUT, the number given back; -1 past the passes. Their names,
+ * by index: hakios_metal_perf_counter_name ("gbif_rd0" ... "rb_stall_ccu_w"; 13 of them) */
+void hakios_metal_cb_set_perf(hakios_metal_cb *cb, int on);
+int hakios_metal_cb_pass_counters(hakios_metal_cb *cb, unsigned i, uint32_t *out, unsigned count);
+const char *hakios_metal_perf_counter_name(unsigned i);
 /* the attachments the tiles of profiled pass I loaded and stored, as masks (0 and 0 for a sysmem pass); -1 past the passes */
 int hakios_metal_cb_pass_moved(hakios_metal_cb *cb, unsigned i, unsigned *loaded, unsigned *stored);
 int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);

@@ -1832,7 +1832,7 @@ hm_ft_name(unsigned i, const char *const *names, unsigned count)
 #define HM_FT_FILTER(f)  HM_FT_NAME(f, "nearest", "linear")
 #define HM_FT_MIP(f)     HM_FT_NAME(f, "none", "nearest", "linear")
 #define HM_FT_ADDRESS(a) HM_FT_NAME(a, "clamp", "mirrorclamp", "repeat", "mirror", "zero", "border")
-#define HM_FT_ORIGIN(o)  HM_FT_NAME(o, "own", "surface", "buffer", "compressed")
+#define HM_FT_ORIGIN(o)  HM_FT_NAME(o, "own", "surface", "buffer", "compressed", "tiled")
 #define HM_FT_STATUS(s)  HM_FT_NAME(s, "notenqueued", "enqueued", "committed", "scheduled", "completed", "error")
 
 /* a colour write mask (MTLColorWriteMask: red 8, green 4, blue 2, alpha 1) as its letters */
@@ -2149,6 +2149,8 @@ hm_ft_take(double created)
 	return ft;
 }
 
+static const char *hm_perf_text(hakios_metal_cb *cb, unsigned i, char *buf, size_t size);   /* metal_perf, below */
+
 /* the gpass lines of a command buffer the GPU is done with (or never had): the core's passes as it timed them */
 /* Boot-arg metal_samples=1: each timed pass also counts the samples its draws passed (ZPASS_DONE at both ends,
  * hakios_metal_cb_set_profile_samples), shown in the passes: lines and the gpass lines of a trace. What a pass writes
@@ -2184,11 +2186,14 @@ hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
 		(void)hakios_metal_cb_pass_attachments(cb, (unsigned)i, &attached, &touched);
 		(void)hakios_metal_cb_pass_access(cb, (unsigned)i, &wrote, &read);
 		(void)hakios_metal_cb_pass_moved(cb, (unsigned)i, &loaded, &stored);
+		char ctr[400];
+		hm_perf_text(cb, (unsigned)i, ctr, sizeof(ctr));
 		hm_ft_line(ft, "gpass i=%d kind=%s w=%u h=%u draws=%u us=%.1f mode=%s tiles=%d attached=0x%x touched=0x%x wrote=0x%x read=0x%x loaded=0x%x "
-			   "stored=0x%x samples=%lld why=%s\n", i,
+			   "stored=0x%x samples=%lld why=%s%s%s\n", i,
 			   HM_FT_NAME(kind, "draw", "copy", "clear", "dispatch"), width, height, draws, us,
 			   kind != 0 ? "-" : tiles > 0 ? "gmem" : "sysmem", MAX(tiles, 0), attached, touched, wrote, read, loaded, stored,
-			   hakios_metal_cb_pass_samples(cb, (unsigned)i), hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
+			   hakios_metal_cb_pass_samples(cb, (unsigned)i), hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)),
+			   ctr[0] != 0 ? " ctr=" : "", ctr);
 	}
 }
 
@@ -3587,6 +3592,19 @@ hm_boot_arg_set(const char *what)
 		}
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
+	/* metal_fs64=1 (/var/tmp/metal.args or a boot-arg; off by default): every fragment stage compiled for waves of 64,
+	 * as turnip compiles one on this chip, instead of 128 where its registers fit twice (hakios-metal compiler.cpp,
+	 * fsWaves64). Set before the device compiles anything: the stages of the two sizes are filed under different
+	 * names, and the warm-up compiles the recipes of this size it has not filed yet (dev-notes 25-blur/03 §3) */
+	{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_fs64=1") != NULL) {
+			setenv("HAKIOS_METAL_FS_WAVE", "64", 1);
+			hm_print("metal_fs64=1: fragment stages in waves of 64\n");
+		}
+	}
 	hm_ensure_spi([self class]);
 	hm_functions_encode_from_metadata();
 	self = [super init];
@@ -5092,6 +5110,113 @@ hm_ycbcr_direct(hakios_metal_device *gpu, IOSurfaceRef surface, MTLPixelFormat f
 	return t;
 }
 
+/*
+ * metal_tile=N (/var/tmp/metal.args or a boot-arg; off by default): CoreAnimation's own render targets -- its captures,
+ * the blur's intermediates and its pool -- laid out for the GPU instead of in linear rows. 1: TILE6_3 (hakios_metal_
+ * texture_new_tiled); 2: TILE6_3 compressed (UBWC, hakios_metal_texture_new_compressed with render-target usage).
+ * Only a texture no processor may read or write and no view may reinterpret: private storage ("never accessed by the
+ * CPU directly", MTLResource.h), allowGPUOptimizedContents left on, render-target usage, no ShaderWrite and no
+ * PixelFormatView (the conditions Metal's own lossy compression asks of a texture, MTLTexture.h), 2D, one level, one
+ * sample, RGBA8 or BGRA8 (or their sRGB pair; UBWC: the two unorm ones), at least 16 wide, not memoryless. A texture
+ * over an IOSurface or a buffer never comes here. An experiment (dev-notes 22, 25, 25-blur/03 §2). A pass into a
+ * compressed target runs in sysmem unless metal_gmemubwc=1 (hm_gmem_ubwc); a tiled one may have GMEM as a linear one.
+ */
+static int
+hm_tile_mode(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		mode = 0;
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_tile=")) != NULL) {
+			mode = atoi(at + strlen("metal_tile="));
+		}
+		if (mode < 0 || mode > 2) {
+			mode = 0;
+		}
+		if (mode != 0) {
+			hm_print("metal_tile=%d: CoreAnimation's private render targets are laid out %s\n", mode,
+				 mode == 1 ? "TILE6_3 (tiled, no compression)" : "TILE6_3 with UBWC compression");
+		}
+	}
+	return mode;
+}
+
+/*
+ * metal_gmemubwc=1 (/var/tmp/metal.args or a boot-arg; off by default): a pass whose colour attachment is compressed
+ * (UBWC: the window server's framebuffers in the kernel's scanout pool, and with metal_tile=2 CoreAnimation's private
+ * render targets) may run in GMEM, its tiles loading and storing the attachment in its layout with its flag buffer
+ * (hakios_metal_cb_set_gmem_compressed). Without it such a pass runs in sysmem whatever its draws ("compressed, whose
+ * tiles' loads and stores are served behind a switch" in the trace's why=). An A/B: dev-notes 25-blur/04.
+ */
+static BOOL
+hm_gmem_ubwc(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_gmemubwc=1") != NULL;
+		if (on) {
+			hm_print("metal_gmemubwc=1: a pass into a compressed (UBWC) target may run in GMEM\n");
+		}
+	}
+	return on == 1;
+}
+
+/*
+ * metal_p5=1 (/var/tmp/metal.args or a boot-arg; off by default): a pass one of whose draws reads its target through
+ * framebuffer fetch is tiled whatever its number of draws when its render area is 64 K pixels or more, and its like is
+ * recorded both ways whatever its history (hakios_metal_cb_set_gmem_fetch_first) -- turnip's order, the feedback loop
+ * before the count of draws. Meant for the blur's capture with its in-place filter and its full-size vertical pass,
+ * which otherwise read their target from memory behind a barrier a draw (dev-notes 25-blur/03 §1). It acts on passes
+ * recorded both ways, that is with metal_gmem_draws=N (the plug-in's default bar); a pass into a compressed target
+ * also needs metal_gmemubwc=1.
+ */
+static BOOL
+hm_p5(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_p5=1") != NULL;
+		if (on) {
+			hm_print("metal_p5=1: a pass that reads its target is tiled whatever its draws\n");
+		}
+	}
+	return on == 1;
+}
+
+static int
+hm_tile_for(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
+{
+	const MTLPixelFormat f = [descriptor pixelFormat];
+	int mode = hm_tile_mode();
+
+	if (mode == 0 || [descriptor storageMode] != MTLStorageModePrivate || ![descriptor allowGPUOptimizedContents] ||
+	    [descriptor textureType] != MTLTextureType2D || [descriptor mipmapLevelCount] != 1 || [descriptor sampleCount] != 1 ||
+	    ([descriptor usage] & MTLTextureUsagePixelFormatView) != 0 || (usage & MTLTextureUsageShaderWrite) != 0 ||
+	    (usage & MTLTextureUsageRenderTarget) == 0 || [descriptor width] < 16) {
+		return 0;
+	}
+	if (mode == 2 && (f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatBGRA8Unorm)) {
+		return 2;
+	}
+	if (f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB) {
+		return 1;
+	}
+	return 0;
+}
+
 static BOOL
 hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 {
@@ -5219,6 +5344,23 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 	} else if ([descriptor textureType] == MTLTextureType3D) {
 		texture = hakios_metal_texture_new_3d(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width], (unsigned)[descriptor height],
 						      (unsigned)[descriptor depth], (unsigned)usage);
+	} else if ([descriptor storageMode] != MTLStorageModeMemoryless && hm_tile_for(descriptor, usage) != 0) {
+		/* metal_tile: one of CoreAnimation's private render targets in the GPU's own layout (hm_tile_mode) */
+		const int how = hm_tile_for(descriptor, usage);
+
+		texture = how == 2 ? hakios_metal_texture_new_compressed(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
+									 (unsigned)[descriptor height], (unsigned)usage)
+				   : hakios_metal_texture_new_tiled(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
+								    (unsigned)[descriptor height], (unsigned)usage);
+		if (texture == NULL) {
+			/* (the core's sentence, once: the texture is made linear as before) */
+			HM_ONCE("metal_tile: a texture the switch would lay out for the GPU was refused by the core and is made linear\n");
+			hm_print("metal_tile: %lux%lu, format %lu: %s\n", (unsigned long)[descriptor width], (unsigned long)[descriptor height],
+				 (unsigned long)[descriptor pixelFormat], hakios_metal_error());
+			texture = hakios_metal_texture_new_levels(_gpu, (unsigned)[descriptor textureType], (unsigned)[descriptor pixelFormat],
+								  (unsigned)[descriptor width], (unsigned)[descriptor height],
+								  (unsigned)[descriptor mipmapLevelCount], (unsigned)usage);
+		}
 	} else if (hm_compress(descriptor, usage)) {
 		texture = hakios_metal_texture_new_compressed(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
 							      (unsigned)[descriptor height], (unsigned)usage);
@@ -6941,11 +7083,16 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_skip_refused(_cb, !hm_strict());
 		hakios_metal_cb_set_profile(_cb, hm_fps_on() || _ftrace != NULL);   /* (a recorded buffer's passes are timed, for its gpass lines) */
 		hakios_metal_cb_set_profile_samples(_cb, (hm_fps_on() || _ftrace != NULL) && hm_samples_on());
+		if (hm_perf_on() && (hm_fps_on() || _ftrace != NULL)) {
+			hakios_metal_cb_set_perf(_cb, 1);   /* metal_perf=1: the GPU's counters beside the stamps */
+		}
 		hakios_metal_cb_set_gmem(_cb, hm_gmem_on() || hm_gmem_draws() != 0);
 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
 		hakios_metal_cb_set_gmem_binning(_cb, (hm_gmem_off() & 16) == 0);   /* metal_gmem_off's 16: every draw in every tile */
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
+		hakios_metal_cb_set_gmem_compressed(_cb, hm_gmem_ubwc());   /* metal_gmemubwc=1 */
+		hakios_metal_cb_set_gmem_fetch_first(_cb, hm_p5());   /* metal_p5=1 */
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
 		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
 	}
@@ -7550,6 +7697,51 @@ hm_fps_draws(void)
 	return on != 0;
 }
 
+/*
+ * metal_perf=1 (/var/tmp/metal.args or a boot-arg; off by default): with metal_fps=passes or metal_trace=frame, the
+ * GPU's own counters of memory traffic and caches read around each timed pass (hakios_metal_cb_set_perf: the GBIF's
+ * read and write beats on its two AXI ports, the UCHE's reads for the TP, the TP's L1 requests and misses, the CCU's
+ * colour blocks and hits, the RB's colour reads, writes and stalls on the CCU). They go into the trace's gpass lines
+ * (ctr=...) and the passes lines. A diagnosis: each pass gains two waits for idle around the reads it had already and
+ * thirteen register reads at each end, so its own time grows a little; what it changes nothing of is what is drawn.
+ */
+static BOOL
+hm_perf_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_perf=1") != NULL;
+		if (on) {
+			hm_print("metal_perf=1: performance counters around each timed pass (gpass ctr=, passes ctr)\n");
+		}
+	}
+	return on;
+}
+
+/* the counters of pass I as "name=value,..." into BUF (empty without them) */
+static const char *
+hm_perf_text(hakios_metal_cb *cb, unsigned i, char *buf, size_t size)
+{
+	uint32_t c[16];
+	int n;
+	size_t off = 0;
+
+	buf[0] = 0;
+	if (!hm_perf_on() || (n = hakios_metal_cb_pass_counters(cb, i, c, 16)) <= 0) {
+		return buf;
+	}
+	for (int k = 0; k < n && off + 1 < size; k++) {
+		int w = snprintf(buf + off, size - off, "%s%s=%u", k == 0 ? "" : ",", hakios_metal_perf_counter_name((unsigned)k), c[k]);
+		if (w < 0) break;
+		off += (size_t)w;
+	}
+	return buf;
+}
+
 /* boot-arg metal_gmem_off=N: GMEM's refinements off by the bits of N (hakios_metal_cb_set_gmem_off; 8: the choice of GMEM
  * or sysmem by what each costs, hakios_metal_cb_set_gmem_tuned; 16: the hardware's binning,
  * hakios_metal_cb_set_gmem_binning; 32: every fragment texture the null one, wrong pictures but each draw's time without
@@ -7675,13 +7867,15 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 						 * it was tiled above it -- the two apart: written by a fragment stage's output, read by a fetch; and
 						 * those its tiles loaded from memory and stored to it) */
 						char samples[48] = "";
+						char ctr[400];
 						const long long counted = hakios_metal_cb_pass_samples(cb, (unsigned)i);
 
 						if (counted >= 0) snprintf(samples, sizeof(samples), " samples %lld", counted);
-						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x loaded %#x stored %#x %.3f ms%s%s%s\n", i, kind,
+						hm_perf_text(cb, (unsigned)i, ctr, sizeof(ctr));
+						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x loaded %#x stored %#x %.3f ms%s%s%s%s%s\n", i, kind,
 							 width, height, draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, wrote, read, loaded, stored, us / 1e3,
 							 samples, hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)[0] != 0 ? " sysmem: " : "",
-							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i));
+							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i), ctr[0] != 0 ? " ctr " : "", ctr);
 					}
 				}
 			}

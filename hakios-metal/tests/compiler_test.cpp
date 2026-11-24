@@ -1621,3 +1621,58 @@ TEST(a_ycbcr_slot_is_converted_after_its_sample_and_filed_apart) {
     for (const std::string& n : listing(base, "")) remove((std::string(base) + "/" + n).c_str());
     rmdir(base);
 }
+
+// HAKIOS_METAL_FS_WAVE=64 (the plug-in's metal_fs64=1): a fragment stage compiled for waves of 64, as turnip compiles
+// one on this chip (IR3_SINGLE_ONLY) -- every field the fixture's, which ir3_compiler built so; without it the same stage
+// takes waves of 128 where its registers fit twice. The two are filed in the cache under two names (the twin: the same
+// inputs, the one name, when the switch stays as it was).
+TEST(a_fragment_stage_takes_waves_of_64_behind_its_switch) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: the wave size did not run)\n");
+        return;
+    }
+    std::vector<uint8_t> bc = bitcodeOf("tri_color_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    std::string why;
+    unsetenv("HAKIOS_METAL_FS_WAVE");
+    auto wide = compileStage(bc.data(), bc.size(), &why);
+    setenv("HAKIOS_METAL_FS_WAVE", "64", 1);
+    auto narrow = compileStage(bc.data(), bc.size(), &why);
+    CHECK(wide != nullptr && narrow != nullptr);
+    if (wide == nullptr || narrow == nullptr) {
+        unsetenv("HAKIOS_METAL_FS_WAVE");
+        std::printf("       %s\n", why.c_str());
+        return;
+    }
+    CHECK(wide->stage.k.doubleThreadsize);
+    CHECK(!narrow->stage.k.doubleThreadsize);
+    compareKernelFields("tri_color_fs", narrow->stage.k, kernels::tri_color_fs_air.k, false);
+    // the cache: one name a size
+    char base[] = "/tmp/hakios-metal-wave-test-XXXXXX";
+    CHECK(mkdtemp(base) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", base, 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    auto stages = [&]() {
+        uint32_t n = 0;
+        if (DIR* dir = opendir(base)) {
+            while (dirent* e = readdir(dir)) {
+                const std::string name = e->d_name;
+                n += name.size() > 6 && name.compare(name.size() - 6, 6, ".stage") == 0;
+            }
+            closedir(dir);
+        }
+        return n;
+    };
+    for (int wave = 0; wave < 2; wave++) {
+        if (wave == 0) unsetenv("HAKIOS_METAL_FS_WAVE");
+        else setenv("HAKIOS_METAL_FS_WAVE", "64", 1);
+        for (int again = 0; again < 2; again++) {
+            auto s = compileStage(bc.data(), bc.size(), &why);
+            CHECK(s != nullptr && s->stage.k.doubleThreadsize == (wave == 0));
+        }
+        CHECK_EQ(stages(), uint32_t(wave + 1));
+    }
+    unsetenv("HAKIOS_METAL_FS_WAVE");
+    unsetenv("HAKIOS_METAL_CACHE");
+}

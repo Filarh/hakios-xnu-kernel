@@ -1649,8 +1649,10 @@ TEST(the_fake_refuses_a_draw_whose_target_does_not_hold_together) {
     }
     {
         Twin w;
-        w.at(regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, 0)) = rbMrtBufInfo(FMT6_8_8_8_8_UNORM, a6xx_tile_mode(3), WZYX);   // TILE6_3 (a6xx.xml.h:60), which the enum here does not name
-        CHECK(has(w.fault(), "RB_MRT_BUF_INFO[0]: tile mode 3: only linear targets are what this GPU model runs"));
+        // TILE6_3 told a BGRA swap: a tiled target is WZYX whatever its format (the CCU ignores the swap when tiled,
+        // fd6_format_table.c:370-375), so a tiled target told WXYZ is a stream the TP would read in another order
+        w.at(regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, 0)) = rbMrtBufInfo(FMT6_8_8_8_8_UNORM, TILE6_3, WXYZ);
+        CHECK(has(w.fault(), "RB_MRT_BUF_INFO[0]: tile mode 3: linear targets, or tiled 8_8_8_8 ones in WZYX, are what this GPU model runs"));
     }
     {
         Twin w;
@@ -6081,6 +6083,67 @@ TEST(a_pass_whose_like_was_light_is_recorded_for_sysmem_alone) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// setGmemFetchFirst (the plug-in's metal_p5=1): a pass one of whose draws reads its target is tiled whatever its draws
+// when its area is kGmemFetchMinPixels or more -- render::gmemWorth before the count of draws, as turnip's
+// get_optimal_mode -- and its like is recorded both ways whatever its history. At a bar of 56: two fetching draws over
+// 752 x 1626 are tiled with it and not without (the twin), two over 64 x 64 are not either way, two that do not fetch
+// are not; a pass of the kind whose like was light (one draw) is recorded for sysmem alone the first time it fetches,
+// and tiled from the next time on with the switch, never without.
+TEST(a_pass_that_reads_its_target_is_tiled_first_behind_its_switch) {
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    {
+        render::GmemChoice c;
+        c.draws = 2;
+        c.bar = 56;
+        c.fetch = true;
+        c.touched = c.loaded = c.stored = 4;
+        c.pixels = 752 * 1626;
+        std::string why;
+        CHECK(!render::gmemWorth(c, &why) && has(why, "too few for tiles"));
+        c.fetchFirst = true;
+        CHECK(render::gmemWorth(c, &why));
+        c.pixels = 64 * 64;
+        CHECK(!render::gmemWorth(c, &why));
+        c.pixels = 752 * 1626;
+        c.fetch = false;
+        CHECK(!render::gmemWorth(c, &why));
+    }
+    auto pass = [&](Rig& r, const Texture* t, int draws, bool fetch, bool first, std::string* refusal = nullptr) {
+        RenderPass p;
+        p.color0 = const_cast<Texture*>(t);
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemMinDraws(56);
+        cb->setGmemFetchFirst(first);
+        for (int i = 0; i < draws; i++) CHECK(cb->draw(fetch ? fb : flatProgram(), p, wholeDraw(6, t->width(), t->height()), Bindings{}, Bindings{}));
+        if (refusal != nullptr) *refusal = cb->gmemRefusal();
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+        return cb->counts().gmemPasses;
+    };
+    for (int first = 0; first < 2; first++) {
+        Rig r;
+        auto big = target(r, 752, 1626, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        auto small = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        for (int time = 0; time < 3; time++) CHECK_EQ(pass(r, big.get(), 2, true, first != 0), first ? 1u : 0u);
+        CHECK_EQ(pass(r, small.get(), 2, true, first != 0), 0u);
+    }
+    for (int first = 0; first < 2; first++) {
+        Rig r;
+        auto big = target(r, 752, 1626, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        CHECK_EQ(pass(r, big.get(), 2, false, first != 0), 0u);
+        // (its like had one draw: the first fetching one is recorded for sysmem alone, and says so)
+        std::string refusal;
+        CHECK_EQ(pass(r, big.get(), 1, false, first != 0), 0u);
+        CHECK_EQ(pass(r, big.get(), 2, true, first != 0, &refusal), 0u);
+        CHECK(has(refusal, "draws at most lately"));
+        CHECK_EQ(pass(r, big.get(), 2, true, first != 0, &refusal), first ? 1u : 0u);
+        CHECK_EQ(has(refusal, "draws at most lately"), first == 0);
+    }
+}
+
 // A DontCare attachment is not loaded when the granules past its edge stay in its rows: 100 x 36 (the right edge in the
 // rows' padding, 36 rows a multiple of 4) -- stored, not loaded; 100 x 37 (a granule row past the last) -- loaded too
 TEST(a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row) {
@@ -6983,5 +7046,201 @@ TEST(the_fake_runs_draw_state_groups_as_the_microcode_does) {
         const FakeGpu::Stats st = w.r.fake->stats();
         CHECK(st.faults != before);
         CHECK(has(st.lastFault, "a draw of the stream itself with draw-state group 5 still set by a tiled pass's draws"));
+    }
+}
+
+// setPerf: the performance counters read beside each pass's stamps -- the selectors written once from the stream after a
+// wait for idle, the counters read by CP_REG_TO_MEM at each stamp -- in a sysmem pass and a GMEM pass. The fake counts
+// nothing (zeros) but judges every read; the twin is the same buffer without setPerf, whose stream has none of it.
+TEST(perf_counters_are_selected_once_and_read_around_each_pass) {
+    Rig r;
+    auto t = target(r, 256, 256);
+    RenderPass pass;
+    pass.color0 = t.get();
+    render::Options sysmem;
+    sysmem.gmem = false;
+    size_t words[2] = {0, 0};
+    for (int perf = 0; perf < 2; perf++) {
+        const uint64_t before = r.fake->stats().cpWords;
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setPerf(perf != 0);
+        CHECK(cb->draw(flatProgram(), pass, wholeDraw(3, 256, 256), Bindings{}, Bindings{}, sysmem));
+        RenderPass other;
+        auto t2 = target(r, 256, 256);
+        other.color0 = t2.get();
+        CHECK(cb->draw(flatProgram(), other, wholeDraw(3, 256, 256), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), other, wholeDraw(3, 256, 256), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        const auto times = cb->passTimes();
+        CHECK_EQ(times.size(), 2u);
+        for (const auto& pt : times) {
+            for (uint32_t k = 0; k < CommandBuffer::kPerfCounters; k++) CHECK_EQ(pt.ctr[k], 0u);
+        }
+        words[perf] = r.fake->stats().cpWords - before;
+    }
+    // the reads and the selection are in the stream with setPerf alone: per pass two stamps of 1 + 9 reads of 4 words, and
+    // the selection once (RBBM_PERFCTR_CNTL, the GBIF's two, nine selectors, two waits: 13 * 2 + 2 words)
+    CHECK(words[1] > words[0] + 2 * 2 * 10 * 4);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK(std::string(CommandBuffer::perfCounterName(0)) == "gbif_rd0" && std::string(CommandBuffer::perfCounterName(12)) == "rb_stall_ccu_w");
+}
+
+// A tiled render target (TextureDesc::tiled: TILE6_3 without UBWC, as fdl6_layout lays an optimal image out with UBWC
+// off): its layout's numbers (the pitch to 256 bytes, the rows to 16, fd6_layout.c:86-111), no rows for this processor,
+// and every unit told TILE6_3 and WZYX (fd6_format_table.c:370-375): the RB drawing into it in sysmem, the 2D engine
+// filling it for a Clear and copying out of and into it, the TP sampling it and fetching it, and a GMEM pass loading
+// and storing it. The fake judges the tiled accesses (pitch, rows, reach) and carries none of them out; the twin is a
+// linear target of the same size, whose words keep the linear layout's.
+TEST(a_tiled_target_is_drawn_cleared_copied_sampled_loaded_and_stored_in_its_layout) {
+    using namespace a6xx;
+    Rig r;
+    TextureDesc td;
+    td.format = PixelFormat::kBGRA8Unorm;
+    td.width = 752;
+    td.height = 1626;
+    td.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    td.tiled = true;
+    std::string why;
+    auto tt = Texture::make(*r.gpu, td, &why);
+    CHECK(tt != nullptr);
+    if (tt == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    CHECK(tt->tiled() && !tt->compressed() && tt->contents() == nullptr);
+    CHECK_EQ(tt->bytesPerRow(), 3072u);                         // align(752 * 4, 256)
+    CHECK_EQ(tt->buffer()->length(), uint64_t(3072) * 1632);   // 1626 rows counted to 16, a multiple of 4096 already
+    CHECK(tt->colorTile() == TILE6_3 && tt->colorSwap() == WZYX);
+    std::vector<uint8_t> px(16);
+    CHECK(!tt->read(0, 0, 2, 2, px.data(), 8, &why) && has(why, "tiled texture (TILE6_3)"));
+    CHECK(!tt->replace(0, 0, 2, 2, px.data(), 8, &why) && has(why, "tiled texture (TILE6_3)"));
+    const TexConst sd = tt->sampledDescriptor();
+    CHECK_EQ((sd.dword[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_3));
+    CHECK_EQ((sd.dword[0] & A6XX_TEX_CONST_0_SWAP__MASK) >> A6XX_TEX_CONST_0_SWAP__SHIFT, uint32_t(WZYX));
+    CHECK_EQ((sd.dword[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 3072u);
+    CHECK_EQ((sd.dword[2] & A6XX_TEX_CONST_2_PITCHALIGN__MASK) >> A6XX_TEX_CONST_2_PITCHALIGN__SHIFT, 2u);
+    CHECK((sd.dword[3] & (A6XX_TEX_CONST_3_TILE_ALL | A6XX_TEX_CONST_3_FLAG)) == 0);
+    const TexConst ld = tt->levelDescriptor(0);
+    CHECK_EQ((ld.dword[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_3));
+    // a narrower one, one kernel-stored, or one of 8 bytes a pixel is refused by name
+    TextureDesc narrow = td;
+    narrow.width = 12;
+    CHECK(Texture::make(*r.gpu, narrow, &why) == nullptr && has(why, "at least 16 wide"));
+    TextureDesc stored = td;
+    stored.usage |= kTextureUsageWrite;
+    CHECK(Texture::make(*r.gpu, stored, &why) == nullptr && has(why, "not stored by a kernel"));
+    // views: its sRGB pair keeps the layout; RGBA8 (another order of the same bytes) is refused
+    auto srgb = Texture::view(tt, PixelFormat::kBGRA8UnormSrgb, TextureType::k2D, 0, 1, 0, 1, &why);
+    CHECK(srgb != nullptr && srgb->tiled() && srgb->colorTile() == TILE6_3);
+    CHECK(Texture::view(tt, PixelFormat::kRGBA8Unorm, TextureType::k2D, 0, 1, 0, 1, &why) == nullptr && has(why, "sRGB pair"));
+
+    // sysmem: a Clear and a draw into it -- the 2D fill's destination and RB_MRT_BUF_INFO in its layout
+    RenderPass pass;
+    pass.color0 = tt.get();
+    pass.load = LoadAction::kClear;
+    render::Options sysmem;
+    sysmem.gmem = false;
+    Encoded e(r, flatProgram(), pass, wholeDraw(3, 752, 1626), sysmem);
+    CHECK(e.ok);
+    if (!e.ok) std::printf("       %s\n", e.error.c_str());
+    CHECK_EQ(e.reg(regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, 0)), rbMrtBufInfo(FMT6_8_8_8_8_UNORM, TILE6_3, WZYX));
+    CHECK_EQ(e.reg(REG_A6XX_RB_2D_DST_INFO) & (A6XX_RB_2D_DST_INFO_TILE_MODE__MASK | A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK),
+             A6XX_RB_2D_DST_INFO_TILE_MODE(TILE6_3) | A6XX_RB_2D_DST_INFO_COLOR_SWAP(WZYX));
+    auto cb = drawOnce(r, flatProgram(), pass, wholeDraw(3, 752, 1626), sysmem);
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().tiledFills, 1u);
+    // sampled into a linear target, and fetched in place in sysmem
+    auto lin = target(r, 752, 1626, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    Sampler smp = nearestClamp();
+    Bindings fsb;
+    fsb.textures = {tt.get()};
+    fsb.samplers = {&smp};
+    RenderPass lp;
+    lp.color0 = lin.get();
+    cb = drawOnce(r, texProgram(), lp, wholeDraw(6, 752, 1626), sysmem, Bindings{}, fsb);
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    // copies out of it and into it by the 2D engine (judged, not carried out)
+    const uint32_t copiesBefore = r.fake->stats().tiledCopies;
+    cb = r.queue->commandBuffer();
+    CHECK(cb->blit(*tt, 0, render::BlitRect{0, 0, 752, 1626}, *lin, 0, render::BlitRect{0, 0, 752, 1626}, false, render::Options{}));
+    CHECK(cb->blit(*lin, 0, render::BlitRect{0, 0, 752, 1626}, *tt, 0, render::BlitRect{0, 0, 752, 1626}, false, render::Options{}));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().tiledCopies, copiesBefore + 2);
+    // GMEM: a pass that loads it, two draws, and stores it -- every tile's load and store an event blit in TILE6_3
+    RenderPass gp;
+    gp.color0 = tt.get();
+    const auto before = r.fake->stats();
+    cb = r.queue->commandBuffer();
+    Draw d1 = wholeDraw(3, 752, 1626), d2 = wholeDraw(3, 752, 1626);
+    CHECK(cb->draw(flatProgram(), gp, d1, Bindings{}, Bindings{}));
+    CHECK(cb->draw(flatProgram(), gp, d2, Bindings{}, Bindings{}));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    const auto after = r.fake->stats();
+    CHECK(after.tiles > before.tiles);
+    CHECK(after.tileLoads - before.tileLoads == after.tiles - before.tiles && after.tileStores - before.tileStores == after.tiles - before.tiles);
+    CHECK_EQ(after.faults, 0u);
+}
+
+// A compressed render target (TextureDesc::compressed with render-target usage: UBWC, no rows) as a pass's target: by
+// default the pass runs in sysmem, the reason naming the switch (render::gmemPlan refuses it); with setGmemCompressed
+// its tiles load and store it by the event blit in its layout (TILE6_3, FLAGS and its flag buffer in RB_BLIT_FLAG_DST,
+// as turnip's tu_emit_blit with tu_cs_image_flag_ref); the twin, the same pass on the same target without the
+// switch, has no tile. Needs Mesa's layout (a build with MESA=1).
+TEST(a_compressed_target_is_tiled_only_behind_its_switch) {
+    using namespace a6xx;
+    Rig r;
+    TextureDesc cd;
+    cd.format = PixelFormat::kBGRA8Unorm;
+    cd.width = 752;
+    cd.height = 1626;
+    cd.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    cd.compressed = true;
+    std::string why;
+    auto ct = Texture::make(*r.gpu, cd, &why);
+    if (ct == nullptr && why.find("this build has none") != std::string::npos) {
+        std::printf("       (no Mesa in this build: %s; the compressed target did not run)\n", why.c_str());
+        return;
+    }
+    CHECK(ct != nullptr);
+    if (ct == nullptr) { std::printf("       %s\n", why.c_str()); return; }
+    CHECK(ct->compressed() && ct->contents() == nullptr && ct->staging() == nullptr);
+    RenderPass gp;
+    gp.color0 = ct.get();
+    render::GmemPlan plan;
+    CHECK(!render::gmemPlan(gp, &plan, &why) && has(why, "setGmemCompressed"));
+    CHECK(render::gmemPlan(gp, &plan, &why, render::kGmemPlanCompressed));
+    for (int on = 0; on < 2; on++) {
+        const auto before = r.fake->stats();
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemCompressed(on != 0);
+        cb->setProfile(true);
+        Draw d1 = wholeDraw(3, 752, 1626), d2 = wholeDraw(3, 752, 1626);
+        CHECK(cb->draw(flatProgram(), gp, d1, Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), gp, d2, Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        const auto after = r.fake->stats();
+        const auto t = cb->passTimes();
+        CHECK_EQ(t.size(), size_t(1));
+        if (on == 0) {
+            CHECK(after.tiles == before.tiles);
+            CHECK(!t.empty() && t[0].tiles == 0 && has(t[0].sysmemWhy, "compressed"));
+        } else {
+            CHECK(after.tiles > before.tiles);
+            CHECK(after.tileLoads - before.tileLoads == after.tiles - before.tiles && after.tileStores - before.tileStores == after.tiles - before.tiles);
+            CHECK(!t.empty() && t[0].tiles != 0);
+        }
+        CHECK_EQ(after.faults, 0u);
     }
 }

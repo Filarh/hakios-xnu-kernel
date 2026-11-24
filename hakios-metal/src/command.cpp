@@ -299,6 +299,73 @@ void CommandBuffer::stamp(uint32_t slot) {
                            uint32_t(at >> 32)};
     stream_.packet(a6xx::CP_REG_TO_MEM, w, 3);
     use(*profileStamps_, true);
+    if (perf_) perfStamp(slot);
+}
+
+namespace {
+// The counters setPerf reads, each a countable selected into a counter (Mesa 25.0.7 a6xx.xml.h: the selectors' and the
+// counters' offsets, and the countables' values; the GBIF's from KGSL's a6xx_reg.h:856-859, 876-886):
+//   0-3   GBIF_PERF_CNT_LOW0..3 (0x3cc4-0x3cc7): AXI0 and AXI1 read data beats (34, 35), write data beats (46, 47), the
+//         four selected in GBIF_PERF_CNT_SEL (0x3cc2) a byte each and enabled in GBIF_PERF_PWR_CNT_EN (0x3cc0) a bit each
+//         (KGSL a6xx_counter_gbif_enable: the clear register is the select's minus 1, the enable's minus 2)
+//   4-5   RBBM_PERFCTR_UCHE_0/1 (0x476, 0x478): PERF_UCHE_VBIF_READ_BEATS_TP (4), PERF_UCHE_READ_REQUESTS_TP (9)
+//   6-7   RBBM_PERFCTR_TP_0/1 (0x48e, 0x490): PERF_TP_L1_CACHELINE_REQUESTS (6), PERF_TP_L1_CACHELINE_MISSES (7)
+//   8-9   RBBM_PERFCTR_CCU_0/1 (0x45c, 0x45e): PERF_CCU_COLOR_BLOCKS (5), PERF_CCU_COLOR_BLOCK_HIT (7)
+//   10-12 RBBM_PERFCTR_RB_0/1/2 (0x4d6, 0x4d8, 0x4da): PERF_RB_C_READ (14), PERF_RB_C_WRITE (15),
+//         PERF_RB_STALL_CYCLES_CCU_COLOR_WRITE (35)
+// RBBM_PERFCTR_CNTL (0x500) 1 turns the counters on, as Linux and KGSL leave it at every start of the GPU; this kernel
+// does not write it. The CP's and the RBBM's counter 0 (gxfreq's) are not touched.
+struct PerfSel {
+    uint32_t selReg, countable, ctrReg;
+    const char* name;
+};
+constexpr PerfSel kPerf[CommandBuffer::kPerfCounters] = {
+    {0x3cc2, 34, 0x3cc4, "gbif_rd0"}, {0x3cc2, 35, 0x3cc5, "gbif_rd1"}, {0x3cc2, 46, 0x3cc6, "gbif_wr0"}, {0x3cc2, 47, 0x3cc7, "gbif_wr1"},
+    {0x0e1c, 4, 0x0476, "uche_rd_tp"}, {0x0e1d, 9, 0x0478, "uche_req_tp"},
+    {0xb610, 6, 0x048e, "tp_l1_req"},  {0xb611, 7, 0x0490, "tp_l1_miss"},
+    {0x8e18, 5, 0x045c, "ccu_blocks"}, {0x8e19, 7, 0x045e, "ccu_hit"},
+    {0x8e10, 14, 0x04d6, "rb_c_read"}, {0x8e11, 15, 0x04d8, "rb_c_write"}, {0x8e12, 35, 0x04da, "rb_stall_ccu_w"},
+};
+}  // namespace
+
+const char* CommandBuffer::perfCounterName(uint32_t i) { return i < kPerfCounters ? kPerf[i].name : "?"; }
+
+void CommandBuffer::perfStamp(uint32_t slot) {
+    if (perfStamps_ == nullptr) {
+        std::string why;
+        perfStamps_ = queue_.takeBuffer(4ull * kPerfCounters * 2 * kMaxProfiled, &why);
+        if (perfStamps_ == nullptr) {
+            perf_ = false;
+            return;
+        }
+        memset(perfStamps_->contents(), 0, 4ull * kPerfCounters * 2 * kMaxProfiled);
+        keep(perfStamps_);
+    }
+    if (!perfSelected_) {
+        // once a command buffer, before its first reading: the selectors from the stream after a wait for idle ("bashing
+        // select register directly while gpu is active will end in tears.. so we need to write it via the ring",
+        // fdperf.c:206-213)
+        stream_.waitForIdle();
+        const uint32_t on = 1;
+        stream_.registers(0x0500, &on, 1);                                   // RBBM_PERFCTR_CNTL
+        const uint32_t gbifSel = kPerf[0].countable | kPerf[1].countable << 8 | kPerf[2].countable << 16 | kPerf[3].countable << 24;
+        stream_.registers(0x3cc2, &gbifSel, 1);                              // GBIF_PERF_CNT_SEL
+        const uint32_t gbifEn = 0xf;
+        stream_.registers(0x3cc0, &gbifEn, 1);                               // GBIF_PERF_PWR_CNT_EN: counters 0-3
+        for (uint32_t i = 4; i < kPerfCounters; i++) stream_.registers(kPerf[i].selReg, &kPerf[i].countable, 1);
+        stream_.waitForIdle();
+        perfSelected_ = true;
+    }
+    const uint64_t at = perfStamps_->gpuAddress() + 4ull * kPerfCounters * slot;
+    // the GBIF's four low words in one read (consecutive registers), then each other counter's low word
+    const uint32_t g[3] = {a6xx::CP_REG_TO_MEM_0_REG(0x3cc4) | a6xx::CP_REG_TO_MEM_0_CNT(4), uint32_t(at), uint32_t(at >> 32)};
+    stream_.packet(a6xx::CP_REG_TO_MEM, g, 3);
+    for (uint32_t i = 4; i < kPerfCounters; i++) {
+        const uint64_t to = at + 4ull * i;
+        const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(kPerf[i].ctrReg) | a6xx::CP_REG_TO_MEM_0_CNT(1), uint32_t(to), uint32_t(to >> 32)};
+        stream_.packet(a6xx::CP_REG_TO_MEM, w, 3);
+    }
+    use(*perfStamps_, true);
 }
 
 std::shared_ptr<Buffer> CommandQueue::vscBuffer(std::string* why) {
@@ -342,11 +409,18 @@ uint32_t CommandQueue::lastDraws(uint64_t kind, uint32_t ordinal) {
     return it == lastDraws_.end() ? 0 : it->second;
 }
 
-void CommandQueue::noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws) {
+void CommandQueue::noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws, bool fetched) {
     std::lock_guard<std::mutex> g(lock_);
     lastDraws_[kindKey(kind, ordinal)] = draws;
     Peak& p = peakDraws_[kindKey(kind, ordinal)];
     if (draws >= p.draws || ++p.below >= 16) p.draws = draws, p.below = 0;
+    p.fetched = fetched;
+}
+
+bool CommandQueue::peakFetched(uint64_t kind, uint32_t ordinal) {
+    std::lock_guard<std::mutex> g(lock_);
+    auto it = peakDraws_.find(kindKey(kind, ordinal));
+    return it != peakDraws_.end() && it->second.fetched;
 }
 
 uint32_t CommandQueue::peakDraws(uint64_t kind, uint32_t ordinal) {
@@ -440,6 +514,12 @@ std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
         const auto* c = static_cast<const uint64_t*>(sampleStamps_->contents());
         for (size_t i = 0; i < out.size(); i++) {
             if (c[2 * i + 1] >= c[2 * i]) out[i].samples = int64_t(c[2 * i + 1] - c[2 * i]);
+        }
+    }
+    if (perfStamps_ != nullptr) {
+        const auto* c = static_cast<const uint32_t*>(perfStamps_->contents());
+        for (size_t i = 0; i < out.size(); i++) {
+            for (uint32_t k = 0; k < kPerfCounters; k++) out[i].ctr[k] = c[(2 * i + 1) * kPerfCounters + k] - c[2 * i * kPerfCounters + k];
         }
     }
     return out;

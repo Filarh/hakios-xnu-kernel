@@ -150,7 +150,9 @@ MrtWords mrtWords(const Texture& t, uint32_t level, uint32_t slice = 0) {
     MrtWords m{};
     // (a layer, a face or a depth plane: the slices are one 2D layout each, sliceBytes apart -- fd6_layout.c's layer_size)
     const uint64_t base = t.levelAddress(level) + (slice != 0 ? uint64_t(slice) * t.sliceBytes() : 0);
-    m.bufInfo = rbMrtBufInfo(colorFmt(f), t.compressed() ? TILE6_3 : TILE6_LINEAR, f.swap);
+    // (the layout's tile mode, and for a tiled one WZYX, which the CCU writes whatever it is told, fd6_format_table.c:370-375
+    // -- fdl6_view_init's RB_MRT_BUF_INFO, fd6_view.c:408-413; a compressed one keeps the format's swap it was drawn with)
+    m.bufInfo = rbMrtBufInfo(colorFmt(f), t.colorTile(), t.tiled() ? WZYX : f.swap);
     if (t.compressed()) {
         // its flag buffer, as tu6_emit_mrt / fd6 emit_mrt write it (fd6_view.c's FLAG_BUFFER_PITCH: the pitch, the layer
         // size over 4); RB_RENDER_CNTL.FLAG_MRTS turns its use on
@@ -993,14 +995,16 @@ void fillStream(pm4::Stream& stream, const Texture& target, const ClearWords& c,
         regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {uint32_t(target.flagAddress()), uint32_t(target.flagAddress() >> 32),
                                                  A6XX_RB_2D_DST_FLAGS_PITCH(target.flagPitch())});
     } else {
-        regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), tile, f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
+        // (a tiled target in WZYX order, as every unit reads a tiled layout: r2d_dst over a tiled view, fd6_pipe2swap)
+        regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), tile, target.tiled() ? WZYX : f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32),
+                                                A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
         regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
     }
     command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
 }
 
 void clearStream(pm4::Stream& stream, const Texture& target, const ClearWords& c, uint64_t ts, uint32_t level = 0, uint32_t slice = 0) {
-    fillStream(stream, target, c, TILE6_LINEAR, level, slice);
+    fillStream(stream, target, c, target.colorTile(), level, slice);
     eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, ts, kClearFlushValue, false);
     waitForWord(stream, ts, kClearFlushValue);
     event(stream, PC_CCU_INVALIDATE_COLOR);
@@ -1765,6 +1769,12 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
         mrts[i] = a.texture != nullptr ? mrtWords(*named, a.level, a.slice)
                                        : mrtWords(*named, named == attachmentOf(pass, 0).texture ? attachmentOf(pass, 0).level : 0,
                                                   named == attachmentOf(pass, 0).texture ? attachmentOf(pass, 0).slice : 0);
+        // (a compressed attachment drawn in tiles is told WZYX, the order its tiles' event blits load and store it in --
+        // turnip's RB_MRT_BUF_INFO and RB_BLIT_DST_INFO of a UBWC view, fdl6_view_init, fd6_view.c:408-436; drawn in
+        // sysmem it keeps the format's swap, which the CCU ignores in a tiled layout, fd6_format_table.c:370-375)
+        if (gmem != nullptr && named->compressed()) {
+            mrts[i].bufInfo = rbMrtBufInfo(colorFmt(named->info()), TILE6_3, WZYX);
+        }
         if (mrts[i].srgb && colorRegid[i] != kRegidNone) srgbMask |= 1u << i;
     }
     // each attachment's bin in a pass drawn in tiles
@@ -2415,7 +2425,9 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t
             return refuse(why, which + ": GMEM takes single-sampled 4- and 8-byte float formats");
         }
         if (a.level >= t.levels()) return refuse(why, which + ": no such level");
-        if (t.compressed()) return refuse(why, which + ": compressed, which the tiles' loads and stores do not serve yet");
+        if (t.compressed() && !(flags & kGmemPlanCompressed)) {
+            return refuse(why, which + ": compressed, whose tiles' loads and stores are served behind a switch (CommandBuffer::setGmemCompressed)");
+        }
         const TextureLevel L = t.level(a.level);
         if (L.width != W || L.height != H) return refuse(why, which + ": not the window's size, " + n(W) + "x" + n(H));
         // The event blit moves whole 16 x 4 granules: past the right edge it reads and writes the row's padding, past
@@ -2537,6 +2549,7 @@ bool gmemPipes(const GmemPlan& plan, uint32_t* perPipeX, uint32_t* perPipeY) {
 }
 
 bool gmemWorth(const GmemChoice& c, std::string* why) {
+    if (c.fetchFirst && c.fetch && c.pixels >= kGmemFetchMinPixels) return true;
     const uint32_t few = std::min(c.bar, kGmemFewDraws);
     const std::string bar = "metal_gmem_draws=" + std::to_string(c.bar);
     if (c.draws < few) {
@@ -2710,9 +2723,17 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         const Texture& t = *a.texture;
         const FormatInfo& f = t.info();
         const uint64_t base = t.levelAddress(a.level) + (a.slice != 0 ? uint64_t(a.slice) * t.sliceBytes() : 0);
+        // (in the attachment's layout: TILE6_3 and WZYX for a tiled or compressed one, and a compressed one's flag buffer --
+        // fdl6_view_init's RB_BLIT_DST_INFO, fd6_view.c:430-436, and turnip's tu_emit_blit with tu_cs_image_flag_ref,
+        // which loads and stores a UBWC image so, tu_clear_blit.cc)
         regs(stream, REG_A6XX_RB_BLIT_DST_INFO,
-             {rbBlitDstInfo(colorFmt(f), TILE6_LINEAR, f.swap), uint32_t(base), uint32_t(base >> 32), uint32_t(t.level(a.level).pitch) >> 6});
-        regs(stream, REG_A6XX_RB_BLIT_FLAG_DST, {0, 0, 0});
+             {rbBlitDstInfo(colorFmt(f), t.colorTile(), t.colorSwap()) | (t.compressed() ? A6XX_RB_BLIT_DST_INFO_FLAGS : 0u), uint32_t(base), uint32_t(base >> 32),
+              uint32_t(t.level(a.level).pitch) >> 6});
+        if (t.compressed()) {
+            regs(stream, REG_A6XX_RB_BLIT_FLAG_DST, {uint32_t(t.flagAddress()), uint32_t(t.flagAddress() >> 32), t.flagPitchWord()});
+        } else {
+            regs(stream, REG_A6XX_RB_BLIT_FLAG_DST, {0, 0, 0});
+        }
         reg(stream, REG_A6XX_RB_BLIT_BASE_GMEM, plan.base[i]);
         reg(stream, REG_A6XX_RB_BLIT_INFO, rbBlitInfo(type, false));
         event(stream, BLIT);
@@ -2940,7 +2961,12 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     if (dst.compressed() && (sf.fmt6 != df.fmt6 || dstLevel != 0 || linear)) {
         return refuse(why, "a copy into a compressed texture: from its own format, pixel for pixel, into level 0 is what is served");
     }
-    if (sf.fmt6 != df.fmt6 || (sf.swap != df.swap && !dst.compressed())) {
+    // (a tiled source is read in its layout, r2d_src over the view: SP_PS_2D_SRC_INFO's tile mode, tu_clear_blit.cc:268-295;
+    // into a tiled one, its own format pixel for pixel into level 0, r2d_dst, :396-413)
+    if (dst.tiled() && (sf.fmt6 != df.fmt6 || dstLevel != 0 || linear)) {
+        return refuse(why, "a copy into a tiled texture: from its own format, pixel for pixel, into level 0 is what is served");
+    }
+    if (sf.fmt6 != df.fmt6 || (sf.swap != df.swap && dst.colorTile() == TILE6_LINEAR)) {
         return refuse(why, std::string("a copy from ") + sf.name + " to " + df.name + ": the two must be one pixel format (an sRGB pair is one)");
     }
     if (srcLevel >= src.levels() || dstLevel >= dst.levels()) {
@@ -2997,7 +3023,7 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     default: {
         const uint32_t bpp = df.bytesPerPixel;
         if (scaled || linear || src.samples() != 1 || sf.bytesPerPixel != bpp || df.blockW != 1 || sf.blockW != 1 ||
-            (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16)) {
+            (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16) || src.colorTile() != TILE6_LINEAR || dst.colorTile() != TILE6_LINEAR) {
             return refuse(why, std::string("a copy of ") + df.name + ": the 2D engine's intermediate format for it is not worked out here, and the copy " +
                                    "is not one of the same size pixel for pixel that could move the bits as they are");
         }
@@ -3027,6 +3053,12 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     const a3xx_msaa_samples srcSamples = src.samples() == 4 ? MSAA_FOUR : src.samples() == 2 ? MSAA_TWO : MSAA_ONE;
     uint32_t srcInfo = sp2dSrcInfo(srcFmt, srcSwap, srgb, linear && scaled) | A6XX_SP_PS_2D_SRC_INFO_SAMPLES(srcSamples) |
                        (srcSamples != MSAA_ONE && sf.element == kElemFloat ? A6XX_SP_PS_2D_SRC_INFO_SAMPLES_AVERAGE : 0u);
+    if (src.tiled()) {
+        // from a TILE6_3 layout without flags (r2d_src over a tiled view): TILE6_3 and WZYX
+        srcInfo = (srcInfo & ~(A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK | A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__MASK)) |
+                  field(TILE6_3, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__SHIFT, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK) |
+                  field(WZYX, A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__SHIFT, A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__MASK);
+    }
     if (src.compressed()) {
         // from a UBWC layout (r2d_src over a UBWC view, tu_clear_blit.cc; fdl6_view_init's SP_PS_2D_SRC_INFO): TILE6_3, WZYX
         // (the layout's order; the destination's swap puts a BGRA texture's bytes back), FLAGS, and its flag buffer
@@ -3041,7 +3073,11 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     } else {
         regs(stream, REG_A6XX_SP_PS_2D_SRC_FLAGS, {0, 0, 0});
     }
-    if (dst.compressed()) {
+    if (dst.tiled()) {
+        // into a TILE6_3 layout without flags (r2d_dst over a tiled view): TILE6_3 and WZYX
+        regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(dstFmt, TILE6_3, WZYX, srgb), uint32_t(to), uint32_t(to >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(DL.pitch))});
+        regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
+    } else if (dst.compressed()) {
         // into a UBWC layout (r2d_dst over a UBWC view, tu_clear_blit.cc; fdl6_view_init's RB_2D_DST_INFO): TILE6_3, WZYX
         // (the layout's order, the source's swap reordering a BGRA texture's bytes into it), FLAGS, and its flag buffer
         regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(dstFmt, TILE6_3, WZYX, srgb) | A6XX_RB_2D_DST_INFO_FLAGS, uint32_t(to), uint32_t(to >> 32),
@@ -4530,7 +4566,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         dual = open_->dual;
         plan = open_->plan;
     } else if (options.gmem && gmem_) {
-        gmem = render::gmemPlan(pass, &plan, &gmemWhy_, gmemOff_ & kGmemOldTiles ? render::kGmemPlanOld : 0u) && tileable;
+        gmem = render::gmemPlan(pass, &plan, &gmemWhy_, (gmemOff_ & kGmemOldTiles ? render::kGmemPlanOld : 0u) |
+                                                          (gmemCompressed_ ? render::kGmemPlanCompressed : 0u)) && tileable;
         if (!tileable) gmemWhy_ = whyNotTiled();
         if (gmem && gmemMinDraws_ != 0) {
             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so
@@ -4541,7 +4578,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             kind = render::tuneKeyOf(pass);
             ordinal = ordinals_[kind]++;
             const uint32_t peak = queue_.peakDraws(kind, ordinal);
-            if (peak != 0 && peak < gmemMinDraws_ / 2) {
+            // (setGmemFetchFirst: a like that read its target is recorded both ways, its few draws notwithstanding)
+            if (peak != 0 && peak < gmemMinDraws_ / 2 && !(gmemFetchFirst_ && queue_.peakFetched(kind, ordinal))) {
                 gmem = false;
                 gmemWhy_ = "its like had " + std::to_string(peak) + " draws at most lately";
             } else {
@@ -4741,6 +4779,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
     }
     open_->lastFetched = program.fs.fbRead != 0;
+    open_->fetched |= open_->lastFetched;
     open_->draws++;
     pm4::Stream& into = open_->gmem ? open_->bodies : stream_;
     const bool timed = profileDraws_ && !open_->gmem && drawsProfiled_.size() < kMaxProfiledDraws;
@@ -4897,6 +4936,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         bool certain = false;
         if (gmemOff_ & kGmemByDrawsAlone) {
             certain = open_->draws >= gmemMinDraws_;
+        } else if (gmemFetchFirst_ && open_->read != 0 && openAreaPixels() >= render::kGmemFetchMinPixels) {
+            certain = true;   // (setGmemFetchFirst: a draw reads its target over an area that clears the minimum -- and the area only grows)
         } else if (open_->draws >= std::min(gmemMinDraws_, render::kGmemFewDraws)) {
             if (open_->read != 0) {
                 certain = true;   // (a draw reads its target: tiles)
@@ -5135,6 +5176,13 @@ bool CommandBuffer::append(CommandBuffer& other) {
     return true;
 }
 
+uint64_t CommandBuffer::openAreaPixels() const {
+    const uint32_t* a = open_->area;
+    if (a[0] <= a[2] && a[1] <= a[3]) return uint64_t(a[2] - a[0] + 1) * (a[3] - a[1] + 1);
+    const auto [W, H] = render::windowOf(open_->pass);
+    return uint64_t(W) * H;
+}
+
 void CommandBuffer::closePass(const RenderPass* next, bool kept) {
     if (open_ == nullptr) {
         return;
@@ -5189,6 +5237,8 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
             c.draws = open_->draws;
             c.bar = gmemMinDraws_;
             c.fetch = open_->read != 0;
+            c.fetchFirst = gmemFetchFirst_;
+            c.pixels = openAreaPixels();
             uint32_t load = 0, store = 0;
             const uint32_t H = render::windowOf(open_->pass).second;
             loadStore(overArea ? open_->area[3] : H - 1, H, &load, &store);
@@ -5220,7 +5270,7 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
         noted = std::max(noted, gmemMinDraws_);
         belowBar = open_->draws < gmemMinDraws_;
     }
-    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted);
+    if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted, open_->fetched);
     if (open_->gmem && open_->bodies.size() != 0) {
         Piece ib;
         std::string why;

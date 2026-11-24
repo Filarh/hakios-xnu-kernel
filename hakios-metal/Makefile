@@ -139,6 +139,12 @@ out/ios/hakios-metal-ycbcrcheck: tools/ycbcrcheck.cpp out/ios/libhakios-metal.a 
 		-framework IOKit -framework CoreFoundation -framework IOSurface
 
 
+# the layout check (tools/tilecheck.cpp): linear, TILE6_3 and UBWC render targets on the phone's GPU, compared and timed
+out/ios/hakios-metal-tilecheck: tools/tilecheck.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
+		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
+	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/tilecheck.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
+		-framework IOKit -framework CoreFoundation -framework IOSurface
+
 # a kernel's bitcode as a header, for a probe that compiles it on the phone (our own kernels only: tools/kernels/*.ll)
 tests/fixtures/%_bc.hpp: out/host/kernels/%.bc tools/bc-header.py
 	python3 -I tools/bc-header.py $< $* > $@

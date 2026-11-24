@@ -193,7 +193,14 @@ public:
     // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
     // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted
+    // With profiling and setPerf on, the GPU's own counters of memory traffic and of its caches are read beside each
+    // stamp, and PassTime::ctr holds what each counted over the pass (end minus start, 32 bits): kPerfCounters of them,
+    // named by perfCounterName. They are selected once in the command buffer, from its stream after a wait for idle, as
+    // turnip's VK_KHR_performance_query and KGSL select them (tu_query_pool.cc; KGSL adreno_a6xx_perfcounter.c), and
+    // read by CP_REG_TO_MEM where the time stamps are read.
+    static constexpr uint32_t kPerfCounters = 13;
+    static const char* perfCounterName(uint32_t i);
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; uint32_t ctr[kPerfCounters] = {}; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted; CTR: setPerf's counters over the pass
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and the samples each pass's draws passed: the RB's running count copied out by ZPASS_DONE at the pass's start
@@ -202,6 +209,7 @@ public:
     // of the choice between tiles and sysmem (dev-notes/investigacion/13 §10.4). Off by default: three packets at each
     // end of a pass.
     void setProfileSamples(bool on) { profileSamples_ = on; }
+    void setPerf(bool on) { perf_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
     // the counter at both (so the draws no longer overlap: what each costs alone), with its program's name. Which
     // draws of a heavy frame are heavy is read off these (metal_fps=draws).
@@ -228,6 +236,14 @@ public:
         kGmemEveryBin = 512, kGmemInlineBarriers = 1024, kGmemAllOrdered = 2048, kGmemByDrawsAlone = 4096, kSysmemFetchUnordered = 8192,
     };
     void setGmemOff(uint32_t bits) { gmemOff_ = bits; }
+    // A pass with a compressed (UBWC) colour attachment in GMEM too, its tiles loaded and stored in the UBWC layout with
+    // the flag buffer (render::kGmemPlanCompressed); off by default, when such a pass runs in sysmem: the plug-in's
+    // metal_gmemubwc=1, an A/B on the phone (dev-notes 25-blur/04)
+    void setGmemCompressed(bool on) { gmemCompressed_ = on; }
+    // A pass one of whose draws reads its target (framebuffer fetch) is tiled whatever its draws when its render area is
+    // render::kGmemFetchMinPixels or more, and its like is recorded both ways whatever its history -- turnip's order
+    // (render.hpp, gmemWorth's FETCH_FIRST); off by default: the plug-in's metal_p5=1 (dev-notes 25-blur/03 §1, /04)
+    void setGmemFetchFirst(bool on) { gmemFetchFirst_ = on; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
     void setGmemTuned(bool on) { tuning_ = on; }
@@ -275,6 +291,8 @@ private:
     void drawStamp(uint32_t slot);
     bool gmem_ = true;
     uint32_t gmemOff_ = 0;
+    bool gmemCompressed_ = false;
+    bool gmemFetchFirst_ = false;
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;
@@ -286,6 +304,9 @@ private:
     bool profileSamples_ = false;
     std::shared_ptr<Buffer> sampleStamps_;   // setProfileSamples's: the sample count at each pass's start and end
     void sampleStamp(uint32_t slot);
+    bool perf_ = false, perfSelected_ = false;
+    std::shared_ptr<Buffer> perfStamps_;   // kPerfCounters words a stamp slot
+    void perfStamp(uint32_t slot);
     // the counter into stamp slot SLOT (two a pass: start, end), when profiling and there is room
     void stamp(uint32_t slot);
     void stampStart(PassKind kind, uint32_t width, uint32_t height);
@@ -389,6 +410,7 @@ private:
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
+        bool fetched = false;       // ...and any draw did, in tiles or in sysmem (READ is a tiled pass's): CommandQueue::noteDraws'
         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
         std::shared_ptr<render::PassCache> cache;
     };
@@ -397,6 +419,7 @@ private:
     // when NEXT has the same texture attached with Load, the caller's one pass goes on in a second one here.
     // KEPT: stored whatever follows (a command buffer appended to another: what follows is not known here).
     void closePass(const RenderPass* next = nullptr, bool kept = false);
+    uint64_t openAreaPixels() const;   // the open pass's render area so far in pixels (its window's before a draw)
     void useAttachments(const RenderPass& pass);
     // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
@@ -525,7 +548,10 @@ public:
     // ...and the most it had in the times since its peak, the peak let go after 16 times below it: a pass that is heavy
     // only now and then (CoreAnimation's: light frames between the heavy ones of an animation) counts as heavy
     uint32_t peakDraws(uint64_t kind, uint32_t ordinal);
-    void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws);
+    // ...and whether a draw of it read its target the last time (FETCHED): a pass of few draws that does is still
+    // recorded both ways under setGmemFetchFirst, for render::gmemWorth to tile it
+    bool peakFetched(uint64_t kind, uint32_t ordinal);
+    void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws, bool fetched = false);
     // what the queue keeps of the programs drawn with it, from one command buffer to the next (render.cpp: StateCache;
     // under its own lock)
     render::StateCache& states();
@@ -573,7 +599,7 @@ private:
     struct Tune { double us[2] = {0, 0}; uint32_t runs[2] = {0, 0}; uint32_t passes = 0; };
     std::unordered_map<uint64_t, Tune> tune_;   // (under lock_) preferGmem's, by target
     std::unordered_map<uint64_t, uint32_t> lastDraws_;   // (under lock_) noteDraws', by kind and ordinal
-    struct Peak { uint32_t draws = 0, below = 0; };
+    struct Peak { uint32_t draws = 0, below = 0; bool fetched = false; };
     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
     std::shared_ptr<render::StateCache> states_;   // (made by states() at the first ask, under lock_)
     std::condition_variable changed_;

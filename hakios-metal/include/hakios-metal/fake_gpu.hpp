@@ -156,6 +156,7 @@ public:
         uint32_t tiledFills = 0;    // ...of which into a TILE6_3 depth texture: judged, not written (the tiled order is not modelled)
         uint32_t tiles = 0;         // GMEM tiles begun (CP_SET_MARKER RM6_BIN_RENDER_START | USES_GMEM)
         uint32_t ubwcCopies = 0;   // 2D copies into a UBWC image
+        uint32_t tiledCopies = 0;  // 2D copies into or out of a tiled colour image (TextureDesc::tiled or compressed): judged, not carried out
         uint32_t tileLoads = 0, tileStores = 0;   // event blits, carried out between memory and the model's GMEM
         uint32_t tileClears = 0;    // ...and clears in GMEM
         uint32_t binningPasses = 0, binnedDraws = 0, binData = 0;   // binning passes, the draws in them, tiles told their streams

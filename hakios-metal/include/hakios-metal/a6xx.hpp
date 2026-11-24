@@ -2317,6 +2317,7 @@ inline constexpr uint32_t A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__SHIFT = 7;        
 inline constexpr uint32_t REG_A6XX_RB_BLIT_DST = 0x88d8;                                     // a6xx.xml.h:6325  64-bit
 inline constexpr uint32_t REG_A6XX_RB_BLIT_DST_PITCH = 0x88da;                               // a6xx.xml.h:6328  bytes >> 6
 inline constexpr uint32_t REG_A6XX_RB_BLIT_FLAG_DST = 0x88dc;                                // a6xx.xml.h:6348  64-bit, then FLAG_DST_PITCH: 0 without UBWC
+inline constexpr uint32_t A6XX_RB_BLIT_DST_INFO_FLAGS = 0x00000004;                           // a6xx.xml.h:6302  the destination is UBWC (fdl6_view_init's RB_BLIT_DST_INFO)
 inline constexpr uint32_t REG_A6XX_RB_BLIT_INFO = 0x88e3;                                    // a6xx.xml.h:6380
 inline constexpr uint32_t A6XX_RB_BLIT_INFO_TYPE__MASK = 0x00000003;                         // a6xx.xml.h:6381
 inline constexpr uint32_t A6XX_RB_BLIT_INFO_TYPE__SHIFT = 0;                                 // a6xx.xml.h:6382
@@ -4517,6 +4518,7 @@ inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK = 0x00000300;  
 inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__SHIFT = 8;                      // a6xx.xml.h:9844
 inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__MASK = 0x00000c00;             // a6xx.xml.h:9849
 inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__SHIFT = 10;                    // a6xx.xml.h:9850
+inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_FLAGS = 0x00001000;                        // a6xx.xml.h:9855  the source is UBWC
 inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_SRGB = 0x00002000;                         // a6xx.xml.h:9856
 inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_SAMPLES__MASK = 0x0000c000;                // a6xx.xml.h:9857
 inline constexpr uint32_t A6XX_SP_PS_2D_SRC_INFO_SAMPLES__SHIFT = 14;                       // a6xx.xml.h:9858
@@ -4538,8 +4540,9 @@ static_assert(REG_A6XX_SP_PS_2D_SRC_SIZE == REG_A6XX_SP_PS_2D_SRC_INFO + 1 && RE
                   REG_A6XX_SP_PS_2D_SRC_PITCH == REG_A6XX_SP_PS_2D_SRC_INFO + 4 && REG_A6XX_GRAS_2D_DST_TL == REG_A6XX_GRAS_2D_SRC_BR_Y + 1,
               "INFO, SIZE, BASE lo, hi, PITCH are one pkt4; the four source coordinates run on into GRAS_2D_DST_TL");
 constexpr uint32_t gras2dSrc(uint32_t v) { return field(v, A6XX_GRAS_2D_SRC_TL_X__SHIFT, A6XX_GRAS_2D_SRC_TL_X__MASK); }
-constexpr uint32_t sp2dSrcInfo(uint32_t fmt, uint32_t swap, bool srgb, bool filter) {
-    return field(fmt, 0, A6XX_SP_PS_2D_SRC_INFO_COLOR_FORMAT__MASK) | field(TILE6_LINEAR, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__SHIFT, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK) |
+// (TILE the source's layout: fdl6_view_init's SP_PS_2D_SRC_INFO carries the tile mode, fd6_view.c:320-331)
+constexpr uint32_t sp2dSrcInfo(uint32_t fmt, uint32_t swap, bool srgb, bool filter, uint32_t tile = TILE6_LINEAR) {
+    return field(fmt, 0, A6XX_SP_PS_2D_SRC_INFO_COLOR_FORMAT__MASK) | field(tile, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__SHIFT, A6XX_SP_PS_2D_SRC_INFO_TILE_MODE__MASK) |
            field(swap, A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__SHIFT, A6XX_SP_PS_2D_SRC_INFO_COLOR_SWAP__MASK) | (srgb ? A6XX_SP_PS_2D_SRC_INFO_SRGB : 0u) |
            (filter ? A6XX_SP_PS_2D_SRC_INFO_FILTER : 0u) | A6XX_SP_PS_2D_SRC_INFO_UNK20 | A6XX_SP_PS_2D_SRC_INFO_UNK22;
 }
