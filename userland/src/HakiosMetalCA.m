@@ -3116,7 +3116,8 @@ hm_arg_long(const char *name, long fallback)
  * specialisation, 0.4 to 1.1 s on the phone; the warm-up) holds the compiler a pipeline waits for; the specialisations
  * go to the queue at priority 1 (something draws the generic program until they are done) and the warm-up at
  * priority 3, one job a recipe, after the device is made instead of before it is returned. metal_async_compile=0 (the
- * default): one compiler and one lock, as before.
+ * default): one compiler and one lock, as before. metal_async_compile=2: the queue as with 1, but one compiler, with a
+ * waiting pipeline served before the background's next compilation (it still waits for the one in progress).
  * metal_shared_cache=1: the cache's shared layout (v2/<generation>/: the compiler's identity, sealed files written under
  * a name of the writer's own, a stage keyed by the constants its module declares), trimmed to metal_cache_mb (128 by
  * default) in the background; a process that may read the system's cache but not write it (an app's sandbox) reads it
@@ -3670,8 +3671,13 @@ hm_boot_arg_set(const char *what)
 		}
 	}
 	if (hm_async_compile()) {
-		hakios_metal_compile_set_lanes(2);
-		hm_print("metal_async_compile=1: a foreground and a background compiler; specialisations at priority 1 and the warm-up at 3 in the background\n");
+		/* 1: two compilers; 2: one compiler, a waiting pipeline served before the background's next compilation */
+		const long mode = hm_arg_long("metal_async_compile", 0);
+
+		hakios_metal_compile_set_lanes(mode == 2 ? 1 : 2);
+		hakios_metal_compile_set_foreground_first(1);
+		hm_print("metal_async_compile=%ld: %s; specialisations at priority 1 and the warm-up at 3 in the background\n", mode,
+			 mode == 2 ? "one compiler, the foreground first" : "a foreground and a background compiler");
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
 	hm_ensure_spi([self class]);

@@ -45,6 +45,10 @@ enum class CompilePriority : uint8_t { kWaited = 0, kVisible = 1, kPrefetch = 2,
 // that start after it.
 void setCompileLanes(unsigned lanes);
 unsigned compileLanes();
+// With one compiler for both lanes: whether a foreground thread waiting for it is served before any background thread
+// (off by default: the old lock, first come by the scheduler's choice). With two lanes it changes nothing.
+void setCompileForegroundFirst(bool on);
+bool compileForegroundFirst();
 
 // the lane this thread compiles on: foreground unless a CompileLaneScope (the queue's worker has one) says otherwise
 CompileLane currentCompileLane();
@@ -77,7 +81,6 @@ private:
     unsigned slot_;
     double waitedUs_ = 0;
     std::string behind_;
-    std::unique_lock<std::mutex> lock_;
 };
 
 // One compilation's ticket in the queue (or out of it, once taken).

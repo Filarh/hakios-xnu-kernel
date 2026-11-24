@@ -472,3 +472,90 @@ TEST(a_stage_one_process_filed_is_read_by_another) {
     std::string cmd = "rm -rf '" + dir + "'";
     CHECK(system(cmd.c_str()) == 0);
 }
+
+namespace {
+std::vector<uint8_t> kernelBitcode(const char* name) {
+    std::vector<uint8_t> bytes;
+    FILE* f = fopen((std::string("out/host/kernels/") + name + ".bc").c_str(), "rb");
+    if (f == nullptr) return bytes;
+    uint8_t buffer[4096];
+    for (size_t n; (n = fread(buffer, 1, sizeof buffer, f)) > 0;) bytes.insert(bytes.end(), buffer, buffer + n);
+    fclose(f);
+    return bytes;
+}
+}  // namespace
+
+// With the compiler in (make test MESA=1): the two lanes' compilers at work at once -- a pipeline's stages compiled on
+// the foreground while the background compiles a long kernel again and again -- give the very words one compiler gives
+// alone, and the foreground does not wait; with one lane it waits, behind the background's job by name.
+TEST(two_compilers_at_once_compile_what_one_compiles_alone) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: the two lanes did not run)\n");
+        return;
+    }
+    const char* const stages[] = {"tri_flat_vs", "tri_color_fs", "tri_cflat_fs", "tri_tex_fs", "tri_fc_fs"};
+    std::vector<std::vector<uint8_t>> bitcode;
+    for (const char* s : stages) bitcode.push_back(kernelBitcode(s));
+    const std::vector<uint8_t> chain = kernelBitcode("long_chain");
+    CHECK(!chain.empty());
+    for (const auto& b : bitcode) CHECK(!b.empty());
+    if (chain.empty()) return;
+    const char* cache = getenv("HAKIOS_METAL_CACHE");
+    const std::string keptCache = cache != nullptr ? cache : "";
+    unsetenv("HAKIOS_METAL_CACHE");   // (every compileStage a compilation: no file to find)
+    std::string why;
+    std::vector<std::vector<uint32_t>> alone;
+    for (const auto& b : bitcode) {
+        auto s = compileStage(b.data(), b.size(), &why);
+        CHECK(s != nullptr);
+        alone.push_back(s != nullptr ? s->words : std::vector<uint32_t>{});
+    }
+    auto k = compileAir(chain.data(), chain.size(), &why);
+    CHECK(k != nullptr);
+    const std::vector<uint32_t> chainAlone = k != nullptr ? k->words : std::vector<uint32_t>{};
+    (void)takeCompileTimes();
+    for (unsigned lanes : {2u, 1u}) {
+        setCompileLanes(lanes);
+        setCompileForegroundFirst(lanes == 1);
+        CompileQueue q(1);
+        std::atomic<bool> stop{false}, began{false};
+        std::atomic<int> background{0}, differed{0};
+        q.submit("long_chain", CompilePriority::kWarmUp, "warm-up long_chain", [&] {
+            while (!stop) {
+                std::string w;
+                auto c = compileAir(chain.data(), chain.size(), &w);
+                if (c == nullptr || c->words != chainAlone) differed++;
+                background++;
+                began = true;
+            }
+        });
+        CHECK(eventually([&] { return began.load(); }));
+        double waited = 0;
+        std::string behind;
+        for (int round = 0; round < 6; round++) {
+            for (size_t i = 0; i < bitcode.size(); i++) {
+                auto s = compileStage(bitcode[i].data(), bitcode[i].size(), &why);
+                CHECK(s != nullptr && s->words == alone[i]);
+                const CompileTimes t = takeCompileTimes();
+                waited += t.waitedUs / 1000.0;
+                if (!t.behind.empty()) behind = t.behind;
+            }
+        }
+        stop = true;
+        q.drain();
+        CHECK_EQ(differed.load(), 0);
+        CHECK(background.load() >= 1);
+        std::printf("       %u lane(s): the foreground waited %.1f ms in all for 30 stages; %d background compilations meanwhile%s%s\n", lanes, waited,
+                    background.load(), behind.empty() ? "" : "; behind ", behind.c_str());
+        if (lanes == 2) {
+            CHECK(waited < 5);
+            CHECK(behind.empty());
+        } else {
+            CHECK(waited > 0);
+            CHECK(behind == "warm-up long_chain");
+        }
+    }
+    setCompileLanes(1);
+    setCompileForegroundFirst(false);
+    if (!keptCache.empty()) setenv("HAKIOS_METAL_CACHE", keptCache.c_str(), 1);
+}

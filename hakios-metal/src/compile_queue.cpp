@@ -14,13 +14,17 @@ namespace hakios::metal {
 namespace {
 
 std::atomic<unsigned> gLanes{1};
+std::atomic<bool> gForegroundFirst{false};
 thread_local CompileLane tLane = CompileLane::kForeground;
 thread_local std::string tActivity;
 
-// one slot a compiler: its lock and what holds it (under the slot's own small lock: read by waiters)
+// one slot a compiler: whether it is held and by what, under one small lock (so that a thread that finds it taken
+// reads the name of the thread that has it, never a stale one)
 struct Slot {
-    std::mutex compiler;
-    std::mutex holderLock;
+    std::mutex lock;
+    std::condition_variable freed;
+    bool busy = false;
+    unsigned foregroundWaiting = 0;   // a background thread does not take the slot while a foreground one waits for it
     std::string holder;
 };
 Slot gSlots[2];
@@ -44,6 +48,8 @@ void qosFor(CompilePriority) {}
 
 void setCompileLanes(unsigned lanes) { gLanes.store(lanes >= 2 ? 2 : 1); }
 unsigned compileLanes() { return gLanes.load(); }
+void setCompileForegroundFirst(bool on) { gForegroundFirst.store(on); }
+bool compileForegroundFirst() { return gForegroundFirst.load(); }
 CompileLane currentCompileLane() { return tLane; }
 unsigned compileSlotOf(CompileLane lane) { return gLanes.load() >= 2 && lane == CompileLane::kBackground ? 1 : 0; }
 
@@ -53,24 +59,35 @@ CompileLaneScope::~CompileLaneScope() { tLane = was_; }
 void setCompileActivity(const std::string& what) { tActivity = what; }
 const std::string& compileActivity() { return tActivity; }
 
-CompilerHold::CompilerHold(CompileLane lane) : slot_(compileSlotOf(lane)), lock_(gSlots[slot_].compiler, std::defer_lock) {
+// Foreground first (setCompileForegroundFirst): with one compiler for both lanes, a thread that waits for its result is next as soon as the compilation
+// in progress ends -- a background thread compiling stage after stage (the warm-up, specialisations) does not get the
+// compiler back while one waits. (A plain mutex let it: a pipeline waited behind the next one too, and the next.)
+CompilerHold::CompilerHold(CompileLane lane) : slot_(compileSlotOf(lane)) {
     Slot& s = gSlots[slot_];
-    if (!lock_.try_lock()) {
-        {
-            std::lock_guard<std::mutex> g(s.holderLock);
-            behind_ = s.holder.empty() ? std::string("(unnamed)") : s.holder;
-        }
+    const bool foreground = lane == CompileLane::kForeground;
+    std::unique_lock<std::mutex> g(s.lock);
+    const bool first = gForegroundFirst.load();
+    auto free = [&] { return !s.busy && (foreground || !first || s.foregroundWaiting == 0); };
+    if (!free()) {
+        behind_ = s.holder.empty() ? std::string("(unnamed)") : s.holder;
         const auto asked = std::chrono::steady_clock::now();
-        lock_.lock();
+        if (foreground) s.foregroundWaiting++;
+        s.freed.wait(g, free);
+        if (foreground) s.foregroundWaiting--;
         waitedUs_ = usSince(asked);
     }
-    std::lock_guard<std::mutex> g(s.holderLock);
+    s.busy = true;
     s.holder = tActivity.empty() ? std::string(tLane == CompileLane::kBackground ? "background compilation" : "foreground compilation") : tActivity;
 }
 
 CompilerHold::~CompilerHold() {
-    std::lock_guard<std::mutex> g(gSlots[slot_].holderLock);
-    gSlots[slot_].holder.clear();
+    Slot& s = gSlots[slot_];
+    {
+        std::lock_guard<std::mutex> g(s.lock);
+        s.busy = false;
+        s.holder.clear();
+    }
+    s.freed.notify_all();
 }
 
 CompileQueue::CompileQueue(unsigned workers) {
