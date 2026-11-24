@@ -37,6 +37,19 @@
  *                     every animation added to a material and its weighting changes are logged (a weighting line per
  *                     material at most every 100 ms; nothing is formatted without dump=1)
  *   quiet=1           no log lines but the errors
+ *   group=1           every material whose recipe is in grouprecipes gets the backdrop groupName "blurfreeze.<recipe>",
+ *                     so that CoreAnimation takes ONE capture for all of them (applied when the material's weighting or
+ *                     private opacity changes, which the Control Center's modules do when they are made)
+ *   grouprecipes=a,b  (default modules: the Control Center's module platters)
+ *   luma=0            no backdrop tracks luma (the home indicator's chain down to 1x1): a measurement only, read when
+ *                     SpringBoard starts (respring after changing it)
+ *
+ * What starts a session: in 20H392 the Control Center does not animate the background's MTMaterialLayer weighting.
+ * CCUIOverlay{StatusBar,SlideUp,ScaleFade}PresentationProvider -_addBackgroundViewWeightingAnimationToBatch:transitionState:
+ * sends [[viewProvider overlayBackgroundView] setWeighting:clampedPresentationProgress] inside an animation;
+ * -[MTMaterialView setWeighting:] then sets its _backdropFloatAnimatableProperty, whose transformer
+ * (-_setupAlphaTransformer) sets -[MTMaterialLayer _setPrivateOpacity:removingIfIdentity:] (model) and, every frame,
+ * -[UIView _setPresentationValue:forKey:] with filters.opacityColorMatrix.inputColorMatrix. Those two are hooked.
  *
  * Crash guard: /var/tmp/blurfreeze.armed exists while a session runs (it is written before the snapshot and removed when
  * the session ends). A SpringBoard that starts and finds it died in a session: the file becomes /var/tmp/blurfreeze.tripped
@@ -73,9 +86,12 @@ struct bf_config {
 	double maxMs, slackMs;
 	char recipes[256];
 	int dump, quiet;
+	int group;              /* 1: the materials of grouprecipes share one backdrop capture per recipe (groupName) */
+	char groupRecipes[128];
+	int luma;               /* 0: no backdrop tracks luma (the home indicator's chain down to 1x1), for a measurement */
 };
 
-static struct bf_config bf_cfg = { 0, 0, 1500, 250, "modulesBackground,homeScreenOverlay", 0, 0 };
+static struct bf_config bf_cfg = { 0, 0, 1500, 250, "modulesBackground,homeScreenOverlay", 0, 0, 0, "modules", 1 };
 static CFTimeInterval bf_cfg_read_at = -1e9;
 static int bf_sessions_live;   /* sessions running (main thread only): the cheap test every hook makes first */
 
@@ -102,7 +118,7 @@ static void
 bf_read_config(void)
 {
 	char buf[512] = "";
-	struct bf_config c = { 0, 0, 1500, 250, "modulesBackground,homeScreenOverlay", 0, 0 };
+	struct bf_config c = { 0, 0, 1500, 250, "modulesBackground,homeScreenOverlay", 0, 0, 0, "modules", 1 };
 	int fd = open("/var/tmp/blurfreeze.args", O_RDONLY);
 
 	if (fd >= 0) {
@@ -119,6 +135,9 @@ bf_read_config(void)
 		else if (strncmp(w, "recipes=", 8) == 0) strlcpy(c.recipes, w + 8, sizeof(c.recipes));
 		else if (strncmp(w, "dump=", 5) == 0) c.dump = atoi(w + 5);
 		else if (strncmp(w, "quiet=", 6) == 0) c.quiet = atoi(w + 6);
+		else if (strncmp(w, "group=", 6) == 0) c.group = atoi(w + 6);
+		else if (strncmp(w, "grouprecipes=", 13) == 0) strlcpy(c.groupRecipes, w + 13, sizeof(c.groupRecipes));
+		else if (strncmp(w, "luma=", 5) == 0) c.luma = atoi(w + 5);
 	}
 	if (c.mode < 0 || c.mode > 2) c.mode = 0;
 	if (c.scale > 1) c.scale = 1;
@@ -127,8 +146,8 @@ bf_read_config(void)
 	if (c.slackMs < 30) c.slackMs = 30;
 	if (memcmp(&c, &bf_cfg, sizeof(c)) != 0) {
 		bf_cfg = c;
-		bf_say(NO, "args: mode=%d scale=%g maxms=%g slackms=%g recipes=%s dump=%d", c.mode, c.scale, c.maxMs, c.slackMs,
-		       c.recipes, c.dump);
+		bf_say(NO, "args: mode=%d scale=%g maxms=%g slackms=%g recipes=%s dump=%d group=%d grouprecipes=%s luma=%d", c.mode,
+		       c.scale, c.maxMs, c.slackMs, c.recipes, c.dump, c.group, c.groupRecipes, c.luma);
 	}
 }
 
@@ -146,13 +165,19 @@ bf_mode(void)
 }
 
 static BOOL
-bf_recipe_allowed(NSString *recipe)
+bf_recipe_in(NSString *recipe, const char *list)
 {
 	if (recipe == nil) return NO;
-	for (NSString *r in [[NSString stringWithUTF8String:bf_cfg.recipes] componentsSeparatedByString:@","]) {
+	for (NSString *r in [[NSString stringWithUTF8String:list] componentsSeparatedByString:@","]) {
 		if ([r isEqualToString:@"*"] || [r isEqualToString:recipe]) return YES;
 	}
 	return NO;
+}
+
+static BOOL
+bf_recipe_allowed(NSString *recipe)
+{
+	return bf_recipe_in(recipe, bf_cfg.recipes);
 }
 
 /* ---------------------------------------------------------------------------------------------------------------- */
@@ -315,6 +340,10 @@ static void (*bf_orig_addAnimation)(id, SEL, CAAnimation *, NSString *);
 static void (*bf_orig_setFilters)(id, SEL, NSArray *);
 static void (*bf_orig_setValueForKeyPath)(id, SEL, id, NSString *);
 static void (*bf_orig_setEnabled)(id, SEL, BOOL);
+static void (*bf_orig_setPrivateOpacity)(id, SEL, double, BOOL);
+static void (*bf_orig_viewSetPresentationValue)(id, SEL, id, NSString *);
+static void (*bf_orig_setGroupName)(id, SEL, NSString *);
+static void (*bf_orig_setTracksLuma)(id, SEL, BOOL);
 
 /* ---------------------------------------------------------------------------------------------------------------- */
 /* a session */
@@ -716,20 +745,42 @@ bf_touch(CALayer *m, CFTimeInterval until, BOOL animation)
 /* ---------------------------------------------------------------------------------------------------------------- */
 /* the replacements */
 
-/* dump=1: a material's weighting change, at most one line per material every 100 ms (the last material and time kept) */
+/* dump=1: one line per (material, kind) at most every 100 ms (the last ones and their time kept); KIND "weighting",
+ * "opacity" (the private opacity MaterialKit's alpha transformer sets: the model value) or "present" (the presentation
+ * value it sets every frame of a transition, VALUE the key) */
 static void
-bf_dump_weighting(CALayer *m)
+bf_dump_change(CALayer *m, const char *kind, double v, NSString *key)
 {
-	static __unsafe_unretained CALayer *last;
-	static CFTimeInterval lastAt;
+	static __unsafe_unretained CALayer *last[3];
+	static CFTimeInterval lastAt[3];
+	const int k = kind[0] == 'w' ? 0 : kind[0] == 'o' ? 1 : 2;
 	const CFTimeInterval now = CACurrentMediaTime();
 
-	if (m == last && now - lastAt < 0.1) return;
-	last = m;
-	lastAt = now;
-	bf_say(NO, "weighting %.3f on %s %p recipe=%s context=%u session=%d", [[m valueForKey:@"weighting"] doubleValue],
-	       object_getClassName(m), (__bridge void *)m, [[bf_send(m, "recipeName") description] UTF8String], bf_context_id(m),
+	if (m == last[k] && now - lastAt[k] < 0.1) return;
+	last[k] = m;
+	lastAt[k] = now;
+	bf_say(NO, "%s %.3f%s%s on %s %p recipe=%s context=%u group=%s session=%d", kind, v, key != nil ? " key=" : "",
+	       key != nil ? key.UTF8String : "", object_getClassName(m), (__bridge void *)m,
+	       [[bf_send(m, "recipeName") description] UTF8String], bf_context_id(m), [[bf_send(m, "groupName") description] UTF8String],
 	       bf_session(m) != nil ? bf_session(m).number : 0);
+}
+
+/* group=1: a material of grouprecipes joins the group "blurfreeze.<recipe>": every backdrop of that recipe then shares one
+ * capture (CoreAnimation shares a capture between backdrops of the same groupName -- and the same scale, which one
+ * recipe gives) */
+static void
+bf_apply_group(CALayer *m)
+{
+	NSString *recipe, *name;
+
+	if (!bf_cfg.group || ![m isKindOfClass:bf_MTMaterialLayer]) return;
+	recipe = bf_send(m, "recipeName");
+	if (!bf_recipe_in(recipe, bf_cfg.groupRecipes)) return;
+	name = [@"blurfreeze." stringByAppendingString:recipe];
+	if (![bf_send(m, "groupName") isEqual:name]) {
+		bf_orig_setGroupName(m, sel_registerName("setGroupName:"), name);
+		if (bf_cfg.dump) bf_say(NO, "group %s on %p", name.UTF8String, (__bridge void *)m);
+	}
 }
 
 static void
@@ -738,8 +789,66 @@ bf_updateWeighting(id self, SEL _cmd)
 	bf_orig_updateWeighting(self, _cmd);
 	if (!pthread_main_np()) return;
 	(void)bf_mode();   /* (re-reads the switches, at most once a second, outside sessions) */
-	if (bf_cfg.dump) bf_dump_weighting(self);
+	if (bf_cfg.dump) bf_dump_change(self, "weighting", [[self valueForKey:@"weighting"] doubleValue], nil);
+	bf_apply_group(self);
 	bf_touch(self, 0, NO);
+}
+
+/* -[MTMaterialLayer _setPrivateOpacity:removingIfIdentity:]: the model value of MaterialKit's alpha transformer, which
+ * is what the Control Center's presentation moves ([CCUIOverlay*PresentationProvider
+ * _addBackgroundViewWeightingAnimationToBatch:transitionState:] -> [overlayBackgroundView setWeighting:progress] ->
+ * the view's float animatable property, not the layer's weighting) */
+static void
+bf_setPrivateOpacity(id self, SEL _cmd, double opacity, BOOL removing)
+{
+	bf_orig_setPrivateOpacity(self, _cmd, opacity, removing);
+	if (!pthread_main_np()) return;
+	(void)bf_mode();
+	if (bf_cfg.dump) bf_dump_change(self, "opacity", opacity, nil);
+	bf_apply_group(self);
+	bf_touch(self, 0, NO);
+}
+
+/* -[UIView _setPresentationValue:forKey:]: every frame of the transition MaterialKit sets the presentation value of
+ * filters.opacityColorMatrix.inputColorMatrix on the material view (its layer is the MTMaterialLayer) */
+static void
+bf_viewSetPresentationValue(id self, SEL _cmd, id value, NSString *key)
+{
+	CALayer *m;
+	BFSession *s;
+
+	bf_orig_viewSetPresentationValue(self, _cmd, value, key);
+	if (!pthread_main_np()) return;
+	m = [self layer];
+	if (![m isKindOfClass:bf_MTMaterialLayer]) return;
+	if (bf_cfg.dump) bf_dump_change(m, "present", 0, key);
+	bf_touch(m, 0, NO);
+	s = bf_session(m);
+	if (s != nil && s.mode == 2 && [key hasPrefix:@"filters."]) {
+		/* the material has no filters in the session: the frame's value goes to the snapshot layer as a model value */
+		[CATransaction begin];
+		[CATransaction setDisableActions:YES];
+		@try {
+			[s.proxy setValue:value forKeyPath:key];
+		} @catch (NSException *e) {
+			(void)e;
+		}
+		[CATransaction commit];
+	}
+}
+
+static void
+bf_setGroupName(id self, SEL _cmd, NSString *name)
+{
+	bf_orig_setGroupName(self, _cmd, name);
+	if (bf_cfg.group && pthread_main_np()) bf_apply_group(self);   /* (MaterialKit setting its own name back) */
+}
+
+static void
+bf_setTracksLuma(id self, SEL _cmd, BOOL tracks)
+{
+	if (!bf_cfg.luma && tracks && bf_cfg.dump) bf_say(NO, "tracksLuma refused on %s %p", object_getClassName(self), (__bridge void *)self);
+	bf_orig_setTracksLuma(self, _cmd, bf_cfg.luma ? tracks : NO);
 }
 
 static CFTimeInterval
@@ -809,6 +918,7 @@ bf_setValueForKeyPath(id self, SEL _cmd, id value, NSString *keyPath)
 		}
 		return;
 	}
+	if (!bf_cfg.luma && [keyPath isEqualToString:@"tracksLuma"] && [self isKindOfClass:bf_CABackdropLayer]) value = @NO;
 	bf_orig_setValueForKeyPath(self, _cmd, value, keyPath);
 	if (s != nil && s.mode == 2 && [keyPath isEqualToString:@"opacity"]) s.proxy.opacity = [value floatValue];
 }
@@ -855,8 +965,18 @@ bf_init(void)
 	    !bf_replace([CALayer class], "addAnimation:forKey:", (IMP)bf_addAnimation, &bf_orig_addAnimation) ||
 	    !bf_replace([CALayer class], "setFilters:", (IMP)bf_setFilters, &bf_orig_setFilters) ||
 	    !bf_replace([CALayer class], "setValue:forKeyPath:", (IMP)bf_setValueForKeyPath, &bf_orig_setValueForKeyPath) ||
-	    !bf_replace(bf_CABackdropLayer, "setEnabled:", (IMP)bf_setEnabled, &bf_orig_setEnabled)) {
+	    !bf_replace(bf_CABackdropLayer, "setEnabled:", (IMP)bf_setEnabled, &bf_orig_setEnabled) ||
+	    !bf_replace(bf_MTMaterialLayer, "_setPrivateOpacity:removingIfIdentity:", (IMP)bf_setPrivateOpacity, &bf_orig_setPrivateOpacity) ||
+	    !bf_replace(bf_CABackdropLayer, "setGroupName:", (IMP)bf_setGroupName, &bf_orig_setGroupName) ||
+	    !bf_replace(bf_CABackdropLayer, "setTracksLuma:", (IMP)bf_setTracksLuma, &bf_orig_setTracksLuma)) {
 		return;
+	}
+	/* UIKit's in-process animations (optional: the trigger of the frames of a transition; without it the model changes
+	 * still start sessions) */
+	dlopen("/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore", RTLD_LAZY);
+	if (!bf_replace(objc_getClass("UIView"), "_setPresentationValue:forKey:", (IMP)bf_viewSetPresentationValue,
+			&bf_orig_viewSetPresentationValue)) {
+		bf_say(YES, "no -[UIView _setPresentationValue:forKey:]: transitions are seen through their model values only");
 	}
 	bf_read_config();
 	bf_cfg_read_at = CACurrentMediaTime();
