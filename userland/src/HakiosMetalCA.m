@@ -1482,6 +1482,7 @@ HM_REFUSES_OUT_LOUD
 	NSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */
 	struct hm_ft_rec *_ftrace;               /* metal_trace=frame: this buffer being recorded, else NULL */
 	BOOL _hsr;                               /* metal_hsr: drawn with hidden surface removal by depth */
+	int _hsrLean;                            /* metal_hsrlean: what its draws no opaque draw can cover are drawn with */
 }
 - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue;
 - (void)hakiosTurnAtCommit:(id)texture;
@@ -7099,6 +7100,11 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_hsr(_cb, _hsr);
 		hakios_metal_cb_set_hsr_depth(_cb, hm_hsr_depth() & 3, (hm_hsr_depth() & 4) != 0);
 		hakios_metal_cb_set_hsr_clear_each(_cb, hm_hsr_clear_each());
+		{
+			const int lean = hm_hsr_lean();
+			_hsrLean = (lean & 4) == 0 || __atomic_fetch_add(&hm_hsr_lean_buffers, 1, __ATOMIC_RELAXED) % 2 == 0 ? lean & 3 : 0;
+			hakios_metal_cb_set_hsr_lean(_cb, _hsrLean);
+		}
 	}
 	_owesSlot = YES;
 	return self;
@@ -7169,12 +7175,13 @@ HM_REFUSES_OUT_LOUD
 	unsigned passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, skipped = 0;
 	const char *last = "";
 	char label[300], queue[300], error[600], skip[600], refusal[600], *head = NULL, *record;
-	unsigned hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0;
+	unsigned hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0, hsrUntested = 0, hsrLeanMissed = 0;
 	int n;
 
 	_ftrace = NULL;
 	if (_cb != NULL) {
 		hakios_metal_cb_hsr_counts(_cb, &hsrPasses, &hsrOpaque, &hsrHidden, &hsrBarriers);
+		hakios_metal_cb_hsr_lean_counts(_cb, &hsrUntested, &hsrLeanMissed);
 		hakios_metal_cb_counts(_cb, &passes, &draws, &dispatches, &copies, &clears);
 		hakios_metal_cb_gmem_counts(_cb, &gmemPasses, &tiles);
 		skipped = hakios_metal_cb_skipped(_cb, &last);
@@ -7184,14 +7191,14 @@ HM_REFUSES_OUT_LOUD
 	n = asprintf(&head, "cb seq=%u capture=%u serial=%u label=%s queue=%s qid=%p created=%.6f committed=%.6f scheduled=%.6f completed=%.6f "
 		     "gpu_us=%.1f status=%s error=%s held=%d encoders=%u draws=%u ops=%u core_passes=%u core_draws=%u core_dispatches=%u "
 		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s hsr=%d hsr_passes=%u hsr_opaque=%u "
-		     "hsr_hidden=%u hsr_barriers=%u\n", ft->seq, ft->capture->number,
+		     "hsr_hidden=%u hsr_barriers=%u hsr_lean=%d hsr_untested=%u hsr_lean_missed=%u\n", ft->seq, ft->capture->number,
 		     ft->serial, hm_ft_qs(label, sizeof(label), [self label]), hm_ft_qs(queue, sizeof(queue), [_queue label]), (void *)_queue,
 		     ft->created, ft->committed, ft->scheduled, ft->completed, _cb != NULL ? (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e3 : 0.0,
 		     _cb != NULL ? HM_FT_STATUS(hakios_metal_cb_status(_cb)) : "nocb",
 		     hm_ft_q(error, sizeof(error), _cb != NULL ? hakios_metal_cb_error(_cb) : "no command buffer"), ft->held ? 1 : 0, ft->encoders,
 		     ft->draws, ft->ops, passes, draws, dispatches, copies, clears, gmemPasses, tiles, skipped,
 		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""),
-		     _hsr ? 1 : 0, hsrPasses, hsrOpaque, hsrHidden, hsrBarriers);
+		     _hsr ? 1 : 0, hsrPasses, hsrOpaque, hsrHidden, hsrBarriers, _hsrLean, hsrUntested, hsrLeanMissed);
 	record = n > 0 ? malloc((size_t)n + ft->len) : NULL;
 	if (record != NULL) {
 		memcpy(record, head, (size_t)n);
@@ -7737,6 +7744,34 @@ hm_hsr_clear_each(void)
 		if (each) hm_print("metal_hsrclear=1: each HSR pass clears its depth\n");
 	});
 	return each;
+}
+
+/* boot-arg metal_hsrlean=N: what metal_hsr's draws that no later opaque draw can cover are drawn with
+ * (hakios_metal_cb_set_hsr_lean), N's bits: 1 a hidden draw after its segment's last opaque draw untested (it passes
+ * the test wherever it is drawn: only a later opaque draw of its segment has a smaller Z), 2 the untested draws of an
+ * HSR pass in EARLY_Z as in a pass without depth, 4 only in the command buffers of even number among this process's
+ * (hm_hsr_lean_buffers, counted as they are made), for an A/B within one trace against metal_hsr=1 as it was. Off by
+ * default; a recorded buffer's cb line says hsr_lean=, and how many hidden draws went untested. */
+static unsigned long hm_hsr_lean_buffers;
+static int
+hm_hsr_lean(void)
+{
+	static dispatch_once_t once;
+	static int lean;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_hsrlean=")) != NULL && at[14] >= '0' && at[14] <= '7') {
+			lean = at[14] - '0';
+			hm_print("metal_hsrlean=%d: HSR's hidden draws no opaque draw follows %s, its untested draws in %s%s\n", lean,
+				 (lean & 1) != 0 ? "untested" : "tested", (lean & 2) != 0 ? "EARLY_Z" : "LATE_Z",
+				 (lean & 4) != 0 ? ", in the command buffers of even number alone" : "");
+		}
+	});
+	return lean;
 }
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
