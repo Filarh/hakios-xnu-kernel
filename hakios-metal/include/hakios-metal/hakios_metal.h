@@ -577,6 +577,12 @@ void hakios_metal_cb_set_hsr_depth(hakios_metal_cb *cb, int kind, int lrz);
  * 03 M55); 0, the default: the depth's Z levels run on from pass to pass and it is cleared only when new or spent */
 void hakios_metal_cb_set_hsr_clear_each(hakios_metal_cb *cb, int each);
 void hakios_metal_cb_hsr_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *opaque, unsigned *hidden, unsigned *barriers);
+/* What its draws that no later opaque draw can cover are drawn with (CommandBuffer::setHsrLean): BITS 1 a hidden draw
+ * after its segment's last opaque draw untested, 2 the untested draws of an HSR pass in EARLY_Z as without a depth
+ * attachment; 0, the default, both as before. lean_counts: the hidden draws drawn untested so far, and those that could
+ * not be (drawn tested) */
+void hakios_metal_cb_set_hsr_lean(hakios_metal_cb *cb, int bits);
+void hakios_metal_cb_hsr_lean_counts(hakios_metal_cb *cb, unsigned *untested, unsigned *missed);
 /* How the process's command buffers take their draws from now on (CommandBuffer::keepStates, verifyDraws). KEEP 0:
  * each draw judged and written whole, as the first with its program is -- the stream is the same either way, so this is
  * a bisect's switch and a measurement's. VERIFY 1: each draw taken from its program's kept state is also written whole

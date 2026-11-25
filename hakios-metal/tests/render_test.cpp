@@ -7151,7 +7151,7 @@ struct HsrRun {
 // linear, which this fake draws into (a compressed one it does not), taken by setHsrTest's ANY_TARGET; every pass in
 // sysmem, as a pass into a compressed target is.
 HsrRun runHsr(const HsrScene& scene, bool on, uint8_t twin = 0, uint32_t limit = CommandBuffer::kHsrMaxDraws,
-              CommandBuffer::HsrDepth kind = CommandBuffer::kHsrDepth16, bool lrz = false) {
+              CommandBuffer::HsrDepth kind = CommandBuffer::kHsrDepth16, bool lrz = false, uint8_t lean = 0) {
     HsrRun out;
     Rig r;
     const uint32_t W = 96, H = 64;
@@ -7216,6 +7216,7 @@ HsrRun runHsr(const HsrScene& scene, bool on, uint8_t twin = 0, uint32_t limit =
     cb->setHsr(on);
     cb->setHsrDepth(kind, lrz);
     cb->setHsrTest(twin, limit, true);
+    cb->setHsrLean(lean);
     RenderPass pass;
     pass.color0 = t.get();
     if (scene.c1) pass.more[0].texture = c1.get();
@@ -7516,12 +7517,87 @@ TEST(hsr_draws_each_scene_as_the_draws_without_it_by_the_rules) {
     CHECK_EQ(stacked.counts.hsrPrepasses, 1u);
 }
 
+// setHsrLean: a hidden draw that no opaque draw of its segment follows is drawn untested (kHsrLeanTail), every other
+// one as before; an untested draw of the pass in EARLY_Z with kHsrLeanEarly, LATE_Z without. The rules hold in every
+// scene either way (an untested hidden draw is one rule 2 lets through only where no prepass's draw comes after it).
+// Without an LRZ alone: with one the hidden draws keep their test (its LRZ_CNTL is the test's).
+TEST(hsr_lean_leaves_untested_only_the_hidden_draws_no_opaque_draw_of_their_segment_follows) {
+    std::vector<HsrScene> scenes(std::begin(kHsrScenes), std::end(kHsrScenes));
+    // (hidden draws after the last opaque draw, a barrier, then the same program's draw before an opaque one: the one
+    // after the barrier has its test, though the shadow last held the untested words' place as tested)
+    scenes.push_back({"hidden draws after the last opaque one, a barrier, the same before an opaque one",
+                      {{kHsrBlend, 0, 0, 96, 64}, {kHsrFlat, 8, 8, 60, 40}, {kHsrBlend, 4, 4, 40, 40}, {kHsrBlend, 20, 10, 70, 50}, {kHsrMrt, 0, 0, 30, 30},
+                       {kHsrBlend, 0, 0, 96, 64}, {kHsrFlat, 30, 20, 40, 30}, {kHsrFetch, 0, 0, 50, 64}, {kHsrKill, 40, 0, 56, 64}},
+                      false,
+                      true});
+    auto classOf = [](HsrKind k) {
+        return k == kHsrFlat || k == kHsrOverlap || k == kHsrInstances ? 0 : k == kHsrBlend || k == kHsrFetch || k == kHsrKill ? 1 : 2;
+    };
+    for (const uint8_t lean : {uint8_t(CommandBuffer::kHsrLeanTail), uint8_t(CommandBuffer::kHsrLeanEarly),
+                               uint8_t(CommandBuffer::kHsrLeanTail | CommandBuffer::kHsrLeanEarly)}) {
+        for (const HsrScene& s : scenes) {
+            const HsrRun off = runHsr(s, false), on = runHsr(s, true, 0, CommandBuffer::kHsrMaxDraws, CommandBuffer::kHsrDepth16, false, lean);
+            const std::string broken = hsrRules(off, on);
+            CHECK(broken.empty());
+            if (!broken.empty()) std::printf("       %s (lean %u): %s\n", s.name, unsigned(lean), broken.c_str());
+            // what each draw should be: tested if hidden with an opaque draw after it in its segment (or any hidden one,
+            // without kHsrLeanTail)
+            const size_t n = s.steps.size();
+            std::vector<bool> tested(n, false);
+            uint32_t tail = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (classOf(s.steps[i].kind) != 1) continue;
+                bool opaqueAfter = false;
+                for (size_t j = i + 1; j < n && classOf(s.steps[j].kind) != 2; j++) opaqueAfter = opaqueAfter || classOf(s.steps[j].kind) == 0;
+                tested[i] = opaqueAfter || (lean & CommandBuffer::kHsrLeanTail) == 0;
+                tail += tested[i] ? 0 : 1;
+            }
+            CHECK_EQ(on.counts.hsrUntested, tail);
+            CHECK_EQ(on.counts.hsrLeanMissed, 0u);
+            const uint32_t zoffset = a6xx::regGrasClVport(a6xx::REG_A6XX_GRAS_CL_VPORT_XOFFSET, 0) + 4;
+            uint32_t found = 0;
+            for (const auto& l : on.stats.drawLog) {
+                const HsrLogged x = hsrLogged(l);
+                if (x.indirect) continue;
+                float z;
+                const uint32_t zw = x.reg(zoffset);
+                memcpy(&z, &zw, 4);
+                const double i = (65533.0 - std::round(double(z) * 65535.0)) / 2.0;
+                if (i < 0 || i >= double(n) || i != std::floor(i)) continue;
+                const size_t k = size_t(i);
+                if (classOf(s.steps[k].kind) == 0) continue;   // (an opaque draw's packet in the pass is a NOP: not run)
+                found++;
+                const bool test = (x.reg(a6xx::REG_A6XX_RB_DEPTH_CNTL) & a6xx::A6XX_RB_DEPTH_CNTL_Z_TEST_ENABLE) != 0;
+                const bool suTest = (x.reg(a6xx::REG_A6XX_GRAS_SU_DEPTH_CNTL) & a6xx::A6XX_GRAS_SU_DEPTH_CNTL_Z_TEST_ENABLE) != 0;
+                CHECK_EQ(test, tested[k]);
+                CHECK_EQ(suTest, tested[k]);
+                const uint32_t mode = (x.reg(a6xx::REG_A6XX_RB_DEPTH_PLANE_CNTL) & a6xx::A6XX_RB_DEPTH_PLANE_CNTL_Z_MODE__MASK) >>
+                                      a6xx::A6XX_RB_DEPTH_PLANE_CNTL_Z_MODE__SHIFT;
+                const uint32_t suMode = (x.reg(a6xx::REG_A6XX_GRAS_SU_DEPTH_PLANE_CNTL) & a6xx::A6XX_GRAS_SU_DEPTH_PLANE_CNTL_Z_MODE__MASK) >>
+                                        a6xx::A6XX_GRAS_SU_DEPTH_PLANE_CNTL_Z_MODE__SHIFT;
+                // (an untested hidden draw keeps the tested one's EARLY_Z; a barrier's is LATE_Z unless kHsrLeanEarly)
+                const bool early = tested[k] || classOf(s.steps[k].kind) == 1 || (lean & CommandBuffer::kHsrLeanEarly) != 0;
+                CHECK_EQ(mode, uint32_t(early ? a6xx::A6XX_EARLY_Z : a6xx::A6XX_LATE_Z));
+                if (classOf(s.steps[k].kind) == 2) CHECK_EQ(suMode, mode);
+            }
+            CHECK_EQ(found, uint32_t(n) - hsrCount(s, kHsrFlat, kHsrOverlap, kHsrInstances));
+        }
+    }
+    // with an LRZ (the A610's) the hidden draws keep their test
+    if (render::kLrzServed) {
+        const HsrRun on = runHsr(kHsrScenes[1], true, 0, CommandBuffer::kHsrMaxDraws, CommandBuffer::kHsrDepth16, true, CommandBuffer::kHsrLeanTail);
+        CHECK(hsrRules(runHsr(kHsrScenes[1], false, 0, CommandBuffer::kHsrMaxDraws, CommandBuffer::kHsrDepth16, true), on).empty());
+        CHECK_EQ(on.counts.hsrUntested, 0u);
+    }
+}
+
 // Each mutation twin of the stream breaks a rule: 1 the prepass left out (rule 1: its draws never run), 2 a barrier
 // tested (rule 3), 3 a draw that writes colour 1 taken as opaque (rule 2), 4 the shadow kept across a hole (rule 1: the
 // draw after it runs with the prepass's program), 5 the prepass tested Less (rule 2: two primitives of one draw at one
 // Z would leave the first), 6 a draw whose vertex stage has an IBO taken as opaque (rule 2); and with an LRZ (the A610),
 // 7 the LRZ not cleared (the fake: an earlier pass's LRZ would reject this one's fragments), 8 a hidden draw writing it
-// (the fake: an LRZ over depth no draw wrote; rule 4 as well).
+// (the fake: an LRZ over depth no draw wrote; rule 4 as well); 9 setHsrLean's tail untested before an opaque draw too
+// (rule 2: the prepass is drawn across it).
 TEST(hsr_rules_catch_each_twin) {
     struct Case {
         uint8_t twin;
@@ -7535,14 +7611,17 @@ TEST(hsr_rules_catch_each_twin) {
                           {5, 9, "of a prepass is not tested LessEqual with a depth write"},
                           {6, 11, "of a prepass writes another attachment or has an IBO"},
                           {7, 0, "is not cleared to 1.0 in this pass"},
-                          {8, 1, "writes no depth: the LRZ would bound depth that is not there"}};
+                          {8, 1, "writes no depth: the LRZ would bound depth that is not there"},
+                          {9, 1, "of a prepass is drawn across draw 0, untested"}};
     for (const Case& c : cases) {
         const HsrScene& s = kHsrScenes[c.scene];
-        const bool lrz = c.twin >= 7;   // (the LRZ's twins, with an LRZ: the A610's alone)
+        const bool lrz = c.twin == 7 || c.twin == 8;   // (the LRZ's twins, with an LRZ: the A610's alone)
         if (lrz && !render::kLrzServed) continue;
         const CommandBuffer::HsrDepth kind = CommandBuffer::kHsrDepth16;
-        CHECK(hsrRules(runHsr(s, false, 0, CommandBuffer::kHsrMaxDraws, kind, lrz), runHsr(s, true, 0, CommandBuffer::kHsrMaxDraws, kind, lrz)).empty());   // (the scene as meant passes)
-        const std::string broken = hsrRules(runHsr(s, false, 0, CommandBuffer::kHsrMaxDraws, kind, lrz), runHsr(s, true, c.twin, CommandBuffer::kHsrMaxDraws, kind, lrz));
+        const uint8_t lean = c.twin == 9 ? CommandBuffer::kHsrLeanTail : 0;   // (9: setHsrLean's twin)
+        CHECK(hsrRules(runHsr(s, false, 0, CommandBuffer::kHsrMaxDraws, kind, lrz), runHsr(s, true, 0, CommandBuffer::kHsrMaxDraws, kind, lrz, lean)).empty());   // (the scene as meant passes)
+        const std::string broken =
+            hsrRules(runHsr(s, false, 0, CommandBuffer::kHsrMaxDraws, kind, lrz), runHsr(s, true, c.twin, CommandBuffer::kHsrMaxDraws, kind, lrz, lean));
         CHECK(has(broken, c.want));
         if (!has(broken, c.want)) std::printf("       twin %u on %s: \"%s\"\n", c.twin, s.name, broken.c_str());
     }
@@ -7711,13 +7790,15 @@ TEST(hsr_depth_kept_across_a_gmem_pass_in_the_same_buffer) {
 }
 
 // The prepass's draws are written from the facts the pass's draw is written from: taken from the programs' kept states
-// or judged the long way, the GPU runs every draw of the scene in the same state.
+// or judged the long way, the GPU runs every draw of the scene in the same state -- with setHsrLean's untested hidden
+// draws too (their depth test written among their own words either way).
 TEST(hsr_kept_states_and_whole_draws_give_the_same_draws) {
+    for (const uint8_t lean : {uint8_t(0), uint8_t(CommandBuffer::kHsrLeanTail | CommandBuffer::kHsrLeanEarly)})
     for (size_t k : {size_t(0), size_t(1), size_t(8), size_t(12), size_t(13)}) {
         const bool was = CommandBuffer::keepStates(false);
-        const HsrRun whole = runHsr(kHsrScenes[k], true);
+        const HsrRun whole = runHsr(kHsrScenes[k], true, 0, CommandBuffer::kHsrMaxDraws, CommandBuffer::kHsrDepth16, false, lean);
         CommandBuffer::keepStates(true);
-        const HsrRun kept = runHsr(kHsrScenes[k], true);
+        const HsrRun kept = runHsr(kHsrScenes[k], true, 0, CommandBuffer::kHsrMaxDraws, CommandBuffer::kHsrDepth16, false, lean);
         CommandBuffer::keepStates(was);
         CHECK(whole.completed && kept.completed);
         CHECK_EQ(whole.stats.drawLog.size(), kept.stats.drawLog.size());
@@ -7726,6 +7807,8 @@ TEST(hsr_kept_states_and_whole_draws_give_the_same_draws) {
             CHECK_EQ(whole.stats.drawLog[i].indirect, kept.stats.drawLog[i].indirect);
         }
         CHECK(kept.counts.keptDraws != 0 || k == 12);   // (12 draws each of its programs once)
+        CHECK_EQ(whole.counts.hsrUntested, kept.counts.hsrUntested);
+        CHECK_EQ(kept.counts.hsrLeanMissed, 0u);
         if ((kept.counts.keptDraws == 0 && k != 12) || !whole.completed || !kept.completed) std::printf("       %s: %u kept draws; %s / %s\n", kHsrScenes[k].name, kept.counts.keptDraws, whole.error.c_str(), kept.error.c_str());
     }
 }

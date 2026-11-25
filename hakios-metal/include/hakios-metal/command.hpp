@@ -194,6 +194,9 @@ public:
         // and the prepasses written (segments that had an opaque draw)
         uint32_t hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0, hsrPrepasses = 0;
         uint32_t hsrClears = 0, hsrBusy = 0;   // (HsrClock: the depth cleared as a pass opened; a draw without HSR, the clock another buffer's)
+        // setHsrLean's: hidden draws drawn untested (no opaque draw after them in their segment), and those it could not
+        // make so (their depth test's registers not found among their words: drawn tested, as without it)
+        uint32_t hsrUntested = 0, hsrLeanMissed = 0;
     };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -305,12 +308,29 @@ public:
     // M55, for an A/B); off, the depth's clock carries on from pass to pass (HsrClock) and a pass clears it only when the
     // clock says so -- the default
     void setHsrClearEach(bool each) { hsrClearEach_ = each; }
+    // What setHsr's draws that no later opaque draw can cover are drawn with (the design's section 3, above). Only an opaque draw of the same segment that comes after a hidden
+    // draw can hide its fragments: the prepass of an earlier segment, and the depth earlier passes left, hold larger
+    // Z only (each draw's Z below every Z before it, HsrClock), and a barrier draws nothing into the depth. So a hidden
+    // draw after its segment's last opaque draw passes LEQUAL wherever it is drawn, and its test is reads for nothing.
+    //   kHsrLeanTail   such hidden draws drawn untested: each hidden draw writes RB_DEPTH_CNTL and GRAS_SU_DEPTH_CNTL
+    //                  among its own words (the shadow made to forget them), tested; an opaque draw of the segment
+    //                  after it keeps it so, and at the segment's end the ones after its last opaque draw have those
+    //                  two words made the untested draw's (ZFUNC ALWAYS, no test, no read). A draw after a patched one
+    //                  that wants a test writes its own (hidden) or is a NOP in the pass (opaque); a barrier writes its
+    //                  untested values, since the shadow holds the tested ones. Not with an LRZ (its LRZ_CNTL is the
+    //                  test's too).
+    //   kHsrLeanEarly  an untested draw of an HSR pass (a barrier, or a hidden draw kHsrLeanTail untested) in EARLY_Z,
+    //                  as in a pass without depth, rather than LATE_Z, which a depth test off otherwise gives; LATE_Z
+    //                  still for a fragment stage that writes depth. Nothing is tested or written either way.
+    enum : uint8_t { kHsrLeanTail = 1, kHsrLeanEarly = 2 };
+    void setHsrLean(uint8_t bits) { hsrLean_ = bits; }
     static constexpr uint32_t kHsrMaxDraws = 32767;   // (render.cpp's hsrZ: Z_I's 16-bit level, 65533 - 2 I, at least 1 below it)
     // (for the tests) TWIN: a mutation of the stream the tests' rules must catch -- 1 the prepass left out (the hole
     // stays a NOP, the opaque draws still NOPs), 2 a barrier tested as a hidden draw, 3 an opaque draw that writes
     // another attachment taken as opaque, 4 the shadow and the cursors kept at a segment's hole, 5 the prepass tested
     // LESS, 6 an opaque draw whose stages have IBOs taken as opaque, 7 the LRZ buffer not cleared as a pass opens, 8 the
-    // LRZ written by every draw that tests it (the hidden ones too); 0 the stream as meant. LIMIT: kHsrMaxDraws, or
+    // LRZ written by every draw that tests it (the hidden ones too), 9 with setHsrLean's kHsrLeanTail every hidden draw
+    // untested (an opaque draw after it in its segment too); 0 the stream as meant. LIMIT: kHsrMaxDraws, or
     // fewer to reach it in a test. ANY_TARGET: a pass whose colour 0 is not compressed taken too (the suites without
     // Mesa have no compressed texture).
     void setHsrTest(uint8_t twin, uint32_t limit = kHsrMaxDraws, bool anyTarget = false) {
@@ -368,6 +388,7 @@ private:
     HsrDepth hsrKind_ = kHsrDepth16;   // setHsrDepth's
     bool hsrLrz_ = false;
     bool hsrClearEach_ = false;
+    uint8_t hsrLean_ = 0;   // setHsrLean's
     std::shared_ptr<HsrClock> hsrClock_;   // the clock this buffer owns (HsrClock::owner), let go at commit or destruction
     std::vector<std::shared_ptr<HsrClock>> hsrHeld_;   // (an appended buffer's clocks of other depths, held the same way)
     void hsrLetGo();
@@ -497,6 +518,9 @@ private:
         pm4::Stream hsrPrepass;
         std::vector<size_t> hsrStarts;
         RegShadow hsrShadow;   // (an empty shadow, for an opaque draw's whole words taken from its program's kept state)
+        // setHsrLean's kHsrLeanTail: the hidden draws of the open segment since its last opaque draw, each by where the
+        // values of its RB_DEPTH_CNTL and GRAS_SU_DEPTH_CNTL lie in the stream
+        std::vector<std::pair<size_t, size_t>> hsrTail;
     };
     // NEXT: the pass of the draw that could not join the open one, when it is such a draw that closes it (nullptr for
     // anything else: a copy, a dispatch, the commit). A memoryless attachment the tiles wrote is stored for it alone:

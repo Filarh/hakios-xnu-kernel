@@ -313,11 +313,12 @@ draw_states_keep_each_groups_registers_whole submits 0 words 0 draws 0 loads 0 s
 the_fake_runs_draw_state_groups_as_the_microcode_does submits 6 words 3597 draws 8 loads 12 stream f2ceb65085b181a9 state 54e81470edcf5a2d names 0 0000000000000000
        (no compressed Depth16Unorm in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none)
 hsr_draws_each_scene_as_the_draws_without_it_by_the_rules submits 172 words 240767 draws 735 loads 1912 stream f11ff00e10712e35 state 4ede2b5a9c5d8c71 names 1581 92b5aa76f9ec9c9b
-hsr_rules_catch_each_twin submits 64 words 89299 draws 268 loads 697 stream 9dcd0750efe582e5 state c32683cb90f0cd5a names 587 76f8169e85227f6e
+hsr_lean_leaves_untested_only_the_hidden_draws_no_opaque_draw_of_their_segment_follows submits 184 words 263354 draws 814 loads 2098 stream 61046a02493bb7c7 state d1e8ed4d7dff98f6 names 1685 3871d2225d2f25dd
+hsr_rules_catch_each_twin submits 72 words 99461 draws 300 loads 777 stream 383286f6a2d44675 state 9da19883a3621d42 names 655 d682b7678d512e48
 hsr_past_its_draw_limit_draws_the_rest_as_barriers submits 4 words 6839 draws 24 loads 58 stream 5b6bad7b15984451 state ec98a4b3be275dc5 names 34 2fc550648417576d
 hsr_depth_is_cleared_once_and_its_levels_run_on_in_the_queues_order submits 7 words 15660 draws 26 loads 96 stream 573e79650340d4bf state 981f7e27aa5a8765 names 49 13b297512358d132
 hsr_depth_kept_across_a_gmem_pass_in_the_same_buffer submits 1 words 3300 draws 5 loads 18 stream 7ee7dbd08d695590 state 3819d717c8bda6ac names 8 04f760a4f87724a6
-hsr_kept_states_and_whole_draws_give_the_same_draws submits 20 words 24754 draws 90 loads 258 stream f19dd01a94d08631 state e915a7ec4dbd0861 names 196 c20aca60c69cad60
+hsr_kept_states_and_whole_draws_give_the_same_draws submits 40 words 49534 draws 180 loads 516 stream 44d5a0d66d35b01d state 37127cc4147edecd names 392 841594c18d395ac0
        (no Mesa in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none; no compressed target to draw)
 hsr_serves_the_passes_into_a_compressed_target_alone submits 1 words 1857 draws 3 loads 6 stream 7016c79e6c3b249c state 6daed77ff6dca4f4 names 6 cdd4ee2570085dc3
 texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

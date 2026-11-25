@@ -312,6 +312,8 @@ struct RenderPass {
     const Buffer* depthLrz = nullptr;
     // the depth is CommandBuffer::setHsr's: its Clear as turnip's sysmem clear, without the waits (render.cpp: zsClears)
     bool depthHsr = false;
+    // ...and its untested draws in EARLY_Z, as without a depth attachment (CommandBuffer::setHsrLean's kHsrLeanEarly)
+    bool depthHsrEarly = false;
     // the stencil attachment (MTLRenderPassStencilAttachmentDescriptor): the depth texture itself when it is a
     // Depth32Float_Stencil8 one (its S8 plane), or none; Metal's defaults DontCare / DontCare / 0
     const Texture* stencil = nullptr;

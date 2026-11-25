@@ -2339,8 +2339,9 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
         // (with LRZ on for the draw, a kill that writes depth is EARLY_LRZ_LATE_Z, tu_cmd_buffer.cc:5549-5556: the LRZ
         // tested early, the depth late; never so for setHsr's draws, whose opaque ones do not discard)
         const uint32_t lrz = lrzCntl(program, pass, draw, depthTest, o.lrzWriteAll);
+        // (CommandBuffer::setHsrLean's kHsrLeanEarly: an untested draw of an HSR pass in EARLY_Z, as without the depth)
         const a6xx_ztest_mode zmode = pass.depth == nullptr ? A6XX_EARLY_Z
-                                      : (!depthTest && !st.enabled) || fs.depthRegid != kRegidNone ? A6XX_LATE_Z
+                                      : (!depthTest && !st.enabled && !pass.depthHsrEarly) || fs.depthRegid != kRegidNone ? A6XX_LATE_Z
                                       : fs.hasKill && (draw.depth.write || stencilWrites)            ? (lrz != 0 ? A6XX_EARLY_LRZ_LATE_Z : A6XX_LATE_Z)
                                                                                                      : A6XX_EARLY_Z;
         const uint32_t depthCntl = pass.depth == nullptr ? 0u
@@ -4521,6 +4522,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
             hsrPass.depthStore = StoreAction::kDontCare;
             hsrPass.clearDepth = 1.0;
             hsrPass.depthHsr = true;
+            hsrPass.depthHsrEarly = (hsrLean_ & kHsrLeanEarly) != 0;
         }
     }
     const bool hsr = hsrDepth != nullptr;
@@ -5023,6 +5025,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
                 open_->hsrStarts.push_back(at);
             }
         }
+        // (setHsrLean's kHsrLeanTail: the segment's hidden draws so far have this opaque draw after them -- tested;
+        // 9, the twin: untested all the same)
+        if (hsrClass == render::kHsrOpaque && hsrTwin_ != 9) open_->hsrTail.clear();
         if (hsrClass == render::kHsrOpaque) counts_.hsrOpaque++;
         if (hsrClass == render::kHsrHidden) counts_.hsrHidden++;
         if (hsrClass == render::kHsrBarrier) counts_.hsrBarriers++;
@@ -5056,6 +5061,15 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     const size_t markInto = into.size(), markSys = open_->dual ? open_->sysStream.size() : SIZE_MAX;
     RegShadow& shadow = open_->gmem ? open_->bodyRegs : open_->regs;
     render::Cursor& cursor = open_->cache->cur[open_->gmem ? 1 : 0];
+    // setHsrLean's kHsrLeanTail: a hidden draw writes its depth test among its own words, whatever the shadow and the
+    // cursor hold, so that the segment's end can make them the untested draw's (hsrCloseSegment); not with an LRZ
+    const bool leanTail = hsr && hsrClass == render::kHsrHidden && (hsrLean_ & kHsrLeanTail) != 0 && pass.depthLrz == nullptr &&
+                          (hsrTwin_ == 0 || hsrTwin_ == 9) && !open_->gmem;
+    if (leanTail) {
+        (void)shadow.hold(a6xx::REG_A6XX_RB_DEPTH_CNTL, ~0u);
+        (void)shadow.hold(a6xx::REG_A6XX_GRAS_SU_DEPTH_CNTL, ~0u);
+        cursor.blendSet = false;
+    }
     if (options.dedupRegs && open_->options.dedupRegs) {
         if (fast) {
             // (render::gVerifyDraws: the same draw the long way, through a copy of the shadow as it was, must come to the
@@ -5170,6 +5184,27 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         }
         open_->cache->cur[0].forget();
         open_->cache->cur[1].forget();
+    }
+    if (leanTail) {
+        // where this draw's RB_DEPTH_CNTL and GRAS_SU_DEPTH_CNTL went (the last of each among its words)
+        const std::vector<uint32_t>& w = into.words();
+        size_t depthCntl = SIZE_MAX, suDepthCntl = SIZE_MAX;
+        for (size_t i = markInto; i < w.size();) {
+            const pm4::Header h = pm4::decode(w[i]);
+            if (h.kind == pm4::Header::kBad) break;
+            if (h.kind == pm4::Header::kRegisters) {
+                if (a6xx::REG_A6XX_RB_DEPTH_CNTL >= h.reg && a6xx::REG_A6XX_RB_DEPTH_CNTL < h.reg + h.count) depthCntl = i + 1 + (a6xx::REG_A6XX_RB_DEPTH_CNTL - h.reg);
+                if (a6xx::REG_A6XX_GRAS_SU_DEPTH_CNTL >= h.reg && a6xx::REG_A6XX_GRAS_SU_DEPTH_CNTL < h.reg + h.count) {
+                    suDepthCntl = i + 1 + (a6xx::REG_A6XX_GRAS_SU_DEPTH_CNTL - h.reg);
+                }
+            }
+            i += 1 + h.count;
+        }
+        if (depthCntl != SIZE_MAX && suDepthCntl != SIZE_MAX) {
+            open_->hsrTail.emplace_back(depthCntl, suDepthCntl);
+        } else {
+            counts_.hsrLeanMissed++;   // (drawn tested: the shadow holds what it wrote, as for any draw)
+        }
     }
     if (hsr && hsrClass == render::kHsrOpaque) {
         // (drawn in the prepass: here its state alone, which the draws after it are written against)
@@ -5455,12 +5490,26 @@ void CommandBuffer::hsrOpenSegment() {
     o.hsrSegment = true;
     o.hsrPrepass.clear();
     o.hsrStarts.clear();
+    o.hsrTail.clear();
 }
 
 bool CommandBuffer::hsrCloseSegment() {
     if (open_ == nullptr || !open_->hsrSegment) return true;
     OpenPass& o = *open_;
     o.hsrSegment = false;
+    // setHsrLean's kHsrLeanTail: the hidden draws after the segment's last opaque draw (all of them, when it has none)
+    // untested -- ZFUNC ALWAYS and no test or read, what a draw with the depth test off writes (emitDraw)
+    for (const auto& [depthCntl, suDepthCntl] : o.hsrTail) {
+        using namespace a6xx;
+        const uint32_t was = stream_.words()[depthCntl];
+        const uint32_t off[2] = {(was & ~uint32_t(A6XX_RB_DEPTH_CNTL_Z_TEST_ENABLE | A6XX_RB_DEPTH_CNTL_Z_READ_ENABLE | A6XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE |
+                                                    A6XX_RB_DEPTH_CNTL_ZFUNC__MASK)) |
+                                     A6XX_RB_DEPTH_CNTL_ZFUNC(FUNC_ALWAYS),
+                                 stream_.words()[suDepthCntl] & ~uint32_t(A6XX_GRAS_SU_DEPTH_CNTL_Z_TEST_ENABLE)};
+        if (!stream_.patch(depthCntl, &off[0], 1) || !stream_.patch(suDepthCntl, &off[1], 1)) return fail("an HSR hidden draw's depth test is not in the stream");
+        counts_.hsrUntested++;
+    }
+    o.hsrTail.clear();
     if (o.hsrStarts.empty() || hsrTwin_ == 1) return true;   // (no opaque draw: the hole stays a NOP)
     const std::vector<uint32_t>& w = o.hsrPrepass.words();
     // (a buffer of its own from the queue's pool, not a piece of the slab: the draws' tables are cut where they would be

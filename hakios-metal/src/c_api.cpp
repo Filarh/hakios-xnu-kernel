@@ -1024,6 +1024,19 @@ void hakios_metal_cb_set_hsr_clear_each(hakios_metal_cb* cb, int each) {
     cb->cb->setHsrClearEach(each != 0);
 }
 
+void hakios_metal_cb_set_hsr_lean(hakios_metal_cb* cb, int bits) {
+    const uint8_t b = uint8_t(bits & (CommandBuffer::kHsrLeanTail | CommandBuffer::kHsrLeanEarly));
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, b] { cb->cb->setHsrLean(b); });
+    cb->cb->setHsrLean(b);
+}
+
+void hakios_metal_cb_hsr_lean_counts(hakios_metal_cb* cb, unsigned* untested, unsigned* missed) {
+    syncOne(cb);
+    const CommandBuffer::Counts& c = cb->cb->counts();
+    if (untested != nullptr) *untested = c.hsrUntested;
+    if (missed != nullptr) *missed = c.hsrLeanMissed;
+}
+
 void hakios_metal_cb_hsr_counts(hakios_metal_cb* cb, unsigned* passes, unsigned* opaque, unsigned* hidden, unsigned* barriers) {
     syncOne(cb);
     const CommandBuffer::Counts& c = cb->cb->counts();
