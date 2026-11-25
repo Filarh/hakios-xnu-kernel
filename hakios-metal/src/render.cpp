@@ -1824,7 +1824,10 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
     const uint64_t maxIndices = f.maxIndices;
     const Scissor sc = f.sc;
     const Viewport& vp = draw.viewport;
-    MrtWords mrts[kMaxColorOutputs] = {};
+    // (the colour targets' words are read by the MRT and RB_RENDER_CNTL groups alone: zeroed for those, not for the few
+    // groups of a draw taken from its program's kept state, which made them on every draw)
+    MrtWords mrts[kMaxColorOutputs];
+    if (g & (kGMrt | kGRenderCntl)) std::fill(std::begin(mrts), std::end(mrts), MrtWords{});
     uint32_t srgbMask = 0;
     for (uint32_t i = 0; (g & (kGMrt | kGRenderCntl)) && i < numRt; i++) {
         // (an unwritten slot with no attachment of its own names another attachment's memory: valid, and never written.
