@@ -3596,6 +3596,33 @@ struct PassCache {
         bool plain;
     };
     std::vector<std::unique_ptr<Frag>> frags;
+    // (the frags of the passes before, their vectors' room kept: a pass let go hands them to the next, which made them
+    // anew from the heap at its first draw with each kind of program)
+    std::vector<std::unique_ptr<Frag>> spare;
+    // what a pass let go comes to: as new, but for the spare frags
+    void reset() {
+        for (auto& f : frags) spare.push_back(std::move(f));
+        std::vector<std::unique_ptr<Frag>> keep = std::move(spare);
+        *this = PassCache{};
+        spare = std::move(keep);
+    }
+    // a frag for SIG: a spare one emptied, or a new one
+    Frag* newFrag(uint32_t sig) {
+        std::unique_ptr<Frag> f;
+        if (!spare.empty()) {
+            f = std::move(spare.back());
+            spare.pop_back();
+            f->words.clear();
+            f->segs.clear();
+            f->byReg.clear();
+        } else {
+            f = std::make_unique<Frag>();
+        }
+        f->sig = sig;
+        f->plain = false;
+        frags.push_back(std::move(f));
+        return frags.back().get();
+    }
     // a framebuffer fetch's descriptor of each attachment: [0] where it lies in memory, [1] its bin in GMEM
     uint32_t fb[2][kMaxColorOutputs][16];
     uint8_t fbHave[2] = {0, 0};
@@ -4248,10 +4275,10 @@ uint32_t emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, 
             scratch.clear();
             emitDraw(scratch, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch,
                      kGZs | kGMrt | kGMsaa | kGRenderCntl | kGLrz);
-            auto made = std::make_unique<PassCache::Frag>(PassCache::Frag{sig, scratch.words(), {}, {}, false});
+            PassCache::Frag* made = pc.newFrag(sig);
+            made->words.assign(scratch.words().begin(), scratch.words().end());
             made->plain = packetsOf(made->words.data(), uint32_t(made->words.size()), &made->segs, &made->byReg);
-            pc.frags.push_back(std::move(made));
-            fr = pc.frags.back().get();
+            fr = made;
         }
         kept(Cursor::kPass, fr->words.data(), uint32_t(fr->words.size()), fr->segs.data(), fr->byReg.data(), uint32_t(fr->segs.size()), fr->plain);
     }
@@ -4476,7 +4503,7 @@ void CommandBuffer::PassReturn::operator()(OpenPass* p) const {
     p->hsrPrepass = std::move(hsrPrepass);
     p->staticKey = std::move(staticKey);
     if (cache != nullptr && cache.use_count() == 1) {
-        *cache = render::PassCache{};
+        cache->reset();
         p->cache = std::move(cache);
     }
     queue->givePass(p);
