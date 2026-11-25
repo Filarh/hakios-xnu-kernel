@@ -1432,6 +1432,7 @@ HM_REFUSES_OUT_LOUD
 	unsigned _ycbcrCount;
 	uint64_t _ycbcrWords[HM_YCBCR_MOST];
 	int _ycbcrSpecs[HM_YCBCR_MOST];
+	const void *_ycbcrBases[HM_YCBCR_MOST]; /* with _specTable: the specialisation it was made over, by its program (NULL otherwise) */
 	hakios_metal_program *_ycbcrPrograms[HM_YCBCR_MOST];
 	hakios_metal_spec_table *_specTable; /* metal_async_compile=1: the same, kept by the core and compiled by its queue */
 }
@@ -10038,6 +10039,32 @@ hm_spec_queue(void)
 	return compiling;
 }
 
+static void
+hm_block_job(void *context)
+{
+	void (^job)(void) = (void (^)(void))context;
+
+	@autoreleasepool {   /* (the queue's worker is a thread of the core's, with no pool of its own) */
+		job();
+	}
+	Block_release(job);
+}
+
+/* JOB compiles something a draw falls back from meanwhile (metal_ycbcrgpu's programs): with metal_async_compile, a job
+ * of the core's queue at priority 1, on the background compiler, so that it never holds the one a waiting thread needs;
+ * otherwise (or should the queue turn KEY away) on hakios.metal.specialise, as before */
+static void
+hm_fallback_compile(const char *key, const char *what, void (^job)(void))
+{
+	if (hm_async_compile()) {
+		void *context = Block_copy(job);
+
+		if (hakios_metal_compile_submit(key, 1, what, hm_block_job, context)) return;
+		Block_release(context);
+	}
+	dispatch_async(hm_spec_queue(), job);
+}
+
 - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
 {
 	return [self hakiosProgramFor:buffers offsets:offsets count:count slot:NULL];
@@ -10169,32 +10196,51 @@ hm_spec_queue(void)
 	BOOL start = NO;
 	unsigned at = 0;
 	NSData *content = nil;
+	/* metal_async_compile: the core's table names no slot. Its specialisation is told by its program (the table keeps
+	 * each until the pipeline goes), and compiled again for the bytes this draw holds: the same as the ones it was made
+	 * for in every byte its compilation read. -2 for "one of the table's". */
+	const void *tableBase = NULL;
 
-	if (_fsAir == nil || word == 0 || (_specBinding >= 0 && spec < 0)) return NULL;
+	if (_specTable != NULL && _specBinding >= 0 && base != _program) {
+		spec = -2;
+		tableBase = base;
+	}
+	if (_fsAir == nil || word == 0 || (_specBinding >= 0 && spec == -1)) return NULL;
 	os_unfair_lock_lock(&_specLock);
 	for (at = 0; at < _ycbcrCount; at++) {
-		if (_ycbcrWords[at] == word && _ycbcrSpecs[at] == spec) break;
+		if (_ycbcrWords[at] == word && _ycbcrSpecs[at] == spec && _ycbcrBases[at] == tableBase) break;
 	}
 	if (at < _ycbcrCount) {
 		found = _ycbcrPrograms[at];
 	} else if (_ycbcrCount < HM_YCBCR_MOST) {
 		_ycbcrWords[at] = word;
 		_ycbcrSpecs[at] = spec;
+		_ycbcrBases[at] = tableBase;
 		_ycbcrPrograms[at] = NULL;
 		_ycbcrCount++;
 		start = YES;
-		/* (the bytes its specialisation was compiled for, under the lock that keeps them) */
-		if (spec >= 0) content = [[NSData alloc] initWithBytes:_specKeys + (size_t)spec * _specLength length:_specLength];
+		/* (the bytes its specialisation was compiled for, under the lock that keeps them; with the table, this draw's) */
+		if (spec >= 0) {
+			content = [[NSData alloc] initWithBytes:_specKeys + (size_t)spec * _specLength length:_specLength];
+		} else if (spec == -2) {
+			content = [[NSData alloc] initWithBytes:(const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]) + offsets[_specBinding]
+							 length:_specLength];
+		}
 	} else {
 		HM_ONCE("ycbcr: a pipeline has %d YCbCr programs and is asked for another: those draws sample the copies\n", HM_YCBCR_MOST);
 	}
 	os_unfair_lock_unlock(&_specLock);
 	if (start) {
+		char key[64], what[160];
+
+		/* (the pipeline's identifier is never reused: the queue remembers the keys it ran) */
+		snprintf(key, sizeof(key), "ycbcr:%llu:%u", (unsigned long long)_hakiosUniqueIdentifier, at);
+		snprintf(what, sizeof(what), "ycbcr %s", hakios_metal_program_name(base));
 		[self retain];
-		dispatch_async(hm_spec_queue(), ^{
+		hm_fallback_compile(key, what, ^{
 			const double began = hm_now();
 			hakios_metal_program *p = hakios_metal_program_specialize_ycbcr(_program, [_fsAir bytes], [_fsAir length], _fsConstants,
-										       _fsConstantCount, spec >= 0 ? (unsigned)_specBinding : 0,
+										       _fsConstantCount, spec != -1 ? (unsigned)_specBinding : 0,
 										       [content bytes], [content length], word);
 
 			if (p == NULL) {
@@ -10202,7 +10248,7 @@ hm_spec_queue(void)
 					 (unsigned long long)word, hakios_metal_error());
 			} else {
 				hm_print("ycbcr: %s compiled for YCbCr slots %#llx%s in %.0f ms\n", hakios_metal_program_name(base), (unsigned long long)word,
-					 spec >= 0 ? " over its specialisation" : "", (hm_now() - began) * 1e3);
+					 spec != -1 ? " over its specialisation" : "", (hm_now() - began) * 1e3);
 			}
 			os_unfair_lock_lock(&_specLock);
 			_ycbcrPrograms[at] = p;
