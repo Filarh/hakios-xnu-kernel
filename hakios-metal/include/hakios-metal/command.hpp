@@ -424,45 +424,66 @@ private:
     const void* recent_[kRecent] = {};
 public:
     // What each register written in a pass holds, for appendDeduped: a draw writes some 500 of them and almost all
-    // hold their value already, so each is looked up once, in an open-addressed table of its own (std::unordered_map's
-    // find and insert, two lookups and a node a register, were most of a draw's 20 us of deduplication on the phone)
+    // hold their value already, so each is looked up once. By the register itself rather than a hash of it: the
+    // registers a pass writes lie in a few blocks of the 18-bit space (RB, GRAS, VPC, PC, VFD, SP, HLSQ), each block of
+    // 256 a page of values with the generation each was written in, the pages found through a table of the 1024
+    // blocks. A register holds a value when its stamp is the current generation, so forgetting everything (a packet
+    // behind the stream's back, a pass let go) is one increment, not a fill of the table -- which an open-addressed
+    // table needed, as large as the most registers a pass ever held.
     class RegShadow {
     public:
         // whether REG held VALUE; it holds VALUE from now on
         bool hold(uint32_t reg, uint32_t value) {
-            if (keys_.empty() || 2 * (used_ + 1) > keys_.size()) grow();
-            const size_t mask = keys_.size() - 1;
-            for (size_t i = (reg * 2654435761u) & mask;; i = (i + 1) & mask) {
-                if (keys_[i] == reg) {
-                    const bool same = values_[i] == value;
-                    values_[i] = value;
-                    return same;
-                }
-                if (keys_[i] == kEmpty) {
-                    keys_[i] = reg;
-                    values_[i] = value;
-                    used_++;
-                    return false;
-                }
-            }
+            if (reg >= kRegs) return holdFar(reg, value);
+            const uint32_t block = reg >> kPageBits;
+            uint16_t at = block < index_.size() ? index_[block] : 0;
+            if (at == 0) at = newPage(block);
+            Page& p = pages_[at - 1u];
+            const uint32_t k = reg & (kPage - 1);
+            const bool same = p.stamp[k] == gen_ && p.value[k] == value;
+            p.stamp[k] = gen_;
+            p.value[k] = value;
+            return same;
         }
         void clear() {
-            std::fill(keys_.begin(), keys_.end(), kEmpty);
-            used_ = 0;
+            far_.clear();
+            if (++gen_ != 0) return;
+            // (the generations ran out: every stamp back to 0, which no generation is)
+            for (Page& p : pages_) std::fill(std::begin(p.stamp), std::end(p.stamp), 0u);
+            gen_ = 1;
         }
     private:
-        static constexpr uint32_t kEmpty = ~0u;
-        void grow() {
-            std::vector<uint32_t> keys = std::move(keys_), values = std::move(values_);
-            keys_.assign(std::max<size_t>(1024, keys.size() * 2), kEmpty);
-            values_.assign(keys_.size(), 0);
-            used_ = 0;
-            for (size_t i = 0; i < keys.size(); i++) {
-                if (keys[i] != kEmpty) hold(keys[i], values[i]);
-            }
+        static constexpr uint32_t kRegs = 1u << 18;   // a type-4 header's register field
+        static constexpr uint32_t kPageBits = 8, kPage = 1u << kPageBits;
+        struct Page {
+            uint32_t value[kPage];
+            uint32_t stamp[kPage];
+        };
+        uint16_t newPage(uint32_t block) {
+            if (index_.empty()) index_.assign(kRegs >> kPageBits, 0);
+            pages_.emplace_back();
+            Page& p = pages_.back();
+            std::fill(std::begin(p.stamp), std::end(p.stamp), 0u);
+            index_[block] = uint16_t(pages_.size());
+            return index_[block];
         }
-        std::vector<uint32_t> keys_, values_;
-        size_t used_ = 0;
+        // (a register past the 18 bits a header has: none is written, but the shadow answers for any number)
+        bool holdFar(uint32_t reg, uint32_t value) {
+            for (auto& [r, v] : far_) {
+                if (r != reg) continue;
+                const bool same = v == value;
+                v = value;
+                return same;
+            }
+            far_.emplace_back(reg, value);
+            return false;
+        }
+        std::vector<Page> pages_;
+        // block -> page + 1, 0: none yet (empty until the first page: a shadow is made for nothing at every draw, the
+        // check's copy of it)
+        std::vector<uint16_t> index_;
+        uint32_t gen_ = 1;
+        std::vector<std::pair<uint32_t, uint32_t>> far_;
     };
 
 private:
