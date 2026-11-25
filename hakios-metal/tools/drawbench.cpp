@@ -17,7 +17,13 @@
 //   S T U                   with --stages DIR: the same through the C interface with the stages of a phone's own cache
 //                           (<DIR>/*.stage, compiler.cpp's stageCacheSave: CoreAnimation's functions as the driver
 //                           compiled them there), every vertex stage linked with every fragment stage that links;
-//                           U is T's frame in five passes of 22 draws, as the phone's command buffers hold it
+//                           U is T's frame in five passes of 22 draws, as the phone's command buffers hold it;
+//                           X is CoreAnimation's frame with the home screen's side panel sliding (the main command
+//                           buffer of a metal_trace=frame capture, research/metal/panel): 169 draws in 18 passes of
+//                           1 to 72 draws into targets of 41x21 to 752x1626, the uber shader's pipelines changing at
+//                           almost every draw, the constants' places and the textures moving with each; Y is X's
+//                           frame with every pass in sysmem (on the phone metal_hsr=1 gives the screen's passes a
+//                           depth attachment, which keeps them out of GMEM)
 // Each scene is recorded once to warm the queue's pools, then N times measured (--runs, 5): the time inside the draw
 // calls alone, a draw; the heap allocations in them; the words the command processor is given.
 // --cold KB touches KB kilobytes before each draw, so that a draw starts with as little in the processor's caches as
@@ -470,6 +476,9 @@ struct Frame {
     // the frame in several passes: PASSES in turn, each for DRAWS_A_PASS draws (0: the one pass above for all of them)
     std::vector<hakios_metal_render_pass> passes;
     uint32_t drawsAPass = 0;
+    // ...or PASSES in turn, the Nth for PASS_DRAWS[N] draws into a target of PASS_SIZE[N] (viewport and scissors in it)
+    std::vector<uint32_t> passDraws;
+    std::vector<std::pair<unsigned, unsigned>> passSize;
 };
 
 // the draws of F in order into CB, each timed by CLOCK when there is one; a refusal is counted and the first kept
@@ -479,13 +488,33 @@ void recordDraws(hakios_metal_cb* cb, Frame& f, Result& res, Clock* timed) {
     hakios_metal_render_pass pass = f.pass;
     // (-hakiosDrawOnce: tells the command buffer the vertex stage's textures at an encoder's first draw and when they change)
     hakios_metal_cb_set_vertex_textures(cb, nullptr, 0, nullptr, 0);
+    size_t passAt = 0, passEnd = f.passDraws.empty() ? SIZE_MAX : f.passDraws[0];
+    unsigned W = 750, H = 1624;
+    if (!f.passDraws.empty()) {
+        pass = f.passes[0];
+        W = f.passSize[0].first, H = f.passSize[0].second;
+    }
     for (size_t i = 0; i < f.order.size(); i++) {
         Layer& l = f.layers[f.order[i]];
         if (f.drawsAPass != 0 && i % f.drawsAPass == 0) pass = f.passes[(i / f.drawsAPass) % f.passes.size()];
-        hakios_metal_viewport vp{0, 0, 750, 1624, 0, 1};
+        if (i == passEnd && passAt + 1 < f.passDraws.size()) {
+            passAt++;
+            passEnd += f.passDraws[passAt];
+            pass = f.passes[passAt];
+            W = f.passSize[passAt].first, H = f.passSize[passAt].second;
+        }
+        hakios_metal_viewport vp{0, 0, double(W), double(H), 0, 1};
         hakios_metal_scissor sc{};
-        const bool scissored = i % 3 != 0;   // (most of a compositor's layers are clipped to their bounds)
-        if (scissored) sc = hakios_metal_scissor{unsigned(30 + 180 * (i % 4)), unsigned(60 + 200 * ((i / 4) % 7)), 120, 120};
+        // (most of a compositor's layers are clipped to their bounds; in the panel's frame, X and Y, the scissor
+        // changes at one draw in six, 26 of 169 in the trace)
+        const bool scissored = f.passDraws.empty() ? i % 3 != 0 : i % 6 == 5;
+        if (scissored && W == 750 && H == 1624) {
+            sc = hakios_metal_scissor{unsigned(30 + 180 * (i % 4)), unsigned(60 + 200 * ((i / 4) % 7)), 120, 120};
+        } else if (scissored) {
+            // (a quarter of a smaller target, in one of its four columns and rows)
+            const unsigned w = std::max(1u, W / 4), h = std::max(1u, H / 4);
+            sc = hakios_metal_scissor{w * unsigned(i % 4), h * unsigned((i / 4) % 4), w, h};
+        }
         // what the encoder has bound by now: each uniform buffer further along its ring, the layer's own texture
         uint64_t vso[31], fso[31];
         for (unsigned k = 0; k < l.vsCount; k++) vso[k] = l.vsOffsets[k] + (l.vsUniform[k] ? 8ull * (1 + 2 * (i % 512)) : 0);
@@ -854,7 +883,7 @@ void eachLayer(CRig& r, Common& c, Frame& f) {
 }
 
 void runStageScenes() {
-    if (asked.stages.empty() || !(wanted("S") || wanted("T") || wanted("U"))) return;
+    if (asked.stages.empty() || !(wanted("S") || wanted("T") || wanted("U") || wanted("X") || wanted("Y"))) return;
     std::vector<std::unique_ptr<LoadedStage>> vss, fss;
     {
         std::vector<std::string> files;
@@ -893,12 +922,12 @@ void runStageScenes() {
         }
         return;
     }
-    for (const char* letter : {"S", "T", "U"}) {
+    for (const char* letter : {"S", "T", "U", "X", "Y"}) {
         if (!wanted(letter)) continue;
         CRig r;
         Common c(r);
         Frame f;
-        f.gmem = letter[0] != 'T';
+        f.gmem = letter[0] != 'T' && letter[0] != 'Y';
         f.pass = c.mainPass(true);
         f.index = c.index;
         f.icons = c.icons;
@@ -916,6 +945,40 @@ void runStageScenes() {
             }
             f.passes = {own[0], own[1], c.mainPass(true), own[2], c.mainPass(true)};
             f.drawsAPass = 22;
+        }
+        if (letter[0] == 'X' || letter[0] == 'Y') {
+            // the passes of the panel's main command buffer (panel-base1/abre-2, cb 8): each target's size, its load
+            // action (Clear or Load) and its draws; every pass with the memoryless second attachment (DontCare, Store).
+            // The screen is one texture drawn into four times; the others are surfaces of their own, as many as there
+            // are sizes (CoreAnimation's are a pool, reused within the frame).
+            struct P { unsigned w, h; bool clear; uint32_t draws; };
+            const P ps[] = {{752, 1626, true, 35}, {750, 1624, false, 72}, {169, 68, true, 7}, {62, 37, true, 3},  {64, 39, true, 3},
+                            {169, 68, true, 1},    {750, 1624, false, 10}, {377, 814, false, 3}, {191, 410, true, 2}, {193, 412, true, 2},
+                            {377, 814, false, 1},  {750, 1624, false, 2},  {95, 5, true, 3},    {100, 6, true, 1},   {41, 21, true, 2},
+                            {43, 23, true, 2},     {95, 5, true, 1},       {750, 1624, false, 19}};
+            std::map<std::pair<unsigned, unsigned>, std::pair<hakios_metal_texture*, hakios_metal_texture*>> surfaces;
+            for (const P& p : ps) {
+                hakios_metal_render_pass rp{};
+                if (p.w == 750 && p.h == 1624) {
+                    rp = c.mainPass(true);
+                } else {
+                    auto& s = surfaces[{p.w, p.h}];
+                    if (s.first == nullptr) {
+                        s.first = hakios_metal_texture_new(r.device, k2D, kBGRA8, p.w, p.h, kUsageRead | kUsageTarget);
+                        s.second = hakios_metal_texture_new(r.device, k2D, kBGRA8, p.w, p.h, kUsageRead | kUsageTarget);
+                        hakios_metal_texture_set_memoryless(s.second, asked.memoryless ? 1 : 0);
+                    }
+                    rp.color0 = s.first;
+                    rp.store_action = 1;
+                    rp.more[0].texture = s.second;
+                    rp.more[0].load_action = 0;
+                    rp.more[0].store_action = 1;
+                }
+                rp.load_action = p.clear ? 2 : 1;
+                f.passes.push_back(rp);
+                f.passDraws.push_back(p.draws);
+                f.passSize.push_back({p.w, p.h});
+            }
         }
         // every fragment stage with the first vertex stage it links with -- the one of its own family first, by the
         // names' common beginning (variable_blur_frag_lph with variable_blur_vert_lph) -- bound as its tables ask
@@ -957,6 +1020,8 @@ void runStageScenes() {
                     l.indexed = true;
                     l.vs[vertexAt] = c.vertices;
                     l.vsCount = vertexAt + 1;
+                    // (CoreAnimation's vertices lie in its ring of constants, further along at each draw)
+                    l.vsUniform[vertexAt] = letter[0] == 'X' || letter[0] == 'Y';
                 }
                 // each stage's constant buffers: the pushed ranges' blocks and the UBOs an ldc reads, from the uniforms'
                 // buffer at a place of their own, moved a draw
@@ -1021,14 +1086,46 @@ void runStageScenes() {
                 return;
             }
             f.order.clear();
+            if (!f.passDraws.empty()) {
+                // the uber shader's pipelines (fixed_frag_lph_cph's variants) and the blur's, as the trace has them: in
+                // a pass of many draws three or four pipelines in turn, one draw each, now and then a run of three and
+                // another pipeline of the frame's thirty-odd; in the small passes the blur's programs between them
+                std::vector<uint32_t> uber, blur;
+                for (uint32_t i : taken) {
+                    const std::string& n = f.layers[i].name;
+                    if (n.find("fixed_frag_lph_cph") != std::string::npos) uber.push_back(i);
+                    else if (n.find("downsample") != std::string::npos || n.find("narrow_blur") != std::string::npos) blur.push_back(i);
+                }
+                if (uber.size() > 32) uber.resize(32);
+                if (uber.empty()) uber = taken;
+                if (blur.empty()) blur = taken;
+                uint32_t rare = 0;
+                for (size_t p = 0; p < f.passDraws.size(); p++) {
+                    const uint32_t n = f.passDraws[p];
+                    for (uint32_t k = 0; k < n; k++) {
+                        if (n < 7) {
+                            f.order.push_back(k % 2 == 0 ? blur[(p + k) % blur.size()] : uber[0]);
+                        } else if (k % 11 == 10) {
+                            f.order.push_back(uber[(4 + rare++) % uber.size()]);
+                        } else if (k % 11 == 5 || k % 11 == 6) {
+                            f.order.push_back(uber[(p + 3) % uber.size()]);   // (a run of three with the draw before)
+                        } else {
+                            f.order.push_back(uber[(p + k % 3) % uber.size()]);
+                        }
+                    }
+                }
+            } else {
             // 110 draws: a program stays for 1 to 4 draws, then the next one of the cache
             for (uint32_t i = 0, at = 0; f.order.size() < 110; i++, at++) {
                 for (uint32_t run = 0; run < 1 + i % 4 && f.order.size() < 110; run++) f.order.push_back(taken[at % taken.size()]);
             }
+            }
             char name[200];
             snprintf(name, sizeof name, "C interface: %zu programs of the phone's stage cache (%zu drawn), %s, %s", f.layers.size(), taken.size(),
-                     f.drawsAPass != 0 ? "110 draws in five passes of 22 (three surfaces and the screen twice)" : "a main pass of 110 draws, two attachments",
-                     f.drawsAPass != 0 ? "sysmem once the queue knows them" : f.gmem ? "GMEM binned" : "sysmem");
+                     !f.passDraws.empty() ? "CoreAnimation's panel frame: 169 draws in 18 passes, the pipeline changing at almost every draw"
+                     : f.drawsAPass != 0  ? "110 draws in five passes of 22 (three surfaces and the screen twice)"
+                                          : "a main pass of 110 draws, two attachments",
+                     !f.passDraws.empty() ? (f.gmem ? "as the plug-in records" : "sysmem") : f.drawsAPass != 0 ? "sysmem once the queue knows them" : f.gmem ? "GMEM binned" : "sysmem");
             runFrames(r, f, letter, name);
         }
     }
