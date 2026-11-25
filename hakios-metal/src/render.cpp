@@ -3388,8 +3388,10 @@ struct KeptSeg {
 // is what emitFast compares the next group's words with, register by register, instead of asking the shadow.
 // BY_REG gets the same segments in the order of their registers (a plain group's do not overlap).
 bool packetsOf(const uint32_t* w, uint32_t n, std::vector<KeptSeg>* segs, std::vector<KeptSeg>* byReg) {
+    // (no register written twice is no two packets' runs overlapping once they are in the order of their registers --
+    // a packet's own run has each register once -- which the sorted segments say without a bitmap of every register,
+    // 8 KiB zeroed for each group a pass made)
     bool plain = n <= 0xffff;
-    uint64_t seen[1024] = {};   // a bit a register (16 bits of them)
     const size_t from = segs->size();
     segs->reserve(from + 32);
     for (uint32_t i = 0; plain && i < n;) {
@@ -3399,10 +3401,8 @@ bool packetsOf(const uint32_t* w, uint32_t n, std::vector<KeptSeg>* segs, std::v
             break;
         }
         segs->push_back(KeptSeg{h.reg, uint16_t(h.count), uint16_t(i + 1)});
-        for (uint32_t k = 0; plain && k < h.count; k++) {
-            const uint32_t r = h.reg + k;
-            if (r > 0xffff || r == REG_A6XX_HLSQ_INVALIDATE_CMD || ((seen[r >> 6] >> (r & 63)) & 1)) plain = false;
-            else seen[r >> 6] |= 1ull << (r & 63);
+        if (h.count != 0 && (h.reg + h.count - 1 > 0xffff || (h.reg <= REG_A6XX_HLSQ_INVALIDATE_CMD && REG_A6XX_HLSQ_INVALIDATE_CMD < h.reg + h.count))) {
+            plain = false;
         }
         i += 1 + h.count;
     }
@@ -3410,6 +3410,17 @@ bool packetsOf(const uint32_t* w, uint32_t n, std::vector<KeptSeg>* segs, std::v
     byReg->resize(from);
     byReg->insert(byReg->end(), segs->begin() + from, segs->end());
     std::sort(byReg->begin() + from, byReg->end(), [](const KeptSeg& a, const KeptSeg& b) { return a.reg < b.reg; });
+    uint32_t end = 0;   // (past the last register of the runs so far; a run of none overlaps nothing)
+    for (size_t k = from; plain && k < byReg->size(); k++) {
+        const KeptSeg& x = (*byReg)[k];
+        if (x.count == 0) continue;
+        if (x.reg < end) plain = false;
+        end = x.reg + x.count;
+    }
+    if (!plain) {
+        segs->resize(from);
+        byReg->resize(from);
+    }
     return plain;
 }
 
