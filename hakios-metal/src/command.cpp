@@ -770,7 +770,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
     cb->stream_.waitForIdle();
-    const std::vector<uint32_t>& w = cb->stream_.words();
+    const auto& w = cb->stream_.words();
     int error = 0;
     cb->commands_ = takeCommandBo(4 * w.size(), &error);
     if (cb->commands_ == nullptr) {

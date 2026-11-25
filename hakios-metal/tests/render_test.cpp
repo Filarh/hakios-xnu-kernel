@@ -6320,7 +6320,7 @@ TEST(a_visibility_stream_overflow_turns_the_binning_off) {
         render::GmemPlan plan;
         CHECK(render::gmemPlan(a, &plan, nullptr));
         render::encodeGmem(tiles, a, plan, v->gpuAddress(), 1, v->gpuAddress(), o, 1, 1, false, 0, nullptr, v->gpuAddress());
-        const std::vector<uint32_t>& w = tiles.words();
+        const auto& w = tiles.words();
         uint32_t compares = 0;
         for (size_t i = 0; i < w.size();) {
             const pm4::Header h = pm4::decode(w[i]);

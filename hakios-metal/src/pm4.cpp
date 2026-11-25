@@ -50,7 +50,7 @@ bool Stream::nopPacket(size_t at, uint32_t opcodeA, uint32_t opcodeB) {
 
 bool Stream::patch(size_t at, const uint32_t* words, size_t n) {
     if (at > words_.size() || n > words_.size() - at) return false;
-    std::copy(words, words + n, words_.begin() + long(at));
+    std::copy(words, words + n, words_.begin() + at);
     return true;
 }
 
@@ -59,21 +59,9 @@ void Stream::command(uint32_t opcode, uint32_t count) {
     words_.push_back(type7(opcode, count));
 }
 
-void Stream::registers(uint32_t reg, const uint32_t* values, uint32_t count) {
-    // more than a header can count goes as several packets, each starting where the one before stopped
-    while (count > 0) {
-        uint32_t n = count < kMaxType4Count ? count : kMaxType4Count;
-        words_.push_back(type4(reg, n));
-        words_.insert(words_.end(), values, values + n);
-        reg += n;
-        values += n;
-        count -= n;
-    }
-}
-
 void Stream::nop(uint32_t words) {
     command(kNop, words);
-    words_.insert(words_.end(), words, 0u);
+    std::fill_n(words_.extend(words), words, 0u);
 }
 
 void Stream::waitForIdle() { command(kWaitForIdle, 0); }
@@ -85,7 +73,7 @@ void Stream::memWrite(uint64_t a, const uint32_t* values, uint32_t count) {
         uint32_t n = count < kMaxType7Count - 2 ? count : kMaxType7Count - 2;
         command(kMemWrite, 2 + n);
         address(a);
-        words_.insert(words_.end(), values, values + n);
+        words_.append(values, n);
         a += 4ull * n;
         values += n;
         count -= n;
@@ -105,16 +93,11 @@ void Stream::indirect(uint64_t a, uint32_t words) {
     words_.push_back(words);
 }
 
-void Stream::packet(uint32_t opcode, const uint32_t* words, uint32_t count) {
-    command(opcode, count);
-    words_.insert(words_.end(), words, words + count);
-}
-
 uint32_t* Stream::open(uint32_t opcode, uint32_t count) {
     command(opcode, count);
-    const size_t at = words_.size();
-    words_.resize(at + count);
-    return words_.data() + at;
+    uint32_t* at = words_.extend(count);
+    std::fill_n(at, count, 0u);
+    return at;
 }
 
 }  // namespace hakios::metal::pm4

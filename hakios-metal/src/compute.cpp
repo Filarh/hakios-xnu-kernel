@@ -661,7 +661,7 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
         return refuseWork(why);
     }
     counts_.dispatches++;
-    const std::vector<uint32_t>& w = added.words();
+    const auto& w = added.words();
     closePass();   // a dispatch reads what the draws before it wrote: their pass's tail first
     stampStart(kPassDispatch, groups ? groups[0] : 0, groups ? groups[1] : 0);
     stream_.packet(pm4::kNop, nullptr, 0);   // (a marker between encoders in the stream, for whoever reads it back)

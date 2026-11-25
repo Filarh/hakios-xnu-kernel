@@ -431,7 +431,7 @@ TEST(the_groups_of_a_draw_write_registers_of_their_own) {
             }
             const char* name = g < 0 ? "(the depth buffer)" : groups[g].name;
             std::set<uint32_t> mine;
-            const std::vector<uint32_t>& w = s.words();
+            const auto& w = s.words();
             for (size_t i = 0; i < w.size();) {
                 const pm4::Header h = pm4::decode(w[i]);
                 for (uint32_t k = 0; h.kind == pm4::Header::kRegisters && k < h.count; k++) mine.insert(h.reg + k);

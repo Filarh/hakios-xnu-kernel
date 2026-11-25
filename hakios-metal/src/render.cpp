@@ -4387,8 +4387,8 @@ std::string verifyDraw(const pm4::Stream& to, size_t mark, CommandBuffer::RegSha
     long_.packet(pm4::kNop, nullptr, 0);
     DedupSink sink(long_, shadow);
     emitDraw(sink, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, table, o, gmem, afterFetch, kGAll & ~without);
-    const std::vector<uint32_t>& a = to.words();
-    const std::vector<uint32_t>& b = long_.words();
+    const auto& a = to.words();
+    const auto& b = long_.words();
     if (a.size() - mark != b.size()) return n(a.size() - mark) + " words, " + n(b.size()) + " the long way";
     for (size_t i = 0; i < b.size(); i++) {
         if (a[mark + i] != b[i]) {
@@ -4421,7 +4421,7 @@ std::atomic<uint64_t> gProgramUids{0};
 // the stream back). The words as they are: a pm4::Stream's packets are whole and no longer than a header counts, so
 // taking each apart and making it again, as this did, came to the same words one packet at a time.
 void appendStream(pm4::Stream& to, const pm4::Stream& from) {
-    const std::vector<uint32_t>& w = from.words();
+    const auto& w = from.words();
     to.packet(pm4::kNop, nullptr, 0);
     to.append(w.data(), w.size());
 }
@@ -4435,7 +4435,7 @@ void appendStream(pm4::Stream& to, const pm4::Stream& from) {
 bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegShadow& regs) {
     bool forgot = false;
     using namespace a6xx;
-    const std::vector<uint32_t>& w = from.words();
+    const auto& w = from.words();
     to.packet(pm4::kNop, nullptr, 0);
     for (size_t i = 0; i < w.size();) {
         pm4::Header h = pm4::decode(w[i]);
@@ -5529,7 +5529,7 @@ bool CommandBuffer::hsrCloseSegment() {
     OpenPass& o = *open_;
     o.hsrSegment = false;
     if (o.hsrStarts.empty() || hsrTwin_ == 1) return true;   // (no opaque draw: the hole stays a NOP)
-    const std::vector<uint32_t>& w = o.hsrPrepass.words();
+    const auto& w = o.hsrPrepass.words();
     // (a buffer of its own from the queue's pool, not a piece of the slab: the draws' tables are cut where they would be
     // without HSR, and a prepass of a few dozen whole draws would take a fair share of a slab)
     std::string why;
@@ -5659,7 +5659,7 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
     if (open_->gmem && open_->bodies.size() != 0) {
         Piece ib;
         std::string why;
-        const std::vector<uint32_t>& w = open_->bodies.words();
+        const auto& w = open_->bodies.words();
         // A binned pass's draws as draw-state groups (gmem.hpp): a tile then runs the state of the draws its visibility
         // streams let through and of no other, and leaves the draws' buffer after the last of them. The draws were
         // recorded as a plain stream, which is what a pass that is not binned still runs, every draw in every tile --
@@ -5697,7 +5697,7 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
             const uint32_t movedMask =
                 touched != attached && touched != 0 && !(gmemOff_ & (kGmemOldTiles | kGmemEveryBin)) ? render::gmemTouched(&plan, touched, W, H) : 0;
             if (movedMask != 0 && open_->options.gmemTwin != 6) {   // (the twin: those registers left as recorded)
-                moved = w;
+                moved.assign(w.begin(), w.end());
                 for (size_t i = 0; i < moved.size();) {
                     const pm4::Header h = pm4::decode(moved[i]);
                     for (uint32_t k = 0; h.kind == pm4::Header::kRegisters && k < h.count; k++) {
@@ -5711,14 +5711,15 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
                 }
             }
         }
-        const std::vector<uint32_t>& body = moved.empty() ? w : moved;
+        const uint32_t* const recorded = moved.empty() ? w.data() : moved.data();
+        const size_t recordedCount = moved.empty() ? w.size() : moved.size();
         // (binned when the queue's streams have not overrun and the plan's pipes can name their bins)
         uint32_t perPipeX = 1, perPipeY = 1;
         const bool binned = (open_->options.gmemBinning || gmemBinning_) && queue_.binningOk() && render::gmemPipes(plan, &perPipeX, &perPipeY);
         render::DrawStates& groups = drawCache_->groups;
         const uint32_t fetchBy = gmemOff_ & kGmemAllOrdered ? render::kDsFetchOrdered : gmemOff_ & kGmemInlineBarriers ? render::kDsFetchInline : render::kDsFetchGroup;
         const bool grouped = binned && !(gmemOff_ & kGmemPlainBody) &&
-                             render::drawStates(body.data(), body.size(), a6xx::CP_SET_DRAW_STATE__0_BINNING | a6xx::CP_SET_DRAW_STATE__0_GMEM, &groups,
+                             render::drawStates(recorded, recordedCount, a6xx::CP_SET_DRAW_STATE__0_BINNING | a6xx::CP_SET_DRAW_STATE__0_GMEM, &groups,
                                                 open_->options.gmemTwin, fetchBy);
         const size_t ibWords = grouped ? groups.blobs.size() + groups.list.size() : w.size();
         if (!piece(4 * ibWords, &ib, &why)) {
@@ -5737,7 +5738,7 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
             bodyAt = ib.gpuAddress() + 4 * groups.blobs.size();
             bodyWords = uint32_t(groups.list.size());
         } else {
-            std::memcpy(ib.contents(), body.data(), 4 * body.size());
+            std::memcpy(ib.contents(), recorded, 4 * recordedCount);
         }
         // The tiles over the render area alone, and of the attachments only those the draws touch: one they neither
         // write nor read keeps its memory as it is (what is loaded and stored of the others: loadStore, above).

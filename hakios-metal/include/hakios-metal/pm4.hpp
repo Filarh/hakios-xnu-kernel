@@ -13,6 +13,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <vector>
 
 namespace hakios::metal::pm4 {
@@ -60,10 +64,99 @@ struct Header {
 
 Header decode(uint32_t word);
 
+// A stream's words: a growable array of them, as a std::vector<uint32_t> would hold them, read through the same
+// calls (size, data, operator[], begin/end, a copy into a std::vector). Its own so that a packet's few words are
+// written in place, inline -- a vector's push_back and insert were each a call, and the insert a memmove, for the
+// 1 to 7 words most of a draw's packets have.
+class Words {
+public:
+    Words() = default;
+    Words(const Words& o) { *this = o; }
+    Words(Words&& o) noexcept : p_(o.p_), n_(o.n_), cap_(o.cap_) { o.p_ = nullptr, o.n_ = o.cap_ = 0; }
+    Words& operator=(const Words& o) {
+        if (this != &o) {
+            n_ = 0;
+            append(o.p_, o.n_);
+        }
+        return *this;
+    }
+    Words& operator=(Words&& o) noexcept {
+        if (this != &o) {
+            std::free(p_);
+            p_ = o.p_, n_ = o.n_, cap_ = o.cap_;
+            o.p_ = nullptr, o.n_ = o.cap_ = 0;
+        }
+        return *this;
+    }
+    ~Words() { std::free(p_); }
+
+    size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    size_t capacity() const { return cap_; }
+    const uint32_t* data() const { return p_; }
+    uint32_t* data() { return p_; }
+    const uint32_t* begin() const { return p_; }
+    const uint32_t* end() const { return p_ + n_; }
+    uint32_t* begin() { return p_; }
+    uint32_t* end() { return p_ + n_; }
+    const uint32_t& operator[](size_t i) const { return p_[i]; }
+    uint32_t& operator[](size_t i) { return p_[i]; }
+    const uint32_t& back() const { return p_[n_ - 1]; }
+    // (a copy: for the tests, which hold a stream's words as a vector; the driver reads them where they are -- built
+    // with this explicit, nothing of src/ converts)
+    operator std::vector<uint32_t>() const { return std::vector<uint32_t>(p_, p_ + n_); }
+    bool operator==(const std::vector<uint32_t>& v) const { return v.size() == n_ && std::equal(v.begin(), v.end(), p_); }
+    bool operator!=(const std::vector<uint32_t>& v) const { return !(*this == v); }
+
+    void clear() { n_ = 0; }
+    void reserve(size_t n) {
+        if (n > cap_) regrow(n);
+    }
+    // (new words zero, as a vector's resize makes them)
+    void resize(size_t n) {
+        reserve(n);
+        if (n > n_) std::fill(p_ + n_, p_ + n, 0u);
+        n_ = n;
+    }
+    // N more words at the end, for the caller to write: grown as a vector grows (twice, or what is asked if more)
+    uint32_t* extend(size_t n) {
+        if (cap_ - n_ < n) regrow(std::max(cap_ * 2, n_ + n));
+        uint32_t* at = p_ + n_;
+        n_ += n;
+        return at;
+    }
+    void push_back(uint32_t w) { *extend(1) = w; }
+    void append(const uint32_t* w, size_t n) {
+        if (n == 0) return;
+        std::memcpy(extend(n), w, 4 * n);
+    }
+
+private:
+    void regrow(size_t cap) {
+        uint32_t* p = static_cast<uint32_t*>(std::realloc(p_, 4 * cap));
+        if (p == nullptr) throw std::bad_alloc();
+        p_ = p;
+        cap_ = cap;
+    }
+    uint32_t* p_ = nullptr;
+    size_t n_ = 0, cap_ = 0;
+};
+
 // A stream of packets being written. Addresses are the GPU's (the IOVA of a buffer plus an offset).
 class Stream {
 public:
-    void registers(uint32_t reg, const uint32_t* values, uint32_t count);
+    void registers(uint32_t reg, const uint32_t* values, uint32_t count) {
+        // (more than a header can count goes as several packets, each starting where the one before stopped)
+        while (count > 0) {
+            const uint32_t n = count < kMaxType4Count ? count : kMaxType4Count;
+            uint32_t* at = words_.extend(1 + n);
+            at[0] = type4(reg, n);
+            for (uint32_t i = 0; i < n; i++) at[1 + i] = values[i];
+            reg += n;
+            values += n;
+            count -= n;
+        }
+    }
     void nop(uint32_t words = 0);
     void waitForIdle();
     void waitMemWrites();
@@ -72,16 +165,20 @@ public:
     void memcpy(uint64_t destination, uint64_t source, uint32_t words);
     void indirect(uint64_t address, uint32_t words);
     // any type-7 packet: OPCODE with WORDS after its header (the compute dispatch's packets, compute.cpp)
-    void packet(uint32_t opcode, const uint32_t* words, uint32_t count);
+    void packet(uint32_t opcode, const uint32_t* words, uint32_t count) {
+        uint32_t* at = words_.extend(1 + size_t(count));
+        at[0] = type7(opcode, count);
+        for (uint32_t i = 0; i < count; i++) at[1 + i] = words[i];
+    }
     // ...whose COUNT words the caller writes itself, where they lie in the stream (zeros until then): the pointer holds
     // until the next packet. A load of constants is its three words and then the constants, with no copy made to join them.
     uint32_t* open(uint32_t opcode, uint32_t count);
     // room for WORDS more, taken at once (a command buffer's stream grows to what the last one's was)
     void reserve(size_t words) { words_.reserve(words_.size() + words); }
     // whole packets already encoded (a program's loads, kept from the last draw with it), as they are
-    void append(const uint32_t* words, size_t count) { words_.insert(words_.end(), words, words + count); }
+    void append(const uint32_t* words, size_t count) { words_.append(words, count); }
 
-    const std::vector<uint32_t>& words() const { return words_; }
+    const Words& words() const { return words_; }
     size_t size() const { return words_.size(); }
     // the header of the last type-7 packet with OPCODE_A or OPCODE_B among the whole packets from FROM on (FROM a
     // header), or SIZE_MAX; and that packet made a CP_NOP of the same length, so the CP skips its words (false if the word
@@ -97,10 +194,11 @@ public:
 private:
     void command(uint32_t opcode, uint32_t count);
     void address(uint64_t a) {
-        words_.push_back(uint32_t(a));
-        words_.push_back(uint32_t(a >> 32));
+        uint32_t* at = words_.extend(2);
+        at[0] = uint32_t(a);
+        at[1] = uint32_t(a >> 32);
     }
-    std::vector<uint32_t> words_;
+    Words words_;
 };
 
 }  // namespace hakios::metal::pm4
