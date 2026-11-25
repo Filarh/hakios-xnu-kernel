@@ -5113,7 +5113,10 @@ hm_compress_ok(void)
  * it is compiled again with the slot's matrix after each sample (hakios_metal_program_specialize_ycbcr), on the
  * pipeline's compiling queue; until that program is there -- and wherever the surface cannot go (a vertex stage, a
  * compute kernel, an argument buffer, a blit, a view of the texture, a pipeline whose fragment function is not kept,
- * a slot past 16) -- the draw samples the RGBA8 copy, made and refreshed as before. Off by default.
+ * a slot past 16) -- the draw samples the RGBA8 copy, made and refreshed as before. On by default: without it the
+ * window server converts every frame of a 1080p video on this processor (89-90 % of a core, about 19 of 30 frames a
+ * second shown in Safari) and with it shows all of them at 10 % (lab 03 V12, n = 3); ycbcrcheck 0 failures (n = 3).
+ * metal_ycbcrgpu=0 turns it off.
  */
 static BOOL
 hm_ycbcr_gpu(void)
@@ -5124,8 +5127,9 @@ hm_ycbcr_gpu(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_ycbcrgpu=1") != NULL;
-		if (on) hm_print("metal_ycbcrgpu=1: two-plane YCbCr surfaces (500, 540) are sampled by the GPU from the surface\n");
+		on = !(hm_bootargs(args, &size) == 0 && strstr(args, "metal_ycbcrgpu=0") != NULL);
+		hm_print(on ? "two-plane YCbCr surfaces (500, 540) are sampled by the GPU from the surface (metal_ycbcrgpu=0: off)\n"
+		            : "metal_ycbcrgpu=0: two-plane YCbCr surfaces are sampled through an RGBA8 copy\n");
 	}
 	return on != 0;
 }
@@ -5182,7 +5186,7 @@ hm_ycbcr_direct(hakios_metal_device *gpu, IOSurfaceRef surface, MTLPixelFormat f
 		CFRelease(m);
 	}
 	if (!hm_ycbcr_gpu()) {
-		snprintf(why, sizeof(why), "metal_ycbcrgpu is off");
+		snprintf(why, sizeof(why), "metal_ycbcrgpu=0");
 	} else if (base == 0 || chroma < base) {
 		snprintf(why, sizeof(why), "no address for its planes");
 	} else {
