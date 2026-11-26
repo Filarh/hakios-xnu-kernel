@@ -613,11 +613,14 @@ void hakios_metal_kept_heads(int keep);
 /* of CB's passes, those whose head was taken so (CommandBuffer::Counts::keptHeads) */
 unsigned hakios_metal_cb_kept_heads(hakios_metal_cb *cb);
 /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
- * has completed, draw I's program name (valid while CB lives) and microseconds; the count is returned, -1 past them */
+ * has completed, draw I's program name (valid while CB lives) and microseconds -- -1 for a draw of a pass recorded both
+ * ways that went to tiles, whose stamps never ran; the count is returned, -1 past them */
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb *cb, int on);
 int hakios_metal_cb_draw_time(hakios_metal_cb *cb, unsigned i, const char **name, double *us);
 /* draw I's pass (an index of hakios_metal_cb_pass_time's) and the pixels it can touch, X0 Y0 X1 Y1; -1 past them */
 int hakios_metal_cb_draw_place(hakios_metal_cb *cb, unsigned i, unsigned *pass, unsigned area[4]);
+/* ...and its ORDINAL among all of CB's draws (the draws hakios_metal_cb_counts counted before it): -1 past them */
+int hakios_metal_cb_draw_order(hakios_metal_cb *cb, unsigned i, unsigned *ordinal);
 void hakios_metal_cb_gmem_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *tiles);
 /* pass I's colour attachments as a mask, and those its draws wrote or read (a GMEM pass's; 0 for a sysmem one): -1 past the passes */
 int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *attached, unsigned *touched);

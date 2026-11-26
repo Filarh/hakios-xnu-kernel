@@ -249,6 +249,7 @@ a_draw_blends_as_the_pipeline_says submits 2 words 1338 draws 2 loads 4 stream 7
 a_command_buffer_counts_its_passes_and_draws submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_profiled_command_buffer_lists_its_passes submits 1 words 1042 draws 2 loads 4 stream b7f6b4897dbe2749 state b2db15d81d80c4dd names 6 65d559327f46117b
 a_profiled_command_buffer_counts_each_passes_samples submits 2 words 3506 draws 6 loads 12 stream 65885db083cbc4d1 state 54e81470edcf5a2d names 13 2d437e105060f692
+a_draw_timed_alone_has_its_time_pass_and_place submits 4 words 3760 draws 10 loads 20 stream 6da1775d59bac5a1 state 12bc3357a14e6a3d names 25 06cfb9c9f789c35e
        a draw then the same draw: 565 and 322 words written in full, 551 and 23 deduplicated
 a_draw_in_an_open_pass_leaves_out_registers_already_holding_their_values submits 2 words 1517 draws 4 loads 8 stream 9f26004ef0651a61 state 1b6f8d91e4c1b5b5 names 8 05d20adef5c3adcc
        a draw with its pass start and end: 588 words, 519 of them register writes; opcode 100 2; opcode 101 2; opcode 20 5; opcode 29 2; opcode 38 3; opcode 50 12; opcode 52 4; opcode 56 4; opcode 60 7; opcode 67 4; opcode 70 20; opcode 99 4

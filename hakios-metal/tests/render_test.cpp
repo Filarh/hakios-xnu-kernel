@@ -3061,6 +3061,62 @@ TEST(a_profiled_command_buffer_counts_each_passes_samples) {
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
+// Each draw timed alone (setProfileDraws, the plug-in's metal_drawts and metal_fps=draws): a sysmem pass's draws get a
+// time, their pass and their place among the buffer's draws; a pass recorded both ways (setGmemMinDraws) is stamped on
+// its sysmem side -- timed when it ends in sysmem (1 draw under a minimum of 2), -1 when it went to tiles (3 draws), its
+// stamps never run, and not timed once it is recorded for tiles alone -- and the buffer still completes. Without the switch the stream is the one it always was: shorter
+// by the two waits and two copies of each draw.
+TEST(a_draw_timed_alone_has_its_time_pass_and_place) {
+    Rig r;
+    auto t = target(r), u = target(r);
+    RenderPass a, b;
+    a.color0 = t.get();
+    b.color0 = u.get();
+    uint64_t words[2] = {};
+    for (int timed = 0; timed < 2; timed++) {
+        const uint64_t before = r.fake->stats().cpWords;
+        auto cb = r.queue->commandBuffer();
+        cb->setGmem(false);   // (sysmem: a tiled pass's draws are not timed)
+        cb->setProfile(true);
+        cb->setProfileDraws(timed == 1);
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb->draw(flatProgram(), b, wholeDraw(6), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        words[timed] = r.fake->stats().cpWords - before;
+        const auto d = cb->drawTimes();
+        CHECK_EQ(d.size(), size_t(timed ? 3 : 0));
+        if (d.size() == 3) {
+            for (uint32_t i = 0; i < 3; i++) {
+                CHECK_EQ(d[i].ordinal, i);
+                CHECK(d[i].us > 0);
+            }
+            CHECK(d[0].pass == 0 && d[1].pass == 0 && d[2].pass == 1);
+            CHECK(d[0].area[2] == 63 && d[0].area[3] == 63);
+        }
+    }
+    // (two waits of one word and two copies of four, a draw)
+    CHECK_EQ(words[1] - words[0], uint64_t(3 * 2 * (1 + 4)));
+    for (const auto& [draws, tiled] : {std::pair<int, bool>{1, false}, {3, true}}) {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setProfileDraws(true);
+        cb->setGmemMinDraws(2);
+        for (int i = 0; i < draws; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(6), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(cb->counts().gmemPasses, tiled ? 1u : 0u);
+        const auto d = cb->drawTimes();
+        // (tiled: from the second draw on the pass is sure to be tiled, recorded for tiles alone, and the third not timed)
+        CHECK_EQ(d.size(), size_t(tiled ? 2 : draws));
+        for (const auto& x : d) CHECK(tiled ? x.us == -1.0 : x.us > 0);
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 // (a measurement, not a rule: how many words a draw adds to its pass, and of which packets -- the per-draw cost on the
 // phone is the command processor reading these)
 // A second draw of the same state into the same pass writes only what changed: far fewer words than the first, which

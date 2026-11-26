@@ -390,7 +390,7 @@ void CommandBuffer::stamp(uint32_t slot) {
         keep(profileStamps_);
     }
     const uint64_t at = profileStamps_->gpuAddress() + 8ull * slot;
-    const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(0x0980) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B, uint32_t(at),
+    const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(a6xx::REG_A6XX_CP_ALWAYS_ON_COUNTER) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B, uint32_t(at),
                            uint32_t(at >> 32)};
     stream_.packet(a6xx::CP_REG_TO_MEM, w, 3);
     use(*profileStamps_, true);
@@ -495,7 +495,10 @@ void CommandBuffer::sampleStamp(uint32_t slot) {
     use(*sampleStamps_, true);
 }
 
-void CommandBuffer::drawStamp(uint32_t slot) {
+// (INTO: the stream the draw goes onto in sysmem -- this buffer's own, or a pass recorded both ways' sysmem side. The
+// wait is turnip's for a timestamp past the top of the pipe, tu_CmdWriteTimestamp2: CP_WAIT_FOR_IDLE, then the counter
+// by CP_REG_TO_MEM, which waits for the CP's own work itself.)
+void CommandBuffer::drawStamp(uint32_t slot, pm4::Stream& into) {
     if (drawStamps_ == nullptr) {
         std::string why;
         drawStamps_ = queue_.takeBuffer(16 * kMaxProfiledDraws, &why);
@@ -507,10 +510,10 @@ void CommandBuffer::drawStamp(uint32_t slot) {
         keep(drawStamps_);
     }
     const uint64_t at = drawStamps_->gpuAddress() + 8ull * slot;
-    stream_.waitForIdle();
-    const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(0x0980) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B, uint32_t(at),
+    into.waitForIdle();
+    const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(a6xx::REG_A6XX_CP_ALWAYS_ON_COUNTER) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B, uint32_t(at),
                            uint32_t(at >> 32)};
-    stream_.packet(a6xx::CP_REG_TO_MEM, w, 3);
+    into.packet(a6xx::CP_REG_TO_MEM, w, 3);
     use(*drawStamps_, true);
 }
 
@@ -519,7 +522,10 @@ std::vector<CommandBuffer::DrawTime> CommandBuffer::drawTimes() const {
     if (drawStamps_ == nullptr) return {};
     const auto* t = static_cast<const uint64_t*>(drawStamps_->contents());
     for (size_t i = 0; i < out.size(); i++) {
-        out[i].us = t[2 * i + 1] > t[2 * i] ? double(t[2 * i + 1] - t[2 * i]) / 19.2 : 0.0;
+        // (both stamps still 0, as the buffer was cleared: they never ran -- a pass recorded both ways that went to tiles)
+        out[i].us = t[2 * i] == 0 && t[2 * i + 1] == 0 ? -1.0
+                    : t[2 * i + 1] > t[2 * i]           ? double(t[2 * i + 1] - t[2 * i]) / a6xx::kAlwaysOnTicksPerUs
+                                                        : 0.0;
     }
     return out;
 }
@@ -529,7 +535,7 @@ std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
     if (profileStamps_ == nullptr) return {};
     const auto* t = static_cast<const uint64_t*>(profileStamps_->contents());
     for (size_t i = 0; i < out.size(); i++) {
-        out[i].us = t[2 * i + 1] > t[2 * i] ? double(t[2 * i + 1] - t[2 * i]) / 19.2 : 0.0;
+        out[i].us = t[2 * i + 1] > t[2 * i] ? double(t[2 * i + 1] - t[2 * i]) / a6xx::kAlwaysOnTicksPerUs : 0.0;
     }
     if (sampleStamps_ != nullptr) {
         const auto* c = static_cast<const uint64_t*>(sampleStamps_->contents());
@@ -601,7 +607,7 @@ CommandBuffer::~CommandBuffer() {
 void CommandBuffer::finish(Status s, bool recycle) {
     status_ = s;
     if (s == kCompleted && counts_.binnedPasses != 0) queue_.checkVsc();
-    if (s == kCompleted && tuning_) {
+    if (s == kCompleted && tuning_ && !profileDraws_) {   // (a buffer whose draws were timed: its passes dearer by the waits)
         for (const PassTime& t : passTimes()) {
             if (t.tuneKey != 0) queue_.tuned(t.tuneKey, t.tiles != 0, t.us);
         }

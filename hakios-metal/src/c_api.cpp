@@ -1152,6 +1152,14 @@ int hakios_metal_cb_draw_place(hakios_metal_cb* cb, unsigned i, unsigned* pass, 
     return int(cb->drawTimes.size());
 }
 
+int hakios_metal_cb_draw_order(hakios_metal_cb* cb, unsigned i, unsigned* ordinal) {
+    syncOne(cb);
+    if (cb->drawTimes.empty()) cb->drawTimes = cb->cb->drawTimes();
+    if (i >= cb->drawTimes.size()) return -1;
+    if (ordinal) *ordinal = cb->drawTimes[i].ordinal;
+    return int(cb->drawTimes.size());
+}
+
 int hakios_metal_cb_draw_time(hakios_metal_cb* cb, unsigned i, const char** name, double* us) {
     syncOne(cb);
     if (cb->drawTimes.empty() || i == 0) cb->drawTimes = cb->cb->drawTimes();

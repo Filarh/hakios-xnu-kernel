@@ -2808,7 +2808,7 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 const uint32_t reg = p[0] & CP_REG_TO_MEM_0_REG__MASK;
                 const uint64_t to = p[1] | uint64_t(p[2]) << 32;
                 uint8_t* d = at(to, 8);
-                if (reg != 0x0980 || !(p[0] & CP_REG_TO_MEM_0_64B) || d == nullptr || to % 8 != 0) {
+                if (reg != REG_A6XX_CP_ALWAYS_ON_COUNTER || !(p[0] & CP_REG_TO_MEM_0_64B) || d == nullptr || to % 8 != 0) {
                     fault(text("CP_REG_TO_MEM of register %#x to %#llx: the fake serves CP_ALWAYS_ON_COUNTER, 64-bit, into a buffer", reg, to));
                     return false;
                 }
