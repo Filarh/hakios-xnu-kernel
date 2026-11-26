@@ -859,6 +859,185 @@ TEST(random_frames_are_the_same_from_kept_states_as_written_whole) {
     CHECK(refused * 10 > taken);
 }
 
+namespace {
+// what frames of passes came to: what the fake was given, the state each draw ran with, and how many heads were kept ones
+struct HeadsTold {
+    golden::Sums sums;
+    std::vector<uint64_t> digests;
+    std::vector<uint32_t> keptAFrame, passesAFrame;
+    uint64_t faults = 0;
+    bool completed = true;
+};
+
+// FRAMES frames of a compositor's passes -- small surfaces cleared, the screen loaded, the screen with a depth cleared,
+// two surfaces of one size at two addresses, a pass twice in a frame -- with the heads of the passes before kept
+// (KEEP) or every head read back through the shadow. In frame ODD the first surface is cleared to another colour, a head
+// none before it had, and in the frame after to the first colour again. HSR: the screen's passes with hidden surface
+// removal, whose depth is cleared in the first of them alone.
+HeadsTold headFrames(bool keep, uint32_t frames, uint32_t odd, bool hsr) {
+    HeadsTold out;
+    // (the programs' states kept, whatever the runner is recording by: a head is kept only with them)
+    const bool wasStates = CommandBuffer::keepStates(true);
+    const bool was = CommandBuffer::keepHeads(keep);
+    Chain chain{&out.sums, FakeGpu::submitHook, FakeGpu::submitHookContext};
+    FakeGpu::submitHookContext = &chain;
+    FakeGpu::submitHook = chained;
+    {
+        Rig r;
+        const uint32_t target = kTextureUsageRenderTarget | kTextureUsageRead;
+        auto screen = texture(r, 128, 96, target, PixelFormat::kBGRA8Unorm), second = texture(r, 128, 96, target, PixelFormat::kBGRA8Unorm);
+        auto smallA = texture(r, 32, 16, target, PixelFormat::kBGRA8Unorm), smallB = texture(r, 32, 16, target, PixelFormat::kBGRA8Unorm);
+        auto wide = texture(r, 64, 8, target, PixelFormat::kBGRA8Unorm);
+        auto depth = texture(r, 128, 96, kTextureUsageRenderTarget, PixelFormat::kDepth32Float);
+        const Program flat = linked(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, "flat");
+        Program blended = linked(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, "flat blended");
+        blended.blend.enabled = true;
+        blended.blend.srcRgb = 1, blended.blend.dstRgb = 5;
+        r.fake->logDraws(true);
+        for (uint32_t frame = 0; frame < frames; frame++) {
+            auto cb = r.queue->commandBuffer();
+            cb->setGmem(false);   // (sysmem: a pass's Clears are its head's -- in tiles they are the tiles')
+            cb->setHsr(hsr);
+            cb->setHsrTest(0, CommandBuffer::kHsrMaxDraws, true);
+            auto cleared = [&](const std::shared_ptr<Texture>& t, double red) {
+                RenderPass p;
+                p.color0 = t.get();
+                p.load = LoadAction::kClear;
+                p.clearColor[0] = red, p.clearColor[1] = 0.5, p.clearColor[2] = 0.25, p.clearColor[3] = 1;
+                return p;
+            };
+            auto draws = [&](RenderPass p, uint32_t w, uint32_t h, uint32_t n) {
+                for (uint32_t i = 0; i < n; i++) {
+                    Draw d = quad(w, h);
+                    if (i % 2 == 1) d.scissor = Scissor{1, 1, w / 2, h / 2};
+                    CHECK(cb->draw(i % 3 == 2 ? blended : flat, p, d, Bindings{}, Bindings{}));
+                    p.load = LoadAction::kLoad;   // (a Clear is the pass's first draw's)
+                    if (p.depth != nullptr) p.depthLoad = LoadAction::kLoad;
+                }
+            };
+            RenderPass onScreen;
+            onScreen.color0 = screen.get();
+            onScreen.more[0].texture = second.get();
+            onScreen.more[0].load = LoadAction::kDontCare;
+            onScreen.more[0].store = StoreAction::kDontCare;
+            RenderPass withDepth = onScreen;
+            withDepth.depth = depth.get();
+            withDepth.depthLoad = LoadAction::kClear;
+            withDepth.clearDepth = 1.0;
+            draws(cleared(smallA, frame == odd ? 0.75 : 0.125), 32, 16, 2);
+            draws(cleared(smallB, 0.125), 32, 16, 1);
+            draws(onScreen, 128, 96, 4);
+            draws(cleared(wide, 0.125), 64, 8, 3);
+            draws(withDepth, 128, 96, 2);
+            draws(onScreen, 128, 96, 3);
+            draws(cleared(smallA, 0.125), 32, 16, 1);
+            draws(onScreen, 128, 96, 1);
+            out.keptAFrame.push_back(cb->counts().keptHeads);
+            out.passesAFrame.push_back(cb->counts().passes);
+            wait(r, cb);
+            out.completed = out.completed && cb->status() == CommandBuffer::kCompleted;
+            if (cb->status() != CommandBuffer::kCompleted) std::printf("       frame %u: %s | %s\n", frame, cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        }
+        for (const auto& d : r.fake->stats().drawLog) out.digests.push_back(d.digest);
+        out.faults = r.fake->stats().faults;
+    }
+    FakeGpu::submitHook = chain.next;
+    FakeGpu::submitHookContext = chain.nextContext;
+    CommandBuffer::keepHeads(was);
+    CommandBuffer::keepStates(wasStates);
+    return out;
+}
+}  // namespace
+
+// A pass's head taken from the heads of the passes before is the head read back through the shadow: the same frames
+// recorded both ways give the fake the same submissions word for word and every draw the same state to run with. The
+// first frame's heads are each new or the second of their kind; from the second frame on every pass's head is a kept
+// one -- but the one cleared to a colour no pass before it was, which is read back and kept in its turn.
+TEST(a_passs_head_from_the_heads_before_is_the_head_read_back_through_the_shadow) {
+    for (const bool hsr : {false, true}) {
+        const HeadsTold back = headFrames(false, 5, 3, hsr), kept = headFrames(true, 5, 3, hsr);
+        CHECK(back.completed && kept.completed);
+        CHECK_EQ(back.faults, 0u);
+        CHECK_EQ(kept.faults, 0u);
+        CHECK_EQ(back.sums.submits, kept.sums.submits);
+        CHECK_EQ(back.sums.words, kept.sums.words);
+        CHECK_EQ(back.sums.draws, kept.sums.draws);
+        CHECK_EQ(back.sums.loads, kept.sums.loads);
+        CHECK_EQ(back.sums.stream, kept.sums.stream);
+        CHECK_EQ(back.sums.state, kept.sums.state);
+        CHECK_EQ(back.sums.names, kept.sums.names);
+        CHECK(!back.sums.bad && !kept.sums.bad);
+        CHECK(!kept.digests.empty());
+        CHECK_EQ(back.digests.size(), kept.digests.size());
+        for (size_t i = 0; i < back.digests.size() && i < kept.digests.size(); i++) {
+            if (back.digests[i] == kept.digests[i]) continue;
+            CHECK_EQ(back.digests[i], kept.digests[i]);
+            std::printf("       draw %zu ran with another state\n", i);
+            break;
+        }
+        CHECK_EQ(kept.keptAFrame.size(), 5u);
+        for (size_t f = 0; f < back.keptAFrame.size(); f++) CHECK_EQ(back.keptAFrame[f], 0u);
+        for (size_t f = 1; f < kept.keptAFrame.size(); f++) {
+            // (frame 3's first pass clears to a colour of its own: read back; every other pass from a kept head -- with
+            // HSR from the third frame on, the depth's clock giving the second frame's screen passes heads of their own)
+            const uint32_t fresh = f == 3 ? 1u : 0u;
+            if (hsr && f == 1) {
+                CHECK(kept.keptAFrame[f] + 2 >= kept.passesAFrame[f]);
+                continue;
+            }
+            CHECK_EQ(kept.keptAFrame[f], kept.passesAFrame[f] - fresh);
+            if (kept.keptAFrame[f] != kept.passesAFrame[f] - fresh) {
+                std::printf("       hsr %d frame %zu: %u of %u heads kept ones\n", int(hsr), f, kept.keptAFrame[f], kept.passesAFrame[f]);
+            }
+        }
+        // (the first frame: the screen's second and third passes and the first surface's second have a head seen before;
+        // with HSR the first surface's at least)
+        if (!hsr) CHECK_EQ(kept.keptAFrame[0], 3u);
+        CHECK(kept.keptAFrame[0] >= 1u);
+        CHECK(kept.keptAFrame[0] < kept.passesAFrame[0]);
+    }
+}
+
+// A head is kept by its words, the table's address aside: a pass that differs from a kept one in a word of its head --
+// its size, a clear's colour, the address of what it clears -- is not taken for it.
+TEST(a_head_that_differs_in_a_word_is_not_a_kept_one) {
+    const bool wasStates = CommandBuffer::keepStates(true), wasHeads = CommandBuffer::keepHeads(true);
+    Rig r;
+    const uint32_t target = kTextureUsageRenderTarget | kTextureUsageRead;
+    auto a = texture(r, 32, 16, target, PixelFormat::kBGRA8Unorm), b = texture(r, 32, 16, target, PixelFormat::kBGRA8Unorm);
+    auto c = texture(r, 48, 16, target, PixelFormat::kBGRA8Unorm);
+    const Program flat = linked(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, "flat");
+    auto frame = [&](const std::vector<std::pair<Texture*, double>>& passes, bool clear) {
+        auto cb = r.queue->commandBuffer();
+        cb->setGmem(false);   // (sysmem: a pass's Clear is its head's)
+        for (const auto& [t, red] : passes) {
+            RenderPass p;
+            p.color0 = t;
+            if (clear) {
+                p.load = LoadAction::kClear;
+                p.clearColor[0] = red, p.clearColor[3] = 1;
+            }
+            CHECK(cb->draw(flat, p, quad(t->width(), t->height()), Bindings{}, Bindings{}));
+        }
+        const uint32_t kept = cb->counts().keptHeads;
+        finish(r, cb);
+        return kept;
+    };
+    // cleared: each of the three passes its own head (another address, another size)...
+    CHECK_EQ(frame({{a.get(), 0.5}, {b.get(), 0.5}, {c.get(), 0.5}}, true), 0u);
+    // ...which the next frame's are; another colour is another head, once
+    CHECK_EQ(frame({{a.get(), 0.5}, {b.get(), 0.5}, {c.get(), 0.5}}, true), 3u);
+    CHECK_EQ(frame({{a.get(), 0.25}, {b.get(), 0.5}, {c.get(), 0.5}}, true), 2u);
+    CHECK_EQ(frame({{a.get(), 0.25}, {b.get(), 0.5}, {c.get(), 0.25}}, true), 2u);
+    CHECK_EQ(frame({{a.get(), 0.25}, {b.get(), 0.5}, {c.get(), 0.25}}, true), 3u);
+    // loaded: a head has nothing of its target but the window -- two targets of one size share it, the third has its own
+    CHECK_EQ(frame({{a.get(), 0}, {c.get(), 0}}, false), 0u);
+    CHECK_EQ(frame({{a.get(), 0}, {b.get(), 0}, {c.get(), 0}}, false), 3u);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CommandBuffer::keepHeads(wasHeads);
+    CommandBuffer::keepStates(wasStates);
+}
+
 // A command buffer finds a program's state by the program's uid in a few slots; more programs than slots, drawn in
 // turn, push each other out of them, and each is still drawn as itself (the runner's check against the long way).
 TEST(more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves) {

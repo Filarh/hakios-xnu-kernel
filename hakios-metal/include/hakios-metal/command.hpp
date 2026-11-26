@@ -205,6 +205,8 @@ public:
         uint32_t hsrClears = 0, hsrBusy = 0;   // (HsrClock: the depth cleared as a pass opened; a draw without HSR, the clock another buffer's)
         // ...and of those, the ones whose draw before them in the pass was of the same program, taken the same way
         uint32_t sameProgramDraws = 0;
+        // of the passes, those whose head was taken from the heads of the passes before (render.cpp: HeadCache)
+        uint32_t keptHeads = 0;
     };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -451,10 +453,23 @@ public:
             const bool same = p.stamp[k] == gen_ && p.value[k] == value;
             p.stamp[k] = gen_;
             p.value[k] = value;
+            told_[reg >> (kToldBits + 6)] |= 1ull << ((reg >> kToldBits) & 63);
             return same;
+        }
+        // whether it holds none of the COUNT registers from REG on -- said by the blocks of 64 they lie in: true only
+        // when no register of those blocks has been told to it since it last forgot (false may be said of registers it
+        // does not hold). Nothing is told to it by asking, and none of its pages is read: a bit a block, 512 bytes in all.
+        bool holdsNone(uint32_t reg, uint32_t count) const {
+            if (count == 0) return true;
+            if (reg + count > kRegs) return false;
+            for (uint32_t b = reg >> kToldBits, last = (reg + count - 1) >> kToldBits; b <= last; b++) {
+                if ((told_[b >> 6] >> (b & 63)) & 1) return false;
+            }
+            return true;
         }
         void clear() {
             far_.clear();
+            std::fill(std::begin(told_), std::end(told_), 0ull);
             if (++gen_ != 0) return;
             // (the generations ran out: every stamp back to 0, which no generation is)
             for (Page& p : pages_) std::fill(std::begin(p.stamp), std::end(p.stamp), 0u);
@@ -463,6 +478,7 @@ public:
     private:
         static constexpr uint32_t kRegs = 1u << 18;   // a type-4 header's register field
         static constexpr uint32_t kPageBits = 8, kPage = 1u << kPageBits;
+        static constexpr uint32_t kToldBits = 6;   // (holdsNone's blocks: 64 registers)
         struct Page {
             uint32_t value[kPage];
             uint32_t stamp[kPage];
@@ -492,6 +508,8 @@ public:
         std::vector<uint16_t> index_;
         uint32_t gen_ = 1;
         std::vector<std::pair<uint32_t, uint32_t>> far_;
+        // the blocks of 64 registers one of which has been told since the last clear(), a bit each (holdsNone)
+        uint64_t told_[kRegs >> kToldBits >> 6] = {};
     };
 
 private:

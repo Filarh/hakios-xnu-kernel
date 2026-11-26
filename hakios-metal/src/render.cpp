@@ -14,7 +14,9 @@
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
+#include <new>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 
 #include "hakios-metal/a6xx.hpp"
@@ -2518,7 +2520,8 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
         return false;
     }
     tableStart(tableCpu);
-    passStart(stream, windowOf(pass).first, windowOf(pass).second, table, o);
+    const std::pair<uint32_t, uint32_t> window = windowOf(pass);
+    passStart(stream, window.first, window.second, table, o);
     clearAll(stream, pass, clears, table, skipClears);
     zsClears(stream, pass, table, o);
     return true;
@@ -3276,6 +3279,31 @@ class DedupSink {
 public:
     DedupSink(pm4::Stream& to, CommandBuffer::RegShadow& regs) : to_(to), regs_(regs) {}
     void registers(uint32_t reg, const uint32_t* values, uint32_t count) {
+        // (one register, two, or a few: most of what a draw's own groups write -- decided here, in line, a run that goes
+        // out whole written once; the rest below)
+        if (count <= 8) {
+            uint32_t held = 0;
+            for (uint32_t k = 0; k < count; k++) held |= (regs_.hold(reg + k, values[k]) && reg + k != REG_A6XX_HLSQ_INVALIDATE_CMD ? 1u : 0u) << k;
+            if (held == 0) {
+                if (count != 0) to_.registers(reg, values, count);
+                return;
+            }
+            uint32_t runStart = 0, runLen = 0;
+            for (uint32_t k = 0; k < count; k++) {
+                if (!((held >> k) & 1)) {
+                    if (runLen == 0) runStart = k;
+                    runLen++;
+                } else if (runLen != 0) {
+                    to_.registers(reg + runStart, values + runStart, runLen);
+                    runLen = 0;
+                }
+            }
+            if (runLen != 0) to_.registers(reg + runStart, values + runStart, runLen);
+            return;
+        }
+        many(reg, values, count);
+    }
+    void many(uint32_t reg, const uint32_t* values, uint32_t count) {
         while (count > 0) {
             const uint32_t n = count < pm4::kMaxType4Count ? count : pm4::kMaxType4Count;
             uint32_t runStart = 0, runLen = 0;
@@ -3632,9 +3660,11 @@ struct PassCache {
     // a frag for SIG: a spare one emptied, or a new one
     Frag* newFrag(uint32_t sig) {
         std::unique_ptr<Frag> f;
-        if (!spare.empty()) {
-            f = std::move(spare.back());
-            spare.pop_back();
+        // (the oldest of the spare ones, once there are as many as a frame's passes have kinds of target: the newer
+        // ones are what sameFrag looks among)
+        if (spare.size() >= kMostSpare) {
+            f = std::move(spare.front());
+            spare.erase(spare.begin());
             f->words.clear();
             f->segs.clear();
             f->byReg.clear();
@@ -3645,6 +3675,19 @@ struct PassCache {
         f->plain = false;
         frags.push_back(std::move(f));
         return frags.back().get();
+    }
+    static constexpr size_t kMostSpare = 24;
+    // the spare frag whose words are these, taken as it is for SIG (its packets are its words'), or nullptr
+    Frag* sameFrag(uint32_t sig, const uint32_t* words, size_t n) {
+        for (size_t i = spare.size(); i-- > 0;) {
+            Frag& x = *spare[i];
+            if (x.words.size() != n || (n != 0 && memcmp(x.words.data(), words, 4 * n) != 0)) continue;
+            x.sig = sig;
+            frags.push_back(std::move(spare[i]));
+            spare.erase(spare.begin() + long(i));
+            return frags.back().get();
+        }
+        return nullptr;
     }
     // a framebuffer fetch's descriptor of each attachment: [0] where it lies in memory, [1] its bin in GMEM
     uint32_t fb[2][kMaxColorOutputs][16];
@@ -4312,6 +4355,13 @@ uint32_t emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, 
                 for (uint32_t p = 0; p < packets; p++) {
                     const KeptSeg& y = segs[p];
                     const uint32_t* const v = w + y.at;
+                    // (nothing told to the shadow near these registers since it forgot: it holds none of them, and need
+                    // not be told them now -- they are this group's, which the cursor knows from here on, as it knows
+                    // what a group's words change of the group before's)
+                    if (regs.holdsNone(y.reg, y.count)) {
+                        if (y.count != 0) to.append(v - 1, y.count + 1u);
+                        continue;
+                    }
                     // (which of them the shadow held: a bit a register, a packet having 126 at most)
                     uint64_t held[2] = {0, 0};
                     for (uint32_t k = 0; k < y.count; k++) {
@@ -4370,9 +4420,14 @@ uint32_t emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, 
             scratch.clear();
             emitDraw(scratch, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch,
                      kGZs | kGMrt | kGMsaa | kGRenderCntl | kGLrz);
-            PassCache::Frag* made = pc.newFrag(sig);
-            made->words.assign(scratch.words().begin(), scratch.words().end());
-            made->plain = packetsOf(made->words.data(), uint32_t(made->words.size()), &made->segs, &made->byReg);
+            // (a pass's groups are most often those of a pass before it -- the same target again, or its like: a spare
+            // frag of these very words is taken with its packets as they were found, not found again)
+            PassCache::Frag* made = pc.sameFrag(sig, scratch.words().data(), scratch.size());
+            if (made == nullptr) {
+                made = pc.newFrag(sig);
+                made->words.assign(scratch.words().begin(), scratch.words().end());
+                made->plain = packetsOf(made->words.data(), uint32_t(made->words.size()), &made->segs, &made->byReg);
+            }
             fr = made;
         }
         kept(Cursor::kPass, fr->words.data(), uint32_t(fr->words.size()), fr->segs.data(), fr->byReg.data(), uint32_t(fr->segs.size()), fr->plain);
@@ -4602,10 +4657,10 @@ bool sameHead(const HeadCache::Entry& e, const uint32_t* words, size_t n, uint64
 
 // appendDeduped for a pass's head onto the command buffer's stream, REGS holding nothing: from HEADS when a head of
 // these words has been kept, else as appendDeduped does it -- and kept then, when MAKE_AGAIN (the same head for another
-// table's address; false if it cannot be made) shows which of its words are the table's. VERIFY (the tests'): a head
+// table's address; false if it cannot be made) shows which of its words are the table's. True when it was taken from HEADS. VERIFY (the tests'): a head
 // taken from HEADS is also made the long way, and "" or what differs is left in *DIFFERS.
 template <class MakeAgain>
-static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::RegShadow& regs, render::HeadCache& heads, uint64_t table,
+static bool headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::RegShadow& regs, render::HeadCache& heads, uint64_t table,
                      const MakeAgain& makeAgain, bool verify, std::string* differs) {
     using render::HeadCache;
     const uint32_t* const w = head.words().data();
@@ -4632,7 +4687,7 @@ static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::Re
                 if (!later && !regs.hold(held[i].first, held[i].second)) same = false;
             }
             if (!same && differs != nullptr) *differs = "a pass's head from its kept words is not the head read back through the shadow";
-            return;
+            return true;
         }
         to.append(e.out.data(), e.out.size());
         for (const HeadCache::Patch& p : e.outPatches) {
@@ -4645,13 +4700,13 @@ static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::Re
             if (k < e.heldPatches.size() && e.heldPatches[k].at == i) value = render::tableWord(table, e.heldPatches[k++]);
             regs.hold(e.held[i].first, value);
         }
-        return;
+        return true;
     }
     const size_t mark = to.size();
     const bool forgot = appendDeduped(to, head, regs);
     if (heads.allowance == 0) {
         heads.refused++;
-        return;
+        return false;
     }
     heads.allowance--;
     // the same head for a table elsewhere -- another low half and another high half, whatever the offset
@@ -4661,7 +4716,7 @@ static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::Re
     heads.againRegs.clear();
     if (!makeAgain(heads.again, other) || heads.again.size() != n) {
         heads.refused++;
-        return;
+        return false;
     }
     const bool forgotAgain = appendDeduped(heads.againOut, heads.again, heads.againRegs);
     HeadCache::Entry e;
@@ -4670,7 +4725,7 @@ static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::Re
         !render::tablePatches(w, heads.again.words().data(), n, table, other, &e.rawPatches) ||
         !render::tablePatches(to.words().data() + mark, heads.againOut.words().data(), outWords, table, other, &e.outPatches)) {
         heads.refused++;
-        return;
+        return false;
     }
     // A register that takes the table's address is written once in the head, or what the shadow drops of it could
     // depend on the address: such a head is not kept. And what the shadow holds after: the registers the deduplicated
@@ -4713,7 +4768,7 @@ static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::Re
         for (const auto& x : writes) once = once && x.second == 1;
         if (!once) {
             heads.refused++;
-            return;
+            return false;
         }
     }
     {
@@ -4733,7 +4788,7 @@ static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::Re
                 }
             } else if (h.kind == pm4::Header::kBad) {
                 heads.refused++;
-                return;
+                return false;
             } else if (!render::leavesRegisters(h.opcode)) {
                 e.held.clear();
                 e.heldPatches.clear();
@@ -4748,6 +4803,7 @@ static void headOnto(pm4::Stream& to, const pm4::Stream& head, CommandBuffer::Re
         heads.entries[heads.next] = std::move(e);
         heads.next = (heads.next + 1) % HeadCache::kMost;
     }
+    return false;
 }
 
 uint64_t newProgramUid() { return render::gProgramUids.fetch_add(1) + 1; }
@@ -4832,8 +4888,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     // (command.hpp). The draw goes on as a draw of PASS and D, those; GIVEN and GIVEN_DRAW are what was asked. A draw
     // that asks for a depth or stencil test of its own -- refused, the pass having neither -- is left as it came, to be
     // refused by name as it would be. (Its depth attachment's load action Load for the join, Clear for a pass it opens.)
-    RenderPass hsrPass;
-    Draw hsrDraw;
+    // (made only for a draw HSR serves: each is a hundred words or so to set to its defaults, which every draw did)
+    static_assert(std::is_trivially_destructible<RenderPass>::value && std::is_trivially_destructible<Draw>::value, "left unmade, nothing to unmake");
+    alignas(RenderPass) unsigned char hsrPassAt[sizeof(RenderPass)];
+    alignas(Draw) unsigned char hsrDrawAt[sizeof(Draw)];
+    RenderPass& hsrPass = *reinterpret_cast<RenderPass*>(hsrPassAt);
+    Draw& hsrDraw = *reinterpret_cast<Draw*>(hsrDrawAt);
     std::shared_ptr<Texture> hsrDepth;
     std::shared_ptr<Buffer> hsrLrz;
     if (hsr_ && given.color0 != nullptr && (given.color0->compressed() || hsrAnyTarget_) && given.depth == nullptr && given.stencil == nullptr &&
@@ -4862,7 +4922,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         hsrDepth = ht.depth;
         hsrLrz = ht.lrz;
         if (hsrDepth != nullptr) {
-            hsrPass = given;
+            new (&hsrPass) RenderPass(given);
             hsrPass.depth = hsrDepth.get();
             hsrPass.depthLrz = hsrLrz.get();
             hsrPass.depthLevel = hsrPass.depthSlice = 0;
@@ -4921,7 +4981,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
             }
             i = k.next < hsrLimit_ ? k.next++ : hsrLimit_;
         }
-        hsrDraw = givenDraw;
+        new (&hsrDraw) Draw(givenDraw);
         if (i < hsrLimit_) {
             hsrClass = render::hsrClassOf(program, given, givenDraw, hsrTwin_);
             hsrDraw.viewport.znear = hsrDraw.viewport.zfar = render::hsrZ(i);
@@ -5150,9 +5210,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     OpenPassPtr fresh;                            // a new pass, from the queue's spares
     std::shared_ptr<render::PassCache> opened;   // ...and what is kept of it
     if (!joins) {
-        if (!piece(render::kTableBytes, &passTable, &why)) {
+        // (as the slab had it but for what the stream addresses word by word, below the border colours: encodeBegin
+        // writes those and the hole, and nothing else of a pass's table is read -- zeroing its 8 KiB was a pass's)
+        if (!piece(render::kTableBytes, &passTable, &why, true)) {
             return fail(std::string("no memory for the pass's table: ") + why);
         }
+        memset(passTable.contents(), 0, render::kTableBorderColorAt);
         if (gmem) {
             for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
                 const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
@@ -5309,7 +5372,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
                 return render::encodeBegin(s, pass, t, passTable.contents(), &no, o, skipped);
             };
             std::string differs;
-            headOnto(stream_, head, open_->regs, dc.heads, passTable.gpuAddress(), again, render::gVerifyDraws.load(std::memory_order_relaxed), &differs);
+            if (headOnto(stream_, head, open_->regs, dc.heads, passTable.gpuAddress(), again, render::gVerifyDraws.load(std::memory_order_relaxed), &differs)) {
+                counts_.keptHeads++;
+            }
             if (!differs.empty()) return fail(differs);
         } else if (options.dedupRegs) {
             appendDeduped(stream_, head, open_->regs);

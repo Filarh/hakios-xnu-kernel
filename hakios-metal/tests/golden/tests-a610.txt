@@ -159,6 +159,8 @@ a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full sub
 the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        39922 draws taken, 26981 of them from a kept state; 6158 refused
 random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10432510 draws 83782 loads 235862 stream 298d25a9300bd191 state 65f71e5c645bea79 names 39820 9d8a0521e9fd6c52
+a_passs_head_from_the_heads_before_is_the_head_read_back_through_the_shadow submits 20 words 105464 draws 340 loads 680 stream 17099878659960e1 state 967f5124f9e1e075 names 210 34c1a5f1c5b6d844
+a_head_that_differs_in_a_word_is_not_a_kept_one submits 7 words 12334 draws 20 loads 40 stream 8ed70a3124afb1e9 state 40e85c78fad93375 names 41 061fd415bf1f8ac6
 more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream cff598f3a12f1875 state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
 end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000

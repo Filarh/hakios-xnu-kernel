@@ -589,6 +589,11 @@ void hakios_metal_draw_states(int keep, int verify);
 /* SKIP 1: a draw of a sysmem pass whose draw before it was of the same program leaves out the program's invalidate and
  * its stages' preloads (CommandBuffer::skipSameProgramLoads); 0, the default, writes them for every draw */
 void hakios_metal_same_program_loads(int skip);
+/* KEEP 0: a pass's head is not taken from the heads of the passes before (CommandBuffer::keepHeads); 1, the default,
+ * takes it when its words are a kept head's but for its table's address. The stream is the same either way. */
+void hakios_metal_kept_heads(int keep);
+/* of CB's passes, those whose head was taken so (CommandBuffer::Counts::keptHeads) */
+unsigned hakios_metal_cb_kept_heads(hakios_metal_cb *cb);
 /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
  * has completed, draw I's program name (valid while CB lives) and microseconds; the count is returned, -1 past them */
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb *cb, int on);
