@@ -5090,7 +5090,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         if (hsrClass == render::kHsrHidden) counts_.hsrHidden++;
         if (hsrClass == render::kHsrBarrier) counts_.hsrBarriers++;
     }
-    const bool timed = profileDraws_ && !open_->gmem && drawsProfiled_.size() < kMaxProfiledDraws;
+    // (a pass recorded both ways: stamped on its sysmem side, timed if that is what runs)
+    const bool timed = profileDraws_ && (!open_->gmem || open_->dual) && drawsProfiled_.size() < kMaxProfiledDraws;
+    pm4::Stream& stampInto = open_->dual ? open_->sysStream : stream_;
     if (timed) {
         DrawTime dt{program.name != nullptr ? program.name : "?", 0};
         dt.name += " fs:" + std::to_string(program.fs.k.numWords) + "w v:" + std::to_string(d.vertexCount) + (program.blend.enabled ? " blend" : "");   // (which variant: one function's pipelines differ by their constants)
@@ -5110,9 +5112,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
             dt.name += w;
         }
         dt.pass = profiled_.empty() ? 0 : uint32_t(profiled_.size() - 1);
+        dt.ordinal = counts_.draws;
         render::drawArea(pass, d, dt.area);
         drawsProfiled_.push_back(dt);
-        drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)));
+        drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)), stampInto);
     }
 
     // --- the draw's words, straight onto the pass's stream (and onto its sysmem side, for a pass recorded both ways) ---
@@ -5249,7 +5252,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         drawMarks_.push_back(m);
         drawTag_ = 0;
     }
-    if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
+    // (onto the same stream as the first: a pass recorded both ways may have gone to tiles alone with this draw -- below
+    // -- and then neither stamp runs)
+    if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1), stampInto);
     // A pass recorded both ways is recorded for tiles alone from the draw at which closePass's choice can no longer
     // come out sysmem: the choice is render::gmemWorth's over what the pass holds, and what it holds only grows --
     // its draws, the attachments they touch, whether one reads its target -- while what a pass loads and stores is

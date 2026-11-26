@@ -1580,6 +1580,7 @@ HM_REFUSES_OUT_LOUD
 	struct hm_ft_rec *_ftrace;                  /* metal_trace=frame: the command buffer's recorder, else NULL */
 	unsigned _ftEnc;                            /* ...and this encoder's number in it */
 	unsigned _ftDraws;                          /* ...and the draws it has recorded */
+	int _ftCoreDraws;                           /* metal_drawts: the core's draws in the buffer before this draw, -1 untold */
 	/* metal_hsrprobe: this encoder's draws that a later opaque rectangle may still cover (no draw that reads the
 	 * framebuffer or writes another attachment since), by tag and pixel box */
 	struct { unsigned tag; int x0, y0, x1, y1; } _hsr[256];
@@ -1713,6 +1714,7 @@ struct hm_ft_rec {
 	double created, committed, scheduled, completed;
 	int phases;                        /* -commit's return and the completion: the second of them writes the record */
 	BOOL held, committedYet;           /* committed to the GPU once the events it waits for had come; -commit seen */
+	BOOL drawts;                       /* metal_drawts: its draws timed one by one (its gdraw lines) */
 	NSMutableIndexSet *named;          /* the textures, samplers and pipelines described in it (one counter numbers all) */
 };
 
@@ -2231,6 +2233,56 @@ hm_samples_on(void)
 		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_samples=1") != NULL;
 	}
 	return on == 1;
+}
+
+/*
+ * Boot-arg metal_drawts=1 (a measurement, beside metal_trace=frame; off by default): each draw of a recorded command
+ * buffer's sysmem passes timed alone by the GPU (hakios_metal_cb_set_profile_draws: CP_WAIT_FOR_IDLE and a copy of
+ * CP_ALWAYS_ON_COUNTER before the draw and after it, as turnip's tu_CmdWriteTimestamp2 takes a timestamp), written as
+ * a gdraw line each -- its time, its pass (a gpass line's i), its place among the buffer's draws (the cd= of its draw
+ * line), its pixel box -- after the gpass lines; the cb line says drawts=1. The waits keep the draws from overlapping:
+ * a timed pass is dearer than it is otherwise, and its time is no measure of the pass. metal_drawts=2 times only the
+ * recorded buffers of even seq (drawts=0 on the others), an A/B within one trace: the passes of the odd ones are the
+ * same passes untimed. Only buffers a capture takes are timed; the rest run as ever (metal_fps=draws times them all).
+ * A GMEM pass's draws are not timed (each tile runs them again); those of a pass recorded both ways that went to
+ * tiles say us=-1. tools/perf/drawts-an.py reads them.
+ */
+static int
+hm_drawts(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		mode = 0;
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_drawts=")) != NULL) {
+			mode = atoi(at + strlen("metal_drawts="));
+			if (mode != 1 && mode != 2) mode = 0;
+		}
+	}
+	return mode;
+}
+
+/* metal_drawts: the gdraw lines of a recorded buffer whose draws were timed (after its gpass lines) */
+static void
+hm_ft_gdraws(struct hm_ft_rec *ft, hakios_metal_cb *cb)
+{
+	for (unsigned i = 0;; i++) {
+		const char *name = NULL;
+		unsigned pass = 0, ordinal = 0, area[4] = { 0, 0, 0, 0 };
+		double us = 0;
+		char q[600];
+
+		if (hakios_metal_cb_draw_time(cb, i, &name, &us) <= (int)i || hakios_metal_cb_draw_place(cb, i, &pass, area) <= (int)i ||
+		    hakios_metal_cb_draw_order(cb, i, &ordinal) <= (int)i) {
+			break;
+		}
+		hm_ft_line(ft, "gdraw i=%u cd=%u pass=%u us=%.2f area=%u,%u,%u,%u prog=%s\n", i, ordinal, pass, us, area[0], area[1], area[2],
+			   area[3], hm_ft_q(q, sizeof(q), name != NULL ? name : "?"));
+	}
 }
 
 static void
@@ -7110,7 +7162,9 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
-		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
+		/* (metal_drawts: a recorded buffer's draws, every one's or, with =2, those of even seq) */
+		if (_ftrace != NULL && hm_drawts() != 0) _ftrace->drawts = hm_drawts() == 1 || _ftrace->seq % 2 == 0;
+		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws() || (_ftrace != NULL && _ftrace->drawts));
 		const int hsrMode = hm_hsr_switch();
 		_hsr = hsrMode == 1 || (hsrMode == 2 && __atomic_fetch_add(&hm_hsr_buffers, 1, __ATOMIC_RELAXED) % 2 == 0);
 		hakios_metal_cb_set_hsr(_cb, _hsr);
@@ -7196,19 +7250,20 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_gmem_counts(_cb, &gmemPasses, &tiles);
 		skipped = hakios_metal_cb_skipped(_cb, &last);
 		hm_ft_gpasses(ft, _cb);
+		if (ft->drawts) hm_ft_gdraws(ft, _cb);
 	}
 	hm_ft_line(ft, "endcb seq=%u\n", ft->seq);
 	n = asprintf(&head, "cb seq=%u capture=%u serial=%u label=%s queue=%s qid=%p created=%.6f committed=%.6f scheduled=%.6f completed=%.6f "
 		     "gpu_us=%.1f status=%s error=%s held=%d encoders=%u draws=%u ops=%u core_passes=%u core_draws=%u core_dispatches=%u "
 		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s hsr=%d hsr_passes=%u hsr_opaque=%u "
-		     "hsr_hidden=%u hsr_barriers=%u\n", ft->seq, ft->capture->number,
+		     "hsr_hidden=%u hsr_barriers=%u%s\n", ft->seq, ft->capture->number,
 		     ft->serial, hm_ft_qs(label, sizeof(label), [self label]), hm_ft_qs(queue, sizeof(queue), [_queue label]), (void *)_queue,
 		     ft->created, ft->committed, ft->scheduled, ft->completed, _cb != NULL ? (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e3 : 0.0,
 		     _cb != NULL ? HM_FT_STATUS(hakios_metal_cb_status(_cb)) : "nocb",
 		     hm_ft_q(error, sizeof(error), _cb != NULL ? hakios_metal_cb_error(_cb) : "no command buffer"), ft->held ? 1 : 0, ft->encoders,
 		     ft->draws, ft->ops, passes, draws, dispatches, copies, clears, gmemPasses, tiles, skipped,
 		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""),
-		     _hsr ? 1 : 0, hsrPasses, hsrOpaque, hsrHidden, hsrBarriers);
+		     _hsr ? 1 : 0, hsrPasses, hsrOpaque, hsrHidden, hsrBarriers, hm_drawts() == 0 ? "" : ft->drawts ? " drawts=1" : " drawts=0");
 	record = n > 0 ? malloc((size_t)n + ft->len) : NULL;
 	if (record != NULL) {
 		memcpy(record, head, (size_t)n);
@@ -7998,7 +8053,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 						if (hakios_metal_cb_draw_place(cb, i, &pass, area) <= (int)i || hakios_metal_cb_draw_time(cb, i, &name, &dus) <= (int)i) {
 							break;
 						}
-						if (pass == slow) {
+						if (pass == slow && dus >= 0) {
 							hm_print("fps: ...   %s %.0f us over %ux%u at (%u,%u)\n", name, dus, area[2] - area[0] + 1, area[3] - area[1] + 1, area[0], area[1]);
 						}
 					}
@@ -8011,6 +8066,9 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 
 				if (hakios_metal_cb_draw_time(cb, i, &name, &us) <= (int)i || name == NULL) {
 					break;
+				}
+				if (us < 0) {
+					continue;   /* (a pass recorded both ways that went to tiles: its stamps never ran) */
 				}
 				for (k = 0; k < 48 && hm_fps.programs[k].name[0] != 0 && strcmp(hm_fps.programs[k].name, name) != 0; k++) {
 				}
@@ -11060,6 +11118,15 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 			hm_ft_cat(line, sizeof(line), &at, " fb=0x%x discard=%u", traits & 0xff, (traits >> 8) & 1);
 		}
 	}
+	if (ft->drawts && core >= 0 && _ftCoreDraws >= 0) {
+		/* metal_drawts: the core's draws it made, by their place in the buffer (a gdraw line's cd=): one as a rule */
+		unsigned coreDraws = 0;
+
+		hakios_metal_cb_counts([self hakiosCb], NULL, &coreDraws, NULL, NULL, NULL);
+		if (coreDraws == (unsigned)_ftCoreDraws + 1) hm_ft_cat(line, sizeof(line), &at, " cd=%d", _ftCoreDraws);
+		else if (coreDraws > (unsigned)_ftCoreDraws) hm_ft_cat(line, sizeof(line), &at, " cd=%d-%u", _ftCoreDraws, coreDraws - 1);
+	}
+	_ftCoreDraws = -1;
 	hm_ft_cat(line, sizeof(line), &at, " core=%d n=%u res=%s\n", core, opened, hm_ft_q(q[1], sizeof(q[1]), result));
 	hm_ft_line(ft, "%s", line);
 	hm_ft_textures(ft, "d", d, "fs", _fsTextures, _fsHighestTexture, _fsSamplers, _fsHighestSampler, fsUsed, fsSamplers, known);
@@ -11220,6 +11287,13 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	}
 	const double coreBegan = hm_fps_on() ? hm_now() : 0;
 	if (_ftrace != NULL) ftBefore = hm_ft_total(cb);
+	_ftCoreDraws = -1;
+	if (_ftrace != NULL && _ftrace->drawts) {   /* metal_drawts: where this draw's core draws start, for its cd= */
+		unsigned coreDraws = 0;
+
+		hakios_metal_cb_counts(cb, NULL, &coreDraws, NULL, NULL, NULL);
+		_ftCoreDraws = (int)coreDraws;
+	}
 	unsigned hsrTag = 0;
 	const int hsrMode = hm_hsr_mode();
 	if ((hsrMode == 1 || (hsrMode == 2 && _ftrace != NULL && _ftrace->seq % 2 == 0)) && _pipeline != nil && [_pipeline hakiosFtPipe] != NULL) {
