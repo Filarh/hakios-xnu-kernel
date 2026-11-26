@@ -808,6 +808,26 @@ TEST(c_api_multisample_draw_and_resolve) {
 
 // A texture over an IOSurface through C: the refusals reach the caller by name (the drawing into a surface is
 // render_test's, over the fake's surfaces)
+TEST(c_api_texture_over_a_plane_is_planned_without_the_kernel) {
+    // the plug-in's order for a planar surface: the plan (the arguments alone), then the texture
+    hakios_metal_device* d = hakios_metal_open_fake();
+    const uint64_t before = hakios_metal_device_allocated_bytes(d);
+    // mediaserverd's call: plane 0 of a 1128x1504 '420f', 282x1504 R32Uint (53), usage ShaderWrite (2)
+    CHECK_EQ(hakios_metal_texture_plan_iosurface_plane(1234, 0, 53, 282, 1504, 2, 0, 1152, 1128, 1504, 1), 0);
+    CHECK_EQ(hakios_metal_texture_plan_iosurface_plane(1234, 1, 30, 564, 752, 2, 1152ull * 1504, 1152, 564, 752, 2), 0);
+    CHECK_EQ(hakios_metal_texture_plan_iosurface_plane(1234, 0, 53, 283, 1504, 2, 0, 1152, 1128, 1504, 1), -1);
+    CHECK(strstr(hakios_metal_error(), "its row no longer than the plane's") != nullptr);
+    CHECK_EQ(hakios_metal_texture_plan_iosurface_plane(1234, 0, 53, 282, 1505, 2, 0, 1152, 1128, 1504, 1), -1);
+    CHECK(strstr(hakios_metal_error(), "a 282 x 1505 texture over the 1128 x 1504 plane 0 of IOSurface 1234") != nullptr);
+    // the texture itself: there is no surface 1234 on the fake, and a refusal by the arguments never gets that far
+    CHECK(hakios_metal_texture_new_iosurface_plane(d, 1234, 0, 53, 283, 1504, 2, 0, 1152, 1128, 1504, 1) == nullptr);
+    CHECK(strstr(hakios_metal_error(), "its row no longer than the plane's") != nullptr);
+    CHECK(hakios_metal_texture_new_iosurface_plane(d, 1234, 0, 53, 282, 1504, 2, 0, 1152, 1128, 1504, 1) == nullptr);
+    CHECK(strstr(hakios_metal_error(), "IOSurface 1234: the driver gave no buffer for it: no such surface") != nullptr);
+    CHECK_EQ(hakios_metal_device_allocated_bytes(d), before);
+    hakios_metal_close(d);
+}
+
 TEST(c_api_texture_over_an_iosurface_refuses_by_name) {
     hakios_metal_device* d = hakios_metal_open_fake();
     CHECK(hakios_metal_texture_new_iosurface(d, 1234, 0, 80, 64, 64, HAKIOS_METAL_TEXTURE_USAGE_RENDER_TARGET) == nullptr);

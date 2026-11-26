@@ -671,6 +671,48 @@ hakios_metal_texture* hakios_metal_texture_new_iosurface2(hakios_metal_device* d
     return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, &chroma);
 }
 
+namespace {
+void planeDesc(TextureDesc* desc, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage) {
+    desc->format = PixelFormat(pixelFormat);
+    desc->width = width;
+    desc->height = height;
+    desc->usage = usage;
+}
+}  // namespace
+
+hakios_metal_texture* hakios_metal_texture_new_iosurface_plane(hakios_metal_device* d, unsigned surfaceId, unsigned plane, unsigned pixelFormat,
+                                                               unsigned width, unsigned height, unsigned usage, uint64_t planeOffset,
+                                                               unsigned planeRowBytes, unsigned planeWidth, unsigned planeHeight,
+                                                               unsigned planeBytesPerElement) {
+    const Texture::SurfaceRows rows{planeOffset, planeRowBytes, planeWidth, planeHeight, planeBytesPerElement};
+    TextureDesc desc;
+    planeDesc(&desc, pixelFormat, width, height, usage);
+    std::string why;
+    std::shared_ptr<Texture> t = Texture::wrapSurfacePlane(*d->gpu, surfaceId, plane, rows, desc, &why);
+    if (t == nullptr) {
+        failed(why);
+        return nullptr;
+    }
+    auto* r = new hakios_metal_texture;
+    r->texture = std::move(t);
+    return r;
+}
+
+int hakios_metal_texture_plan_iosurface_plane(unsigned surfaceId, unsigned plane, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage,
+                                              uint64_t planeOffset, unsigned planeRowBytes, unsigned planeWidth, unsigned planeHeight,
+                                              unsigned planeBytesPerElement) {
+    const Texture::SurfaceRows rows{planeOffset, planeRowBytes, planeWidth, planeHeight, planeBytesPerElement};
+    const FormatInfo* info = nullptr;
+    TextureDesc desc;
+    planeDesc(&desc, pixelFormat, width, height, usage);
+    std::string why;
+    if (!Texture::planSurfacePlane(surfaceId, plane, rows, desc, &info, &why)) {
+        failed(why);
+        return -1;
+    }
+    return 0;
+}
+
 hakios_metal_texture* hakios_metal_texture_new_ycbcr(hakios_metal_device* d, unsigned surfaceId, unsigned width, unsigned height, uint64_t lumaOffset,
                                                      unsigned lumaRowBytes, uint64_t chromaOffset, unsigned chromaRowBytes, unsigned siting) {
     Texture::SurfacePlane chroma{chromaOffset, chromaRowBytes};

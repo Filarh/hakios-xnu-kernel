@@ -187,6 +187,21 @@ hakios_metal_texture *hakios_metal_texture_new_iosurface(hakios_metal_device *de
  * CHROMA_ROW_BYTES its rows; both planes are sampled as one texture. */
 hakios_metal_texture *hakios_metal_texture_new_iosurface2(hakios_metal_device *device, unsigned surface_id, unsigned plane,
     unsigned pixel_format, unsigned width, unsigned height, unsigned usage, uint64_t chroma_offset, unsigned chroma_row_bytes);
+/* -newTextureWithDescriptor:iosurface:plane: for one plane of a planar surface, in a plain colour format: the plane as
+ * the caller reads it off the surface -- PLANE_OFFSET (IOSurfaceGetBaseAddressOfPlane(s, n) less
+ * IOSurfaceGetBaseAddress(s)), PLANE_ROW_BYTES, PLANE_WIDTH, PLANE_HEIGHT, PLANE_BYTES_PER_ELEMENT. The format's pixel
+ * is the plane's element or several of them (R32Uint over a luma plane, a quarter of its width), the texture's row no
+ * longer than the plane's, its height at most the plane's; pitch and start multiples of 64 bytes. Whatever the
+ * arguments alone decide is refused before the kernel is asked for anything. NULL with the reason. */
+hakios_metal_texture *hakios_metal_texture_new_iosurface_plane(hakios_metal_device *device, unsigned surface_id, unsigned plane,
+    unsigned pixel_format, unsigned width, unsigned height, unsigned usage, uint64_t plane_offset, unsigned plane_row_bytes,
+    unsigned plane_width, unsigned plane_height, unsigned plane_bytes_per_element);
+/* what the arguments alone decide of it: 0 when hakios_metal_texture_new_iosurface_plane would go on to ask the kernel,
+ * -1 with the reason otherwise. No request, no memory. (For a copy of rows the GPU cannot take where they lie, the
+ * caller gives the rows the copy would have, and the format and the size are what is judged.) */
+int hakios_metal_texture_plan_iosurface_plane(unsigned surface_id, unsigned plane, unsigned pixel_format, unsigned width, unsigned height,
+    unsigned usage, uint64_t plane_offset, unsigned plane_row_bytes, unsigned plane_width, unsigned plane_height,
+    unsigned plane_bytes_per_element);
 /* A '420f' or '420v' surface read by the GPU as its planes' values, (Cr, Y, Cb, 1) in (red, green, blue, alpha): the
  * two-plane texture of hakios_metal_texture_new_iosurface2 (500, read by shaders) seen through the swizzle
  * (blue, red, green, one). That is Metal's private 540 as it is; a fragment stage compiled with the slot's YCbCr code

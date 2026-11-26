@@ -259,6 +259,27 @@ public:
     };
     static std::shared_ptr<Texture> wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why,
                                                 const SurfacePlane* chroma = nullptr);
+    // -newTextureWithDescriptor:iosurface:plane: for one plane of a planar surface (a '420f' buffer's luma or chroma, as
+    // CoreVideo and VideoToolbox ask for them one by one): a texture of a plain colour format whose rows are that
+    // plane's. ROWS is the plane as the caller reads it off the surface (IOSurfaceGetBaseAddressOfPlane less
+    // IOSurfaceGetBaseAddress, IOSurfaceGetBytesPerRowOfPlane, -WidthOfPlane, -HeightOfPlane, -BytesPerElementOfPlane):
+    // the kernel describes the surface, not its planes. The format's bytes a pixel are the plane's bytes an element, or
+    // more of them with the texture's row no longer than the plane's (VideoToolbox writes a luma plane, a byte an
+    // element, through R32Uint at a quarter of the width); the height at most the plane's. Everything DESC and ROWS
+    // decide is judged before the kernel is asked for the surface's memory, so a refusal by them costs no memory and
+    // no request; what is left for after is that the rows lie inside the surface's memory. nullptr with *why.
+    struct SurfaceRows {
+        uint64_t offset;
+        uint32_t rowBytes;
+        uint32_t width;
+        uint32_t height;
+        uint32_t bytesPerElement;
+    };
+    static std::shared_ptr<Texture> wrapSurfacePlane(Gpu& gpu, uint32_t surfaceId, uint32_t plane, const SurfaceRows& rows, const TextureDesc& desc,
+                                                     std::string* why);
+    // whether wrapSurfacePlane would take DESC over ROWS, as far as the two decide it (no kernel request, no memory)
+    static bool planSurfacePlane(uint32_t surfaceId, uint32_t plane, const SurfaceRows& rows, const TextureDesc& desc, const FormatInfo** info,
+                                 std::string* why);
     // -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a texture whose rows are BUFFER's bytes from OFFSET,
     // BYTES_PER_ROW apart -- the same memory, so a write through either is seen through the other. One level of a
     // colour format, 1D or 2D; the rows the TP takes (a pitch and a start that are multiples of 64 bytes, as for a

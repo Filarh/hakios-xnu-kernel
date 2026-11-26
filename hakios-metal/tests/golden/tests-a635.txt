@@ -37,6 +37,7 @@ c_api_draw_with_a_vertex_texture submits 0 words 0 draws 0 loads 0 stream 000000
 c_api_pipeline_without_a_fragment_function submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the C interface's multisampling did not run)
 c_api_multisample_draw_and_resolve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+c_api_texture_over_a_plane_is_planned_without_the_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 c_api_texture_over_an_iosurface_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the C interface's indexed draw did not run)
 c_api_indexed_draw submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
@@ -272,6 +273,8 @@ a_texture_over_an_iosurface_draws_into_the_surfaces_memory submits 2 words 624 d
 a_two_plane_surface_is_one_ycbcr_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_ycbcr_texture_is_the_two_planes_read_as_cr_y_cb_one submits 1 words 699 draws 1 loads 4 stream 2d08a60e10be5db9 state fc0919292643f43a names 5 75a6c75c2ecf170b
 a_texture_over_an_iosurface_refuses_what_the_gpu_cannot_take submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_plane_of_a_planar_iosurface_is_a_texture_of_its_rows submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_plane_of_a_planar_iosurface_is_refused_before_the_kernel_is_asked submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 an_indexed_draw_is_the_seven_word_form_with_primitive_restart submits 3 words 2079 draws 3 loads 6 stream 59553d81950982ce state af1beff45cf71e23 names 18 9efb005cbdc4ec8c
 an_indexed_or_instanced_draw_refuses_what_it_cannot_serve submits 1 words 689 draws 1 loads 2 stream 27af40ab9bfe7c67 state 58699d5de9f40f97 names 5 b4e454c540a07906
 a_draw_loads_the_ubo_descriptors_an_ldc_reads_through submits 3 words 1950 draws 3 loads 6 stream 78b0be44c726a793 state cbf1a96e2a2cfabb names 10 2bdc4839433416ac

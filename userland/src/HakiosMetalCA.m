@@ -100,6 +100,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <os/lock.h>
+#include <os/proc.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -557,9 +558,16 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 - (hakios_metal_device *)hakiosDevice;
 @end
 
+/* A resource made from a heap counts against the heap's size while it holds memory of it: from its creation until it
+ * is released or made aliasable (MTLHeap's usedSize, "the size, in bytes, of all resources allocated from the heap";
+ * -makeAliasable lets later resources of the heap have the memory). HEAP is retained, BYTES what was counted. */
+static void hm_heap_gave_back(id heap, NSUInteger bytes);
+
 @interface HakiosMetalBuffer : _MTLResource {
 	HakiosMetalDevice *_device;
 	hakios_metal_buffer *_buffer;
+	id _heap;                       /* the heap it was made from (retained), nil for the device's own */
+	NSUInteger _heapBytes;          /* what the heap still counts for it: 0 once aliasable */
 	BOOL _noCopy;                   /* the caller's own pages (-newBufferWithBytesNoCopy:...) */
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device length:(NSUInteger)length;
@@ -569,6 +577,7 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 			 deallocator:(void (^)(void *, NSUInteger))deallocator;
 - (hakios_metal_buffer *)hakiosBuffer;
 - (void *)contents;
+- (void)hakiosFromHeap:(id)heap bytes:(NSUInteger)bytes;
 @end
 
 /* What a no-copy buffer hands the core for Metal's deallocator: the block and the caller's range. The core calls
@@ -697,6 +706,8 @@ hm_nocopy_buffer(HakiosMetalDevice *device, void *bytes, NSUInteger length, void
 @interface HakiosMetalTexture : _MTLResource {
 	HakiosMetalDevice *_device;
 	hakios_metal_texture *_texture;
+	id _heap;                           /* the heap it was made from (retained), nil for the device's own */
+	NSUInteger _heapBytes;              /* what the heap still counts for it: 0 once aliasable */
 	MTLTextureUsage _usage;             /* what hakios-metal was given: ShaderRead, ShaderWrite, or both */
 	MTLResourceOptions _askedOptions;   /* the descriptor's, for -unfilteredResourceOptions; what was GIVEN is shared memory */
 	BOOL _allowGPUOptimizedContents;    /* the descriptor's word; the layout is linear either way */
@@ -733,6 +744,8 @@ hm_nocopy_buffer(HakiosMetalDevice *device, void *bytes, NSUInteger length, void
 - (hakios_metal_texture *)hakiosTextureAsIs;   /* (no refresh of a YCbCr copy: hakiosTexture) */
 - (void)hakiosSetIOSurface:(IOSurfaceRef)surface plane:(NSUInteger)plane;
 - (void)hakiosShadow:(IOSurfaceRef)surface;
+- (void)hakiosShadow:(IOSurfaceRef)surface plane:(NSUInteger)plane;
+- (void)hakiosFromHeap:(id)heap bytes:(NSUInteger)bytes;
 - (BOOL)hakiosIsShadow;
 - (BOOL)hakiosIsTurned;
 - (void)hakiosTurnInto:(hakios_metal_cb *)cb;
@@ -1080,6 +1093,7 @@ hm_layout_rows(HakiosMetalTextureLayout *l, unsigned bw, unsigned bh, unsigned b
 	NSUInteger _used;
 }
 - (instancetype)initWithDevice:(id)device descriptor:(MTLHeapDescriptor *)descriptor;
+- (void)hakiosGaveBack:(NSUInteger)bytes;
 @end
 
 /* An argument encoder (MTLArgumentEncoder) over the layout the AIR front end reads back (nir_air.h, air_argbuf): eight
@@ -1302,12 +1316,15 @@ HM_REFUSES_OUT_LOUD
 - (MTLHeapType)type { return [_descriptor type]; }
 - (NSUInteger)protectionOptions { return 0; }   /* no protected memory on this port, as a texture answers */
 - (NSUInteger)size { return [_descriptor size]; }
-- (NSUInteger)usedSize { return _used; }
+- (NSUInteger)usedSize { return __atomic_load_n(&_used, __ATOMIC_RELAXED); }
+- (void)hakiosGaveBack:(NSUInteger)bytes { __atomic_fetch_sub(&_used, bytes, __ATOMIC_RELAXED); }
 - (NSUInteger)currentAllocatedSize { return [_descriptor size]; }
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment
 {
+	const NSUInteger used = [self usedSize];
+
 	(void)alignment;
-	return [_descriptor size] > _used ? [_descriptor size] - _used : 0;
+	return [_descriptor size] > used ? [_descriptor size] - used : 0;
 }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { (void)state; return MTLPurgeableStateNonVolatile; }
 
@@ -1317,11 +1334,20 @@ HM_REFUSES_OUT_LOUD
 	NSUInteger size = resource != nil ? [(id<MTLResource>)resource allocatedSize] : 0;
 
 	if (resource == nil) return nil;
-	if (_used + size > [_descriptor size]) {
+	/* (counted first and taken back if it overran: two threads making resources cannot both take the last bytes) */
+	if (__atomic_add_fetch(&_used, size, __ATOMIC_RELAXED) > [_descriptor size]) {
+		__atomic_fetch_sub(&_used, size, __ATOMIC_RELAXED);
 		[resource release];
 		return nil;
 	}
-	_used += size;
+	/* the resource gives its bytes back when it is released or made aliasable: a heap whose resources have gone is
+	 * empty again, as Metal's is (MPS and CMCapture's allocators make and release temporary textures from one heap
+	 * for as long as they run) */
+	if ([resource respondsToSelector:@selector(hakiosFromHeap:bytes:)]) {
+		[resource hakiosFromHeap:self bytes:size];
+	} else {
+		__atomic_fetch_sub(&_used, size, __ATOMIC_RELAXED);
+	}
 	return resource;
 }
 - (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
@@ -1371,6 +1397,14 @@ HM_REFUSES_OUT_LOUD
 	return nil;
 }
 @end
+
+static void
+hm_heap_gave_back(id heap, NSUInteger bytes)
+{
+	if (heap != nil && bytes != 0) {
+		[(HakiosMetalHeap *)heap hakiosGaveBack:bytes];
+	}
+}
 
 @interface HakiosMetalDepthStencilState : NSObject <MTLDepthStencilState> {
 	id<MTLDevice> _device;
@@ -3965,9 +3999,40 @@ hm_boot_arg_set(const char *what)
  * Apple1 that is not served -- ASTC, say -- is refused where it is asked for, by name, as everything else is. */
 - (NSUInteger)featureProfile { return 1; }
 
-/* Not measured: nothing has asked the kernel what one allocation may be. It only has to be non-zero for initLimits
- * to accept it; a buffer longer than the kernel gives is refused at -newBufferWithLength:options:, with the reason. */
+/* What the kernel gives as one allocation: 256 MiB (drivers/gpu/hakios.gpu.cpp GPU_BUFFER_MAX; the same number in the
+ * A610 port's kernel, MSM_BUFFER_MAX). A buffer longer than that is refused at -newBufferWithLength:options:, with the
+ * reason. */
 - (uint64_t)maxBufferLength { return 256ULL << 20; }
+
+/* MTLDevice.recommendedMaxWorkingSetSize: "an approximation of how much memory, in bytes, this GPU device can allocate
+ * without affecting its runtime performance" (Metal's documentation). Not implemented, the base class answered 0, which
+ * a caller sizing its caches by it reads as no memory at all (mediaserverd: the capture plug-in's log read 0 MB).
+ * The GPU's memory here is the phone's (hasUnifiedMemory), and every allocation of this driver is resident from the
+ * moment it is made, inside the process that made it. So the answer is the smaller of two budgets: two thirds of the
+ * phone's memory (hw.memsize) -- the share Apple's own GPUs answer on their unified-memory machines of up to 32 GB, as
+ * programs print it there: 5461 MB of 8 GB, 10922 of 16, 21845 of 32 -- and what this process may still take before
+ * the kernel's memory limit for it (os_proc_available_memory, "the amount of memory available to the current app",
+ * which is the limit less the footprint; 0 where the process has no limit) added to what the device holds already. */
+- (uint64_t)recommendedMaxWorkingSetSize
+{
+	uint64_t memory = 0;
+	size_t size = sizeof(memory);
+
+	if (sysctlbyname("hw.memsize", &memory, &size, NULL, 0) != 0 || memory == 0) {
+		return 0;
+	}
+	uint64_t budget = memory / 3 * 2;
+	const uint64_t left = (uint64_t)os_proc_available_memory();
+
+	if (left != 0) {
+		const uint64_t limit = left + (_gpu != NULL ? hakios_metal_device_allocated_bytes(_gpu) : 0);
+
+		if (limit < budget) {
+			budget = limit;
+		}
+	}
+	return budget;
+}
 
 /* The sample counts a texture and a render pipeline take here: 1, 2 and 4 (texture.cpp's multisample rule; the
  * pipeline's rasterSampleCount check). Not implemented, both answered NO through the zero stub -- also for 1 -- and
@@ -5294,6 +5359,27 @@ hm_next_resource_id(void)
 	return __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED);
 }
 
+/* The rows a copy of a surface is taken from and written back into (-hakiosShadow:plane:): the surface's own, or one
+ * plane's of a planar surface. */
+static uint8_t *
+hm_shadow_rows(IOSurfaceRef surface, NSUInteger plane)
+{
+	return IOSurfaceGetPlaneCount(surface) > 1 ? IOSurfaceGetBaseAddressOfPlane(surface, plane) : IOSurfaceGetBaseAddress(surface);
+}
+
+static size_t
+hm_shadow_row_bytes(IOSurfaceRef surface, NSUInteger plane)
+{
+	return IOSurfaceGetPlaneCount(surface) > 1 ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) : IOSurfaceGetBytesPerRow(surface);
+}
+
+static size_t
+hm_shadow_bytes(IOSurfaceRef surface, NSUInteger plane)
+{
+	return IOSurfaceGetPlaneCount(surface) > 1 ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) * IOSurfaceGetHeightOfPlane(surface, plane) :
+						      IOSurfaceGetBytesPerRow(surface) * IOSurfaceGetHeight(surface);
+}
+
 /* the nil this device returns for a texture it cannot make, with the sentence that says why: Metal validates nothing before
  * this call (the base class has no -newTextureWithDescriptor: at all), so this line is the only account of the refusal */
 static id
@@ -5579,6 +5665,98 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 	return [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
 }
 
+/* One plane of a planar surface in a plain colour format: what CoreVideo's texture cache asks for a pixel buffer's planes
+ * one by one (CVMetalTextureCacheCreateTextureFromImage with a plane index), and VideoToolbox's Metal transfer for the
+ * planes it writes -- in mediaserverd, plane 0 of a 1128x1504 '420f' buffer as a 282x1504 R32Uint texture of usage
+ * ShaderWrite, four luma bytes a texel. The texture is the plane's rows where they lie; rows the GPU cannot take
+ * (a pitch or a start that is not a multiple of 64 bytes) are read and written through a copy of the plane, as a
+ * single-plane surface's are. What the descriptor and the plane decide is judged first, by the core's plan, which asks
+ * the kernel for nothing: a combination that cannot be served is a nil that costs no memory.
+ * The rules, as Apple's own layers state them: the plane exists ("requested plane (%u) is greater than the number of
+ * planes in the iosurface (%u)"), the size is inside it ("The given width or height exceeds the underlying IOSurface
+ * width/height"), and the texture's row is inside the plane's ("Descriptor row bytes (%ld) larger than surface row
+ * bytes (%ld)") -- the strings of Metal's validation and of the drivers' texture creation in the macOS shared cache. */
+- (HakiosMetalTexture *)hakiosNewTextureWithDescriptor:(MTLTextureDescriptor *)descriptor usage:(MTLTextureUsage)usage plane:(NSUInteger)plane
+				       ofPlanarSurface:(IOSurfaceRef)surface
+{
+	const size_t planes = IOSurfaceGetPlaneCount(surface);
+	const OSType fourcc = IOSurfaceGetPixelFormat(surface);
+	hakios_metal_texture *texture = NULL;
+	HakiosMetalTexture *t;
+
+	if (plane >= planes || [descriptor width] == 0 || [descriptor height] == 0 || [descriptor width] > 32767 || [descriptor height] > 32767) {
+		return hm_refuse_texture([NSString stringWithFormat:@"a %lux%lu texture of pixel format %lu over plane %lu of IOSurface %u ('%c%c%c%c', "
+							    "%zu plane(s)): a plane of the surface and a size of 1 to 32767 are what it takes",
+							    (unsigned long)[descriptor width], (unsigned long)[descriptor height],
+							    (unsigned long)[descriptor pixelFormat], (unsigned long)plane, IOSurfaceGetID(surface),
+							    (char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc, planes]);
+	}
+	const unsigned format = (unsigned)[descriptor pixelFormat], width = (unsigned)[descriptor width], height = (unsigned)[descriptor height];
+	const uint64_t offset = (uint64_t)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface, plane) - (uintptr_t)IOSurfaceGetBaseAddress(surface));
+	const unsigned rowBytes = (unsigned)IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+	const unsigned planeWidth = (unsigned)IOSurfaceGetWidthOfPlane(surface, plane), planeHeight = (unsigned)IOSurfaceGetHeightOfPlane(surface, plane);
+	const unsigned element = (unsigned)IOSurfaceGetBytesPerElementOfPlane(surface, plane);
+	const BOOL linear = rowBytes % 64 == 0 && offset % 64 == 0;
+	/* (for the copy, the rows it would have: what is judged then is the format and the size against the plane) */
+	const unsigned judgedRow = linear ? rowBytes : (unsigned)(((uint64_t)planeWidth * element + 63) & ~63ull);
+
+	if (hakios_metal_texture_plan_iosurface_plane(IOSurfaceGetID(surface), (unsigned)plane, format, width, height, (unsigned)usage,
+						      linear ? offset : 0, judgedRow, planeWidth, planeHeight, element) != 0) {
+		return hm_refuse_texture([NSString stringWithFormat:@"over IOSurface %u ('%c%c%c%c', %zux%zu, %zu planes), usage %#lx: %s",
+							    IOSurfaceGetID(surface), (char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8),
+							    (char)fourcc, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), planes,
+							    (unsigned long)[descriptor usage], hakios_metal_error()]);
+	}
+	if (linear) {
+		/* (a render target wherever the core takes one, as over a single-plane surface: the rows are linear) */
+		if ((usage & MTLTextureUsageRenderTarget) == 0) {
+			texture = hakios_metal_texture_new_iosurface_plane(_gpu, IOSurfaceGetID(surface), (unsigned)plane, format, width, height,
+									   (unsigned)(usage | MTLTextureUsageRenderTarget), offset, rowBytes, planeWidth,
+									   planeHeight, element);
+			if (texture != NULL) {
+				usage |= MTLTextureUsageRenderTarget;
+			}
+		}
+		if (texture == NULL) {
+			texture = hakios_metal_texture_new_iosurface_plane(_gpu, IOSurfaceGetID(surface), (unsigned)plane, format, width, height,
+									   (unsigned)usage, offset, rowBytes, planeWidth, planeHeight, element);
+		}
+		if (texture != NULL) {
+			HM_ONCE("a texture over one plane of a planar IOSurface: plane %lu of a '%c%c%c%c' %zux%zu (%ux%u, %u byte(s) an element, rows of "
+				"%u bytes from +%llu) as a %ux%u texture of pixel format %u, usage %#lx\n", (unsigned long)plane, (char)(fourcc >> 24),
+				(char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+				planeWidth, planeHeight, element, rowBytes, (unsigned long long)offset, width, height, format, (unsigned long)usage);
+			t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
+			[t hakiosSetIOSurface:surface plane:plane];
+			return t;
+		}
+	} else {
+		const MTLTextureUsage writes = usage & MTLTextureUsageShaderWrite;
+		MTLTextureUsage copyUsage = MTLTextureUsageShaderRead | writes | MTLTextureUsageRenderTarget;
+
+		texture = hakios_metal_texture_new_levels(_gpu, 2, format, width, height, 1, (unsigned)copyUsage);
+		if (texture == NULL) {
+			copyUsage = MTLTextureUsageShaderRead | writes;
+			texture = hakios_metal_texture_new_levels(_gpu, 2, format, width, height, 1, (unsigned)copyUsage);
+		}
+		if (texture != NULL) {
+			HM_ONCE("a texture over a plane of rows the GPU cannot take (plane %lu of a '%c%c%c%c' %zux%zu: rows of %u bytes from +%llu) is "
+				"a copy of them, made again when the surface changes\n", (unsigned long)plane, (char)(fourcc >> 24), (char)(fourcc >> 16),
+				(char)(fourcc >> 8), (char)fourcc, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), rowBytes,
+				(unsigned long long)offset);
+			t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:copyUsage];
+			[t hakiosShadow:surface plane:plane];
+			return t;
+		}
+	}
+	return hm_refuse_texture([NSString stringWithFormat:@"a %ux%u texture of pixel format %u over plane %lu of IOSurface %u ('%c%c%c%c', %zux%zu; "
+						    "the plane %ux%u, %u byte(s) an element, rows of %u bytes from +%llu), usage %#lx: %s", width, height,
+						    format, (unsigned long)plane, IOSurfaceGetID(surface), (char)(fourcc >> 24), (char)(fourcc >> 16),
+						    (char)(fourcc >> 8), (char)fourcc, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), planeWidth,
+						    planeHeight, element, rowBytes, (unsigned long long)offset, (unsigned long)[descriptor usage],
+						    hakios_metal_error()]);
+}
+
 /* An IOSurface is the window server's memory, and what CAMetalLayer makes its drawables of: the texture is the
  * surface's own pixels (hakios-metal asks the kernel for the surface's memory as a GPU buffer), so drawing into it is
  * drawing into what the compositor reads. A refusal here is LOUD and named, never a quiet nil: the earlier plug-in's
@@ -5654,6 +5832,9 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 				}
 			}
 		}
+	}
+	if (IOSurfaceGetPlaneCount(surface) >= 2 && [descriptor pixelFormat] != 500 && [descriptor pixelFormat] != 540) {
+		return [self hakiosNewTextureWithDescriptor:descriptor usage:usage plane:plane ofPlanarSurface:surface];
 	}
 	if (([descriptor pixelFormat] == 500 || [descriptor pixelFormat] == 540) && IOSurfaceGetPlaneCount(surface) == 2 && plane == 0) {
 		/* the private two-plane formats a decoded picture is sampled through, read and never drawn into: 500,
@@ -5786,9 +5967,25 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
 	const double began = hm_ft_work_began();
+	const double start = hm_now();
 	id texture = [[self hakiosNewTextureWithDescriptor:descriptor iosurface:surface plane:plane] hakiosSwizzledBy:[descriptor swizzle]];
+	const double took = hm_now() - start;
 
 	hm_ft_worked(HM_FT_W_SURFACE, began, 0);
+	/* a texture over a surface is a request to the kernel and a mapping, a fraction of a millisecond: one that takes
+	 * 50 ms waited for something (the kernel's lock behind a long submission, the surface's memory being wired), and
+	 * whatever the process did meanwhile is not this call's -- said the first times, with what was asked */
+	if (took >= 0.050) {
+		static _Atomic unsigned said;
+
+		if (atomic_fetch_add(&said, 1) < 16) {
+			hm_print("a texture over IOSurface %u took %.0f ms: plane %lu, %lux%lu, pixel format %lu, usage %#lx -> %s\n",
+				 surface != NULL ? IOSurfaceGetID(surface) : 0, took * 1e3, (unsigned long)plane,
+				 descriptor != nil ? (unsigned long)[descriptor width] : 0ul, descriptor != nil ? (unsigned long)[descriptor height] : 0ul,
+				 descriptor != nil ? (unsigned long)[descriptor pixelFormat] : 0ul,
+				 descriptor != nil ? (unsigned long)[descriptor usage] : 0ul, texture != nil ? "a texture" : "nil");
+		}
+	}
 	return texture;
 }
 
@@ -6035,11 +6232,18 @@ HM_REFUSES_OUT_LOUD
 		 * last one lets go (hm_nocopy_released) */
 		hakios_metal_buffer_free(_buffer);
 	}
+	hm_heap_gave_back(_heap, _heapBytes);
+	[_heap release];
 	[_device release];
 	[super dealloc];
 }
 
 - (hakios_metal_buffer *)hakiosBuffer { return _buffer; }
+- (void)hakiosFromHeap:(id)heap bytes:(NSUInteger)bytes
+{
+	_heap = [heap retain];
+	_heapBytes = bytes;
+}
 
 - (void *)contents          { return hakios_metal_buffer_contents(_buffer); }
 - (NSUInteger)length        { return (NSUInteger)hakios_metal_buffer_length(_buffer); }
@@ -6066,12 +6270,17 @@ HM_REFUSES_OUT_LOUD
 	       (hakios_metal_buffer_is_program_memory(_buffer) ? MTLResourceCPUCacheModeDefaultCache : MTLResourceCPUCacheModeWriteCombined);
 }
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeDefault; }
-- (id)heap                                  { return nil; }   /* every buffer is its own allocation; nil is Metal's answer for that */
+- (id)heap                                  { return _heap; }   /* nil for the device's own: Metal's answer for that */
 - (NSUInteger)heapOffset                    { return 0; }
-- (BOOL)isAliasable                         { return NO; }
-/* a buffer is its own kernel allocation, as a texture is: there is nothing to alias within (a placement heap's included) */
+- (BOOL)isAliasable                         { return _heap != nil && _heapBytes == 0; }
+/* a buffer is its own kernel allocation, as a texture is: there is nothing to alias within (a placement heap's included).
+ * A heap's buffer gives the heap its bytes back, which is what the call is for: later resources of the heap fit. */
 - (void)makeAliasable
 {
+	if (_heap != nil) {
+		hm_heap_gave_back(_heap, __atomic_exchange_n(&_heapBytes, 0, __ATOMIC_RELAXED));
+		return;
+	}
 	HM_ONCE("a buffer was asked to become aliasable; every buffer here is its own allocation and none aliases another\n");
 }
 
@@ -6197,8 +6406,16 @@ HM_REFUSES_OUT_LOUD
 	return self;
 }
 
+- (void)hakiosFromHeap:(id)heap bytes:(NSUInteger)bytes
+{
+	_heap = [heap retain];
+	_heapBytes = bytes;
+}
+
 - (void)dealloc
 {
+	hm_heap_gave_back(_heap, _heapBytes);
+	[_heap release];
 	if (_texture != NULL && (_parent == nil || _ownsView)) {
 		hakios_metal_texture_free(_texture);   /* a command buffer still using it keeps its memory */
 	}
@@ -6247,9 +6464,9 @@ HM_REFUSES_OUT_LOUD
 - (MTLCPUCacheMode)cpuCacheMode             { return MTLCPUCacheModeWriteCombined; }
 - (MTLResourceOptions)resourceOptions       { return MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined; }
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeDefault; }
-- (id)heap                                  { return nil; }
+- (id)heap                                  { return _heap; }
 - (NSUInteger)heapOffset                    { return 0; }
-- (BOOL)isAliasable                         { return NO; }
+- (BOOL)isAliasable                         { return _heap != nil && _heapBytes == 0; }
 
 /* the layout's own bytes, every level and slice of it (the core's plan, which -heapTextureSizeAndAlignWithDescriptor:
  * answers with too, so that a heap counts a texture as it sized it); a view's are its parent's memory */
@@ -6258,9 +6475,14 @@ HM_REFUSES_OUT_LOUD
 	return (NSUInteger)hakios_metal_texture_allocated_bytes(_texture);
 }
 
-/* a texture is its own kernel allocation, as a buffer is; there is no heap to alias within */
+/* a texture is its own kernel allocation, as a buffer is; there is no heap to alias within. A heap's texture gives the
+ * heap its bytes back, which is what the call is for: later resources of the heap fit. */
 - (void)makeAliasable
 {
+	if (_heap != nil) {
+		hm_heap_gave_back(_heap, __atomic_exchange_n(&_heapBytes, 0, __ATOMIC_RELAXED));
+		return;
+	}
 	HM_ONCE("a texture was asked to become aliasable; every texture here is its own allocation and none aliases another\n");
 }
 
@@ -6384,7 +6606,7 @@ HM_REFUSES_OUT_LOUD
 	 * when it is encoded -- before the last one's command buffer has written back when the GPU is busy. Writing a
 	 * whole copy back then put its stale rows over what the other pass drew: black bands that moved from frame to
 	 * frame. Against the base, each copy carries only its own drawing, and passes into different parts merge. */
-	const size_t bytes = IOSurfaceGetBytesPerRow(_iosurface) * IOSurfaceGetHeight(_iosurface);
+	const size_t bytes = hm_shadow_bytes(_iosurface, _iosurfacePlane);
 	const double began = hm_now();
 	uint8_t *now = malloc(bytes);
 
@@ -6392,11 +6614,11 @@ HM_REFUSES_OUT_LOUD
 		free(now);
 		return;
 	}
-	uint8_t *surface = IOSurfaceGetBaseAddress(_iosurface);
+	uint8_t *surface = hm_shadow_rows(_iosurface, _iosurfacePlane);
 
 	memcpy(now, _shadowBase != NULL ? _shadowBase : surface, bytes);
 	(void)hakios_metal_texture_read(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture), now,
-					(uint64_t)IOSurfaceGetBytesPerRow(_iosurface));
+					(uint64_t)hm_shadow_row_bytes(_iosurface, _iosurfacePlane));
 	if (_shadowBase == NULL) {
 		memcpy(surface, now, bytes);
 	} else {
@@ -6415,7 +6637,13 @@ HM_REFUSES_OUT_LOUD
 
 - (void)hakiosShadow:(IOSurfaceRef)surface
 {
-	[self hakiosSetIOSurface:surface plane:0];
+	[self hakiosShadow:surface plane:0];
+}
+
+/* the same over one plane of a planar surface: the copy is of that plane's rows, and goes back into them */
+- (void)hakiosShadow:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	[self hakiosSetIOSurface:surface plane:plane];
 	_shadow = YES;
 	_shadowSeed = IOSurfaceGetSeed(surface) + 1;   /* (not the surface's seed: the first refresh copies) */
 	[self hakiosRefreshShadow];
@@ -6526,16 +6754,17 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 		[self hakiosConvertYCbCr];
 	} else {
 		(void)hakios_metal_texture_replace(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture),
-						   IOSurfaceGetBaseAddress(_iosurface), (uint64_t)IOSurfaceGetBytesPerRow(_iosurface));
+						   hm_shadow_rows(_iosurface, _iosurfacePlane),
+						   (uint64_t)hm_shadow_row_bytes(_iosurface, _iosurfacePlane));
 		/* a copy something writes keeps what it took, for -hakiosWriteBackShadow to tell its own drawing from */
 		if ((_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0) {
-			const size_t bytes = IOSurfaceGetBytesPerRow(_iosurface) * IOSurfaceGetHeight(_iosurface);
+			const size_t bytes = hm_shadow_bytes(_iosurface, _iosurfacePlane);
 
 			if (_shadowBase == NULL) {
 				_shadowBase = malloc(bytes);
 			}
 			if (_shadowBase != NULL) {
-				memcpy(_shadowBase, IOSurfaceGetBaseAddress(_iosurface), bytes);
+				memcpy(_shadowBase, hm_shadow_rows(_iosurface, _iosurfacePlane), bytes);
 			}
 		}
 	}

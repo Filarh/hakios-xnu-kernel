@@ -1106,6 +1106,87 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
     return adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, pitchAlign, surfaceId));
 }
 
+// One plane of a planar surface as a texture of a plain colour format. The rules are those of a single-plane surface
+// above, with the plane's geometry where the surface's was: the row of the texture inside the row of the plane
+// (Apple's drivers say "Descriptor row bytes (%ld) larger than surface row bytes (%ld)"), the size inside the plane's
+// (MTLDebugDevice: "The given width or height exceeds the underlying IOSurface width/height"), and what the GPU asks of
+// linear rows (64-byte pitch and start: RB_MRT_PITCH, TEX_CONST_2).
+bool Texture::planSurfacePlane(uint32_t surfaceId, uint32_t plane, const SurfaceRows& rows, const TextureDesc& desc, const FormatInfo** infoOut,
+                               std::string* why) {
+    const FormatInfo* info = formatInfo(desc.format);
+    const std::string name = "plane " + n(plane) + " of IOSurface " + n(surfaceId);
+    if (info == nullptr || desc.type != TextureType::k2D || desc.mipLevels != 1 || desc.samples != 1) {
+        return refuse(why, "a texture over " + name + " of type " + n(uint32_t(desc.type)) + ", pixel format " + n(uint32_t(desc.format)) + ", " +
+                               n(desc.mipLevels) + " level(s) and " + n(desc.samples) + " sample(s): a single-level 2D texture of one of the served colour formats is "
+                               "what a plane takes");
+    }
+    if (info->depth || info->blockW > 1 || info->twoPlane) {
+        return refuse(why, std::string("a ") + info->name + " texture over " + name + ": a plane is read in a plain colour format");
+    }
+    if ((desc.usage & ~(kTextureUsageRead | kTextureUsageWrite | kTextureUsageRenderTarget)) != 0) {
+        return refuse(why, "texture usage " + n(desc.usage) + " has bits other than shader read (1), shader write (2) and render target (4): not served");
+    }
+    if (desc.width == 0 || desc.height == 0 || desc.width > 32767 || desc.height > 32767 || rows.bytesPerElement == 0 || rows.width == 0 ||
+        desc.height > rows.height) {
+        return refuse(why, "a " + n(desc.width) + " x " + n(desc.height) + " texture over the " + n(rows.width) + " x " + n(rows.height) + " " + name + " (" +
+                               n(rows.bytesPerElement) + " byte(s) an element)");
+    }
+    const uint64_t textureRow = uint64_t(desc.width) * info->bytesPerPixel, planeRow = uint64_t(rows.width) * rows.bytesPerElement;
+    if (info->bytesPerPixel < rows.bytesPerElement || textureRow > planeRow) {
+        return refuse(why, "a " + n(desc.width) + " x " + n(desc.height) + " " + info->name + " texture (rows of " + n(textureRow) + " bytes) over the " +
+                               n(rows.width) + " x " + n(rows.height) + " " + name + " of " + n(rows.bytesPerElement) + " byte(s) an element (rows of " +
+                               n(planeRow) + "): the format's pixel is the plane's element or several of them, and its row no longer than the plane's");
+    }
+    if (rows.rowBytes % 64 != 0 || rows.offset % 64 != 0 || rows.rowBytes < textureRow) {
+        return refuse(why, name + "'s rows of " + n(rows.rowBytes) + " bytes from offset " + n(rows.offset) +
+                               ": the GPU wants a pitch and a start that are multiples of 64 bytes, and rows that hold the width");
+    }
+    *infoOut = info;
+    return true;
+}
+
+std::shared_ptr<Texture> Texture::wrapSurfacePlane(Gpu& gpu, uint32_t surfaceId, uint32_t plane, const SurfaceRows& rows, const TextureDesc& desc,
+                                                   std::string* why) {
+    const FormatInfo* info = nullptr;
+    if (!planSurfacePlane(surfaceId, plane, rows, desc, &info, why)) {
+        return nullptr;
+    }
+    SurfaceInfo s;
+    std::shared_ptr<Buffer> buffer = surfaceBuffer(gpu, surfaceId, &s, why);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    // (as wrapSurface: a buffer whose texture is refused here is not kept for the next wrap)
+    struct KeptIfWrapped {
+        Gpu& gpu;
+        std::shared_ptr<Buffer> buffer;
+        bool wrapped = false;
+        ~KeptIfWrapped() {
+            if (!wrapped) forgetSurfaceBuffer(&gpu, buffer);
+        }
+    } kept{gpu, buffer};
+    const std::string name = "plane " + n(plane) + " of IOSurface " + n(surfaceId);
+    if (s.ubwc) {
+        refuse(why, name + ": the surface is compressed (UBWC), which has no planes to read as rows");
+        return nullptr;
+    }
+    if (plane >= std::max<uint32_t>(s.planes, 1)) {
+        refuse(why, name + ": the surface has " + n(s.planes) + " plane(s)");
+        return nullptr;
+    }
+    const uint64_t textureRow = uint64_t(desc.width) * info->bytesPerPixel;
+    if (rows.offset + uint64_t(rows.rowBytes) * (desc.height - 1) + textureRow > s.size) {
+        refuse(why, name + "'s rows of " + n(rows.rowBytes) + " bytes from offset " + n(rows.offset) + " for " + n(desc.height) + " rows of " + n(textureRow) +
+                        " bytes: past the surface's " + n(s.size) + " bytes");
+        return nullptr;
+    }
+    // TEX_CONST_2.PITCHALIGN: the largest k up to log2(cpp) with the pitch a multiple of 64 << k
+    uint32_t pitchAlign = 0;
+    while (pitchAlign < log2u(info->bytesPerPixel) && rows.rowBytes % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
+    kept.wrapped = true;
+    return adopt(new Texture(std::move(buffer), desc, info, rows.rowBytes, rows.offset, pitchAlign, surfaceId));
+}
+
 // A '420f' or '420v' surface as one YCbCr8_420_2P texture: plane 0 the luma rows the kernel describes, plane 1 the
 // interleaved CbCr rows at half the size the caller read off the surface. Both must be rows the TP takes from their
 // own addresses (64-byte pitches and starts, as for any linear texture here) and lie inside the surface's memory.

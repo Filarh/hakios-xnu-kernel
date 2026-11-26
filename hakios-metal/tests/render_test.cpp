@@ -4161,6 +4161,143 @@ TEST(a_texture_over_an_iosurface_refuses_what_the_gpu_cannot_take) {
     CHECK_EQ(r.fake->liveBuffers(), 0u);
 }
 
+// mediaserverd, the camera's preview (VideoToolbox's Metal transfer under CMCapture's BWPixelTransferNode, through
+// CoreVideo's texture cache): -newTextureWithDescriptor:iosurface:plane: with a 282x1504 R32Uint descriptor of usage
+// ShaderWrite over plane 0 of a 1128x1504 '420f' pixel buffer -- the luma plane, a byte an element, written four bytes
+// a texel. The surface as CoreVideo lays a 1128-wide biplanar buffer out: rows of 1152 bytes (64-byte row alignment),
+// the luma's 1504 rows and then the chroma's 752 (564x752 elements of two bytes).
+namespace {
+const uint32_t k420fCode = 0x34323066u;
+const Texture::SurfaceRows kLuma1128{0, 1152, 1128, 1504, 1};
+const Texture::SurfaceRows kChroma1128{uint64_t(1152) * 1504, 1152, 564, 752, 2};
+TextureDesc planeDesc(PixelFormat f, uint32_t w, uint32_t h, uint32_t usage) {
+    TextureDesc d;
+    d.format = f;
+    d.width = w;
+    d.height = h;
+    d.usage = usage;
+    return d;
+}
+}  // namespace
+
+TEST(a_plane_of_a_planar_iosurface_is_a_texture_of_its_rows) {
+    Rig r;
+    r.fake->addSurface(31, 1128, 1504, 1152, k420fCode, 0, 2);
+    const uint64_t allocatedBefore = r.gpu->allocatedBytes();
+    const uint32_t liveBefore = r.fake->liveBuffers();
+    std::string why;
+    // the call as it was measured: plane 0, 282x1504, format 53, usage 0x2
+    auto luma = Texture::wrapSurfacePlane(*r.gpu, 31, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 282, 1504, kTextureUsageWrite), &why);
+    CHECK(luma != nullptr);
+    if (luma == nullptr) {
+        std::fprintf(stderr, "  %s\n", why.c_str());
+        return;
+    }
+    CHECK_EQ(luma->surface(), 31u);
+    CHECK_EQ(luma->desc().width, 282u);
+    CHECK_EQ(luma->desc().height, 1504u);
+    CHECK_EQ(luma->level(0).pitch, 1152u);
+    // nothing of the driver's own was allocated for it: the texture is the surface's memory, one buffer of its size
+    CHECK_EQ(r.gpu->allocatedBytes(), allocatedBefore);
+    CHECK_EQ(r.fake->liveBuffers(), liveBefore + 1);
+    CHECK_EQ(luma->buffer()->length(), (uint64_t(1152) * 1504 + uint64_t(1152) * 752 + 0xfff) & ~0xfffull);
+    // the chroma plane beside it, as the transfer asks next: 564x752 RG8Unorm, and the same bytes as 282x752 R32Uint;
+    // both are the one buffer of the surface
+    auto chroma = Texture::wrapSurfacePlane(*r.gpu, 31, 1, kChroma1128, planeDesc(PixelFormat::kRG8Unorm, 564, 752, kTextureUsageWrite), &why);
+    auto chroma4 = Texture::wrapSurfacePlane(*r.gpu, 31, 1, kChroma1128, planeDesc(PixelFormat::kR32Uint, 282, 752, kTextureUsageWrite), &why);
+    CHECK(chroma != nullptr && chroma4 != nullptr);
+    if (chroma == nullptr || chroma4 == nullptr) {
+        std::fprintf(stderr, "  %s\n", why.c_str());
+        return;
+    }
+    CHECK(chroma->buffer() == luma->buffer() && chroma4->buffer() == luma->buffer());
+    CHECK_EQ(chroma->gpuAddress(), luma->gpuAddress() + uint64_t(1152) * 1504);
+    CHECK_EQ(r.gpu->allocatedBytes(), allocatedBefore);
+    CHECK_EQ(r.fake->liveBuffers(), liveBefore + 1);
+    // the rows are the planes': a texel of the luma texture is four luma bytes where they lie, a chroma one the pair
+    const uint32_t texel = 0x44332211u;
+    CHECK(luma->replace(281, 1503, 1, 1, &texel, 4, &why));
+    const uint8_t pair[2] = {0xaa, 0xbb};
+    CHECK(chroma->replace(563, 751, 1, 1, pair, 2, &why));
+    const std::vector<uint8_t> bytes = r.fake->surfaceBytes(31);
+    const uint64_t lumaAt = uint64_t(1152) * 1503 + 1124, chromaAt = uint64_t(1152) * 1504 + uint64_t(1152) * 751 + 1126;
+    CHECK(bytes.size() > chromaAt + 1);
+    if (bytes.size() > chromaAt + 1) {
+        CHECK(bytes[lumaAt] == 0x11 && bytes[lumaAt + 1] == 0x22 && bytes[lumaAt + 2] == 0x33 && bytes[lumaAt + 3] == 0x44);
+        CHECK(bytes[chromaAt] == 0xaa && bytes[chromaAt + 1] == 0xbb);
+        CHECK(bytes[lumaAt + 4] == 0 && bytes[chromaAt - 1] == 0);
+    }
+    uint32_t back = 0;
+    CHECK(chroma4->read(281, 751, 1, 1, &back, 4, &why));
+    CHECK_EQ(back >> 16, 0xbbaau);
+    // a smaller texture than the plane, and the plane in its own element's format
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 31, 0, kLuma1128, planeDesc(PixelFormat::kR8Unorm, 1128, 1504, kTextureUsageRead), &why) != nullptr);
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 31, 0, kLuma1128, planeDesc(PixelFormat::kR8Unorm, 640, 480, kTextureUsageRead), &why) != nullptr);
+    CHECK(Texture::wrapSurfacePlane(*r.gpu, 31, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 100, 100, kTextureUsageRead | kTextureUsageWrite), &why) != nullptr);
+    luma.reset();
+    chroma.reset();
+    chroma4.reset();
+    CHECK_EQ(r.gpu->allocatedBytes(), allocatedBefore);
+}
+
+TEST(a_plane_of_a_planar_iosurface_is_refused_before_the_kernel_is_asked) {
+    Rig r;
+    r.fake->addSurface(32, 1128, 1504, 1152, k420fCode, 0, 2);
+    const uint64_t allocatedBefore = r.gpu->allocatedBytes();
+    const uint32_t liveBefore = r.fake->liveBuffers();
+    // (surface 99 does not exist: a refusal that names the plane, not the missing surface, was made without asking for it)
+    auto refusedWith = [&](uint32_t id, uint32_t plane, const Texture::SurfaceRows& rows, const TextureDesc& desc, const char* want) {
+        std::string why;
+        CHECK(Texture::wrapSurfacePlane(*r.gpu, id, plane, rows, desc, &why) == nullptr);
+        CHECK(has(why, want));
+        if (!has(why, want)) std::fprintf(stderr, "  got \"%s\"\n", why.c_str());
+        CHECK_EQ(r.gpu->allocatedBytes(), allocatedBefore);
+        CHECK_EQ(r.fake->liveBuffers(), liveBefore);
+    };
+    const uint32_t w = kTextureUsageWrite;
+    // a row longer than the plane's: one texel more than a quarter of the luma's width, and the luma's width in R32Uint
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 283, 1504, w), "rows of 1132 bytes) over the 1128 x 1504 plane 0 of IOSurface 99");
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 1128, 1504, w), "its row no longer than the plane's");
+    // more rows than the plane has (the luma's height asked of the chroma plane)
+    refusedWith(99, 1, kChroma1128, planeDesc(PixelFormat::kR32Uint, 282, 1504, w), "a 282 x 1504 texture over the 564 x 752 plane 1 of IOSurface 99");
+    // a pixel smaller than the plane's element
+    refusedWith(99, 1, kChroma1128, planeDesc(PixelFormat::kR8Unorm, 564, 752, w), "the format's pixel is the plane's element or several of them");
+    // sizes that are nothing, or past what a texture is; a size whose bytes would overflow 32 bits is one of them
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 0, 1504, w), "a 0 x 1504 texture over");
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 0x40000000u, 4, w), "a 1073741824 x 4 texture over");
+    refusedWith(99, 0, Texture::SurfaceRows{0, 1152, 1128, 1504, 0}, planeDesc(PixelFormat::kR32Uint, 282, 1504, w), "(0 byte(s) an element)");
+    // rows the GPU cannot take where they lie: 1128-byte rows, a start off a 64-byte boundary
+    refusedWith(99, 0, Texture::SurfaceRows{0, 1128, 1128, 1504, 1}, planeDesc(PixelFormat::kR32Uint, 282, 1504, w), "rows of 1128 bytes from offset 0");
+    refusedWith(99, 0, Texture::SurfaceRows{16, 1152, 1128, 1504, 1}, planeDesc(PixelFormat::kR32Uint, 282, 1504, w), "rows of 1152 bytes from offset 16");
+    // formats that are not a plane's: depth, compressed, the two-plane one; more than one level
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat::kDepth32Float, 282, 1504, kTextureUsageRenderTarget), "a plane is read in a plain colour format");
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat(9999), 282, 1504, w), "a single-level 2D texture of one of the served colour formats");
+    {
+        TextureDesc levels = planeDesc(PixelFormat::kR32Uint, 282, 1504, w);
+        levels.mipLevels = 2;
+        refusedWith(99, 0, kLuma1128, levels, "2 level(s)");
+    }
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 282, 1504, 0x10), "texture usage 16 has bits other than");
+    // what only the surface decides, after it was asked for: no such surface, a plane it does not have, rows past its
+    // memory -- each leaves no buffer open and nothing allocated
+    refusedWith(99, 0, kLuma1128, planeDesc(PixelFormat::kR32Uint, 282, 1504, w), "IOSurface 99: the driver gave no buffer for it: no such surface");
+    refusedWith(32, 2, kLuma1128, planeDesc(PixelFormat::kR32Uint, 282, 1504, w), "plane 2 of IOSurface 32: the surface has 2 plane(s)");
+    refusedWith(32, 1, Texture::SurfaceRows{uint64_t(1152) * 1504, 1152, 564, 4000, 2}, planeDesc(PixelFormat::kRG8Unorm, 564, 4000, w),
+                "past the surface's");
+    refusedWith(32, 1, Texture::SurfaceRows{uint64_t(1) << 40, 1152, 564, 752, 2}, planeDesc(PixelFormat::kRG8Unorm, 564, 752, w), "past the surface's");
+    r.fake->addSurface(33, 64, 64, 256, 0x42475241u);
+    refusedWith(33, 1, Texture::SurfaceRows{0, 256, 64, 64, 4}, planeDesc(PixelFormat::kBGRA8Unorm, 64, 64, w), "plane 1 of IOSurface 33: the surface has 1 plane(s)");
+    // the last row may end where the surface ends: a plane whose rows are longer than its last row's bytes
+    r.fake->addSurface(34, 16, 2, 4096, 0x4c303038u, 0, 2);   // 2 rows of 4096, then 1 chroma row: 3 pages
+    {
+        std::string why;
+        CHECK(Texture::wrapSurfacePlane(*r.gpu, 34, 1, Texture::SurfaceRows{8192, 4096, 8, 1, 2}, planeDesc(PixelFormat::kRG8Unorm, 8, 1, w), &why) != nullptr);
+        CHECK(Texture::wrapSurfacePlane(*r.gpu, 34, 1, Texture::SurfaceRows{8192, 4096, 8, 2, 2}, planeDesc(PixelFormat::kRG8Unorm, 8, 2, w), &why) == nullptr);
+        CHECK(has(why, "past the surface's 12288 bytes"));
+    }
+    CHECK_EQ(r.gpu->allocatedBytes(), allocatedBefore);
+}
+
 // --- indexed and instanced draws ---------------------------------------------------------------------------------------------
 
 namespace {
