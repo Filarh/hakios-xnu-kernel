@@ -23,7 +23,10 @@
 //                           1 to 72 draws into targets of 41x21 to 752x1626, the uber shader's pipelines changing at
 //                           almost every draw, the constants' places and the textures moving with each; Y is X's
 //                           frame with every pass in sysmem (on the phone metal_hsr=1 gives the screen's passes a
-//                           depth attachment, which keeps them out of GMEM)
+//                           depth attachment, which keeps them out of GMEM); Z is a chat list scrolling (Telegram's:
+//                           290 draws in 51 passes, most of them small surfaces of 1 to 8 draws, eight pipelines,
+//                           quads of six vertices without indices), in sysmem; M is Z with the screen's passes drawn
+//                           with hidden surface removal (metal_hsr=1: an opaque draw is written twice)
 // Each scene is recorded once to warm the queue's pools, then N times measured (--runs, 5): the time inside the draw
 // calls alone, a draw; the heap allocations in them; the words the command processor is given.
 // --cold KB touches KB kilobytes before each draw, so that a draw starts with as little in the processor's caches as
@@ -488,6 +491,9 @@ struct Frame {
     // ...or PASSES in turn, the Nth for PASS_DRAWS[N] draws into a target of PASS_SIZE[N] (viewport and scissors in it)
     std::vector<uint32_t> passDraws;
     std::vector<std::pair<unsigned, unsigned>> passSize;
+    // ...and, for some of them, hidden surface removal as the plug-in's metal_hsr=1 gives the screen's passes (scene M):
+    // PASS_HSR[N] whether the Nth pass is drawn so (hakios_metal_cb_set_hsr around its draws)
+    std::vector<uint8_t> passHsr;
 };
 
 // the draws of F in order into CB, each timed by CLOCK when there is one; a refusal is counted and the first kept
@@ -503,6 +509,11 @@ void recordDraws(hakios_metal_cb* cb, Frame& f, Result& res, Clock* timed) {
         pass = f.passes[0];
         W = f.passSize[0].first, H = f.passSize[0].second;
     }
+    if (!f.passHsr.empty()) {
+        // (the phone's passes drawn so are the compressed screen's; the host's suites have no compressed texture)
+        hakios_metal_cb_set_hsr_test(cb, 0, ~0u, 1);
+        hakios_metal_cb_set_hsr(cb, f.passHsr[0]);
+    }
     for (size_t i = 0; i < f.order.size(); i++) {
         Layer& l = f.layers[f.order[i]];
         if (f.drawsAPass != 0 && i % f.drawsAPass == 0) pass = f.passes[(i / f.drawsAPass) % f.passes.size()];
@@ -511,6 +522,7 @@ void recordDraws(hakios_metal_cb* cb, Frame& f, Result& res, Clock* timed) {
             passEnd += f.passDraws[passAt];
             pass = f.passes[passAt];
             W = f.passSize[passAt].first, H = f.passSize[passAt].second;
+            if (!f.passHsr.empty()) hakios_metal_cb_set_hsr(cb, f.passHsr[passAt]);
         }
         hakios_metal_viewport vp{0, 0, double(W), double(H), 0, 1};
         hakios_metal_scissor sc{};
@@ -898,7 +910,7 @@ void eachLayer(CRig& r, Common& c, Frame& f) {
 }
 
 void runStageScenes() {
-    if (asked.stages.empty() || !(wanted("S") || wanted("T") || wanted("U") || wanted("X") || wanted("Y"))) return;
+    if (asked.stages.empty() || !(wanted("S") || wanted("T") || wanted("U") || wanted("X") || wanted("Y") || wanted("Z") || wanted("M"))) return;
     std::vector<std::unique_ptr<LoadedStage>> vss, fss;
     {
         std::vector<std::string> files;
@@ -937,12 +949,13 @@ void runStageScenes() {
         }
         return;
     }
-    for (const char* letter : {"S", "T", "U", "X", "Y"}) {
+    for (const char* letter : {"S", "T", "U", "X", "Y", "Z", "M"}) {
         if (!wanted(letter)) continue;
         CRig r;
         Common c(r);
         Frame f;
-        f.gmem = letter[0] != 'T' && letter[0] != 'Y';
+        const bool list = letter[0] == 'Z' || letter[0] == 'M';
+        f.gmem = letter[0] != 'T' && letter[0] != 'Y' && !list;
         f.pass = c.mainPass(true);
         f.index = c.index;
         f.icons = c.icons;
@@ -995,6 +1008,54 @@ void runStageScenes() {
                 f.passSize.push_back({p.w, p.h});
             }
         }
+        if (list) {
+            // A chat list scrolling (Telegram's, lab 03 M68: metal_fps says a buffer holds 51.2 to 51.6 passes and 287 to
+            // 293 draws, 34 % of the draws with the program of the draw before; metal_fps=timeline's lines begin
+            // [515x275 4 draws] [750x1624 10] [750x1624 17] [128x64 4] [128x64 2] [128x64 1] [750x1624 1] [750x1624 9]
+            // [64x64 3] [64x64 2] [128x64 2] [64x64 3] and are cut there by the log): 51 passes and 290 draws, ten passes
+            // into the screen (one of 73 draws, the list itself) and 41 into small surfaces of their own, each cleared,
+            // of 1 to 8 draws. The passes past the twelfth are made up to those sums. All in sysmem, as the phone draws
+            // them (too few draws for tiles, or the screen's with metal_hsr=1); in M the screen's passes are drawn with
+            // hidden surface removal, as metal_hsr=1 draws them.
+            struct P { unsigned w, h; bool clear; uint32_t draws; };
+            std::vector<P> ps = {{515, 275, true, 4}, {750, 1624, false, 10}, {750, 1624, false, 17}, {128, 64, true, 4}, {128, 64, true, 2},
+                                 {128, 64, true, 1},  {750, 1624, false, 1},  {750, 1624, false, 9},  {64, 64, true, 3},  {64, 64, true, 2},
+                                 {128, 64, true, 2},  {64, 64, true, 3}};
+            const unsigned sizes[][2] = {{128, 64}, {64, 64}, {452, 48}, {496, 86}, {515, 275}};
+            const uint32_t small[] = {4, 6, 8, 7, 5, 2, 4, 3, 6, 5, 4, 2, 1, 3, 6, 8, 5, 4, 7, 3, 2, 6, 4, 5, 3, 2, 8, 6, 4, 5, 7, 3, 6};
+            uint32_t k = 0;
+            for (uint32_t d : small) {
+                ps.push_back(P{sizes[k % 5][0], sizes[k % 5][1], true, d});
+                if (k == 9) ps.push_back(P{750, 1624, false, 73});
+                if (k % 7 == 3) ps.push_back(P{750, 1624, false, 1});
+                k++;
+            }
+            std::map<std::pair<unsigned, unsigned>, std::pair<hakios_metal_texture*, hakios_metal_texture*>> surfaces;
+            for (const P& p : ps) {
+                hakios_metal_render_pass rp{};
+                const bool screen = p.w == 750 && p.h == 1624;
+                if (screen) {
+                    rp = c.mainPass(true);
+                } else {
+                    auto& s = surfaces[{p.w, p.h}];
+                    if (s.first == nullptr) {
+                        s.first = hakios_metal_texture_new(r.device, k2D, kBGRA8, p.w, p.h, kUsageRead | kUsageTarget);
+                        s.second = hakios_metal_texture_new(r.device, k2D, kBGRA8, p.w, p.h, kUsageRead | kUsageTarget);
+                        hakios_metal_texture_set_memoryless(s.second, asked.memoryless ? 1 : 0);
+                    }
+                    rp.color0 = s.first;
+                    rp.store_action = 1;
+                    rp.more[0].texture = s.second;
+                    rp.more[0].load_action = 0;
+                    rp.more[0].store_action = 1;
+                }
+                rp.load_action = p.clear ? 2 : 1;
+                f.passes.push_back(rp);
+                f.passDraws.push_back(p.draws);
+                f.passSize.push_back({p.w, p.h});
+                if (letter[0] == 'M') f.passHsr.push_back(screen ? 1 : 0);
+            }
+        }
         // every fragment stage with the first vertex stage it links with -- the one of its own family first, by the
         // names' common beginning (variable_blur_frag_lph with variable_blur_vert_lph) -- bound as its tables ask
         for (const auto& fs : fss) {
@@ -1036,7 +1097,9 @@ void runStageScenes() {
                     l.vs[vertexAt] = c.vertices;
                     l.vsCount = vertexAt + 1;
                     // (CoreAnimation's vertices lie in its ring of constants, further along at each draw)
-                    l.vsUniform[vertexAt] = letter[0] == 'X' || letter[0] == 'Y';
+                    l.vsUniform[vertexAt] = letter[0] == 'X' || letter[0] == 'Y' || list;
+                    // (a chat list's quads: six vertices each, no index buffer)
+                    if (list) l.indexed = false;
                 }
                 // each stage's constant buffers: the pushed ranges' blocks and the UBOs an ldc reads, from the uniforms'
                 // buffer at a place of their own, moved a draw
@@ -1115,7 +1178,34 @@ void runStageScenes() {
                 if (uber.empty()) uber = taken;
                 if (blur.empty()) blur = taken;
                 uint32_t rare = 0;
-                for (size_t p = 0; p < f.passDraws.size(); p++) {
+                if (list) {
+                    // few pipelines: six of the uber shader's -- two of them opaque (no blending, the second attachment
+                    // masked: what metal_hsr draws in its prepass) -- and two of the blur's in the small passes; a draw in
+                    // three has the pipeline of the draw before (M68: 34 %)
+                    if (uber.size() > 6) uber.resize(6);
+                    if (blur.size() > 2) blur.resize(2);
+                    for (size_t u = 0; u < uber.size(); u += 3) {
+                        hakios_metal_program_set_blend(f.layers[uber[u]].program, 0, 0, 0, 1, 0, 1, 0, 0xf);
+                        hakios_metal_program_set_blend_at(f.layers[uber[u]].program, 1, 0, 0, 0, 1, 0, 1, 0, 0);
+                    }
+                    uint32_t seed = 12345, last = uber[0];
+                    for (size_t p = 0; p < f.passDraws.size(); p++) {
+                        const uint32_t n = f.passDraws[p];
+                        for (uint32_t k = 0; k < n; k++) {
+                            seed = seed * 1664525u + 1013904223u;
+                            const uint32_t roll = seed >> 16;
+                            if (k != 0 && roll % 100 < 40) {
+                                // (the draw before's)
+                            } else if (n <= 4 && k == 0) {
+                                last = blur[p % blur.size()];
+                            } else {
+                                last = uber[(roll / 100) % uber.size()];
+                            }
+                            f.order.push_back(last);
+                        }
+                    }
+                }
+                for (size_t p = 0; !list && p < f.passDraws.size(); p++) {
                     const uint32_t n = f.passDraws[p];
                     for (uint32_t k = 0; k < n; k++) {
                         if (n < 7) {
@@ -1137,10 +1227,12 @@ void runStageScenes() {
             }
             char name[200];
             snprintf(name, sizeof name, "C interface: %zu programs of the phone's stage cache (%zu drawn), %s, %s", f.layers.size(), taken.size(),
-                     !f.passDraws.empty() ? "CoreAnimation's panel frame: 169 draws in 18 passes, the pipeline changing at almost every draw"
+                     list                 ? "a chat list scrolling: 290 draws in 51 passes, eight pipelines, quads without indices"
+                     : !f.passDraws.empty() ? "CoreAnimation's panel frame: 169 draws in 18 passes, the pipeline changing at almost every draw"
                      : f.drawsAPass != 0  ? "110 draws in five passes of 22 (three surfaces and the screen twice)"
                                           : "a main pass of 110 draws, two attachments",
-                     !f.passDraws.empty() ? (f.gmem ? "as the plug-in records" : "sysmem") : f.drawsAPass != 0 ? "sysmem once the queue knows them" : f.gmem ? "GMEM binned" : "sysmem");
+                     !f.passHsr.empty()   ? "sysmem, the screen's passes with hidden surface removal (metal_hsr=1)"
+                     : !f.passDraws.empty() ? (f.gmem ? "as the plug-in records" : "sysmem") : f.drawsAPass != 0 ? "sysmem once the queue knows them" : f.gmem ? "GMEM binned" : "sysmem");
             runFrames(r, f, letter, name);
         }
     }

@@ -1386,6 +1386,13 @@ hakios_metal_program* hakios_metal_program_specialize_ycbcr(hakios_metal_program
 }   // extern "C"
 
 namespace hakios::metal {
+void hakios_metal_cb_set_hsr_test(hakios_metal_cb* cb, unsigned twin, unsigned limit, int anyTarget) {
+    if (cb == nullptr) return;
+    const uint32_t most = limit < CommandBuffer::kHsrMaxDraws ? limit : CommandBuffer::kHsrMaxDraws;
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, twin, most, anyTarget] { cb->cb->setHsrTest(uint8_t(twin), most, anyTarget != 0); });
+    cb->cb->setHsrTest(uint8_t(twin), most, anyTarget != 0);
+}
+
 hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const Stage& fs, unsigned colorPixelFormat, unsigned fsIboBase, unsigned ssboWrites) {
     if (vs.kind != kStageVertex || fs.kind != kStageFragment) {
         failed("hakios_metal_program_from_stages: a vertex stage and a fragment stage, in that order");

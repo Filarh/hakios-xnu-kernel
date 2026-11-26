@@ -17,4 +17,8 @@ namespace hakios::metal {
 hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const Stage& fs, unsigned colorPixelFormat, unsigned fsIboBase = 0,
                                                        unsigned ssboWrites = 3);
 
+// CommandBuffer::setHsrTest for a command buffer of the C interface: TWIN and LIMIT as it takes them, ANY_TARGET the
+// passes whose colour 0 is not compressed served too (a host without Mesa has no compressed texture to draw into).
+void hakios_metal_cb_set_hsr_test(hakios_metal_cb* cb, unsigned twin, unsigned limit, int anyTarget);
+
 }  // namespace hakios::metal
