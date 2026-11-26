@@ -340,6 +340,10 @@ public:
     // stream is the same either way (the tests record it both ways); a bisect's switch. On by default; what it was is
     // returned.
     static bool keepStates(bool on);
+    // a pass's head taken from the heads of the passes before when its words are one's but for its table's address
+    // (render.cpp: HeadCache), not read back through the register shadow. The stream is the same either way. On by
+    // default (and off with keepStates(false)); what it was is returned.
+    static bool keepHeads(bool on);
     // a draw of a sysmem pass whose draw before it was of the same program, both from its kept state, without the
     // program's HLSQ_INVALIDATE_CMD and its stages' preloads and immediates (render.cpp: gSkipSameProgram): the stream
     // differs. Off by default (metal_sameprog=1 in the plug-in); what it was is returned.
