@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "hakios-metal/compute.hpp"
+#include "hakios-metal/cull.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/gpu.hpp"
 #include "hakios-metal/pm4.hpp"
@@ -219,7 +220,9 @@ public:
     // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
     // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; int64_t samples = -1; uint32_t cullSeen = 0, cullCoverers = 0, culled = 0; uint64_t culledPixels = 0; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's; SAMPLES: setProfileSamples's count, -1 when not counted
+    // (CULL_SEEN, CULL_COVERERS, CULLED, CULLED_PIXELS: setCull's, of a pass's draws -- those it looked at, those that
+    // covered something, those left out (or, verifying, that would have been) and the pixels of their boxes)
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and the samples each pass's draws passed: the RB's running count copied out by ZPASS_DONE at the pass's start
@@ -276,6 +279,46 @@ public:
     void setDrawTag(uint32_t tag) { drawTag_ = tag; }
     bool cancelDraw(uint32_t tag);
     uint32_t cancelledDraws() const { return cancelled_; }
+    // Whole draws left out when what they draw cannot be seen (the plug-in's metal_cull; dev-notes/investigacion/anexos/
+    // 33-panel-lateral/10-oclusion-exacta.md). A draw X of a pass is left out -- its draw packet a CP_NOP, its state in
+    // place -- when every pixel it can touch is covered by rectangles that LATER draws of the same pass fill whole and
+    // no draw between X and the last of them reads the pass's attachments. It rests on nothing the caller promises:
+    //   X          writes colour 0 alone, no memory, no depth from its FS, no visibility result (render.cpp's
+    //              hsrClassOf: not a barrier); triangles, one instance, not indirect, at most cull::kMaxVertices
+    //   a coverer  besides: blending off, every channel written, no discard, no framebuffer fetch, one sample
+    //              (hsrClassOf: opaque), no face culled, two triangles that are the halves of an axis-aligned rectangle
+    //   a reader   a draw whose FS fetches the framebuffer, or that samples a texture in the memory of an attachment:
+    //              nothing drawn before it is left out for what comes after it
+    // and where the vertices land is worked out from the vertex stage's own instructions and the bytes it will fetch
+    // (cull.hpp), X's box taken outwards and a coverer's rectangle inwards by more than the hardware can move a vertex.
+    // Only in a pass with no depth or stencil attachment of the caller's, drawn in sysmem alone (one in tiles, or
+    // recorded both ways, is left as it is). The bytes read are held against the buffers again when the command buffer
+    // is committed: if a single one differs, or a buffer has since been written by the GPU, every draw left out is put
+    // back. kCullVerify works all of it out and leaves nothing out. Off by default.
+    enum : uint8_t { kCullOff = 0, kCullOn = 1, kCullVerify = 2 };
+    void setCull(uint8_t mode) { cull_ = mode; }
+    // (for the tests) TWIN, a mistake made on purpose that the pictures must show: 1 a blending draw covers, 2 a
+    // coverer's rectangle taken outwards, 3 a reader ends nothing, 4 any two triangles cover their bounding box, 5 the
+    // bytes not held against the buffers at the commit
+    void setCullTest(uint8_t twin) { cullTwin_ = twin; }
+    struct CullCounts {
+        uint32_t seen = 0;        // draws of passes it serves
+        uint32_t known = 0;       // ...whose positions were worked out
+        uint32_t coverers = 0;    // ...that were a covering rectangle when something could be covered
+        uint32_t culled = 0;      // draws left out (verifying: that would have been)
+        uint64_t pixels = 0;      // the pixels of their boxes
+        uint32_t undone = 0;      // draws put back at the commit: a byte read had changed
+        uint32_t why[cull::kWhyCount] = {};   // draws not looked at further, by reason
+    };
+    const CullCounts& cullCounts() const { return cullCounts_; }
+    // the draws left out, the first kMaxCullEvents: PASS its pass among passTimes' (~0: not profiled), DRAW and BY the
+    // draw's and its last coverer's numbers among their pass's draws, BOX the pixels it could touch
+    struct CullEvent {
+        uint32_t pass, draw, by;
+        cull::Rect box;
+    };
+    static constexpr size_t kMaxCullEvents = 256;
+    const std::vector<CullEvent>& cullEvents() const { return cullEvents_; }
     // Hidden surface removal by depth (the plug-in's metal_hsr; dev-notes/investigacion/anexos/32-interfaz-telegram/
     // 02-hsr-por-profundidad.md): what a GPU of Apple's does not shade -- a fragment a later opaque draw of the pass
     // covers -- is not shaded here either, and the picture is the one the draws give in their order. Off by default.
@@ -377,6 +420,27 @@ private:
     };
     uint32_t drawTag_ = 0, cancelled_ = 0;
     std::vector<DrawMark> drawMarks_;
+    // setCull: the bytes its answers were read from, which of them a draw left out rests on, and where each such
+    // draw's packet lies -- a word of the stream, or of an HSR prepass's buffer -- with the header it had
+    uint8_t cull_ = 0, cullTwin_ = 0;
+    CullCounts cullCounts_;
+    std::vector<CullEvent> cullEvents_;
+    cull::Snapshots cullSnapshots_;
+    struct CullCheck {
+        uint32_t first, count;
+    };
+    std::vector<CullCheck> cullChecks_;
+    struct CullDone {
+        size_t at;        // SIZE_MAX: not in the stream
+        uint32_t* ptr;
+        uint32_t header;
+    };
+    std::vector<CullDone> cullDone_;
+    // the draw just written into the open pass: AT its draw packet in the stream, PREPASS_AT in the HSR prepass (SIZE_MAX: none)
+    void cullDraw(const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings, const Bindings& fsBindings, size_t at,
+                  size_t prepassAt);
+    // at the commit, the pass closed: the bytes read still what the buffers hold, or every draw left out put back
+    void cullRevalidate();
     bool hsr_ = false, hsrAnyTarget_ = false;   // setHsr's, setHsrTest's
     uint8_t hsrTwin_ = 0;
     uint32_t hsrLimit_ = kHsrMaxDraws;
@@ -411,8 +475,11 @@ private:
     void finish(Status s, bool recycle = true);
     // (once for reading and once for writing: the submission names each buffer once whatever the draws, and the list was
     // as long as the frame's draws times their bindings, gone through again for every one of them at the commit)
-    void use(const Buffer& b, bool write) {
+    // (STORED: the GPU does write it -- false for a draw's bindings named for writing only because their stage has
+    // device buffers, which one that stores to none of them does not write: Bo::noteGpuWrite)
+    void use(const Buffer& b, bool write, bool stored = true) {
         const Bo* bo = &b.bo();
+        if (write && stored) bo->noteGpuWrite();
         const void* key = reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(bo) | (write ? 1u : 0u));
         if (!recently(key)) uses_.push_back(BoUse{bo, write});
     }
@@ -533,7 +600,34 @@ private:
         pm4::Stream hsrPrepass;
         std::vector<size_t> hsrStarts;
         RegShadow hsrShadow;   // (an empty shadow, for an opaque draw's whole words taken from its program's kept state)
+        // setCull: the draws that later ones may still cover, oldest first -- each with what its positions come from,
+        // then, once a coverer has asked, its box and what of it is not covered yet, the records its positions were
+        // read into and those of the coverers that took a piece -- and the draws left out whose packet in the open
+        // segment's prepass has no address yet
+        struct CullDraw {
+            uint32_t index = 0;
+            cull::Geometry geometry;
+            bool evaluated = false;
+            cull::Rect box;
+            cull::Region left;
+            CullCheck evidence{0, 0};
+            static constexpr uint32_t kMaxCoverers = 6;
+            uint32_t coverers = 0;
+            CullCheck coverer[kMaxCoverers];
+            size_t at = SIZE_MAX, prepassAt = SIZE_MAX;
+            uint32_t* prepassPtr = nullptr;
+            uint32_t prepassHeader = 0;
+        };
+        static constexpr size_t kMaxCullDraws = 48;
+        std::vector<CullDraw> cull;
+        struct CullFix {
+            size_t prepassAt;
+            uint32_t done;
+        };
+        std::vector<CullFix> cullFixes;
     };
+    // setCull: X of the open pass is covered, the last piece by the pass's draw BY -- counted, and left out unless verifying
+    void cullLeaveOut(OpenPass::CullDraw& x, uint32_t by);
     // NEXT: the pass of the draw that could not join the open one, when it is such a draw that closes it (nullptr for
     // anything else: a copy, a dispatch, the commit). A memoryless attachment the tiles wrote is stored for it alone:
     // when NEXT has the same texture attached with Load, the caller's one pass goes on in a second one here.

@@ -160,6 +160,11 @@ public:
     bool surface() const { return surface_; }
     void cpuBegin(bool write) const;
     void cpuEnd() const;
+    // Whether a command buffer has ever named it as something the GPU writes (a copy's or a fill's destination, an
+    // attachment, a buffer a stage stores to): from then on what this processor reads there is not known to be what
+    // a draw will fetch, and nothing is worked out from its bytes (cull.hpp: Snapshots). Never taken back.
+    void noteGpuWrite() const { gpuWritten_.store(true, std::memory_order_relaxed); }
+    bool gpuWritten() const { return gpuWritten_.load(std::memory_order_relaxed); }
 
 private:
     friend class Gpu;
@@ -174,6 +179,7 @@ private:
     bool counted_ = false;   // in Gpu::allocatedBytes: memory this driver asked for (not an IOSurface's)
     bool mapped_ = true;     // cpu_ is the transport's mapping, undone with the Bo (false: the program's own memory, userBo)
     bool surface_ = false;   // surfaceBo's: an IOSurface's memory, cached in this process (cpuBegin, cpuEnd)
+    mutable std::atomic<bool> gpuWritten_{false};   // noteGpuWrite's
 };
 
 struct BoUse {

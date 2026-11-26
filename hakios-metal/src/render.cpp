@@ -5052,6 +5052,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     open_->lastFetched = program.fs.fbRead != 0;
     open_->draws++;
     pm4::Stream& into = open_->gmem ? open_->bodies : stream_;
+    size_t cullPrepass = SIZE_MAX;   // (setCull: where an opaque draw's whole words begin in the HSR prepass)
     if (hsr) {
         // (a pass with a depth attachment is never tiled, gmemPlan: INTO is the stream)
         open_->hsrDraws++;
@@ -5086,6 +5087,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
                 if (!hsrCloseSegment()) return false;
             } else {
                 open_->hsrStarts.push_back(at);
+                cullPrepass = at;
             }
         }
         if (hsrClass == render::kHsrOpaque) counts_.hsrOpaque++;
@@ -5244,6 +5246,17 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         // (drawn in the prepass: here its state alone, which the draws after it are written against)
         into.nopPacket(into.lastPacket(markInto, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI), a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI);
     }
+    if (cull_ != kCullOff) {
+        // setCull, in a pass it serves: no depth or stencil of the caller's, its draws straight onto the stream (a pass in
+        // tiles, or recorded both ways, moves its draws' words when it closes, and where they end up is not followed)
+        if (!open_->gmem && !open_->dual && given.color0 != nullptr && given.depth == nullptr && given.stencil == nullptr && givenDraw.depth.compare == 7 &&
+            !givenDraw.depth.write && !givenDraw.stencil.enabled) {
+            cullDraw(program, given, givenDraw, vsBindings, fsBindings, into.lastPacket(markInto, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDX_OFFSET),
+                     cullPrepass != SIZE_MAX ? open_->hsrPrepass.lastPacket(cullPrepass, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDX_OFFSET) : SIZE_MAX);
+        } else {
+            open_->cull.clear();
+        }
+    }
     if (drawTag_ != 0) {
         // (setDrawTag: where this draw's draw packet went, for a cancelDraw while the pass is open)
         DrawMark m{drawTag_, &into, into.lastPacket(markInto, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI), SIZE_MAX};
@@ -5289,10 +5302,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     counts_.draws++;
     if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing
-    for (const auto& [b, writes] : {std::pair<const Bindings*, bool>{&vsBindings, program.vs.k.numSsbos != 0}, {&fsBindings, program.fs.k.numSsbos != 0}}) {
+    // (and written in fact only by a stage that stores to them, Program::ssboWrites: what Bo::gpuWritten says of a buffer)
+    for (const auto& [b, writes, stores] : {std::tuple<const Bindings*, bool, bool>{&vsBindings, program.vs.k.numSsbos != 0, (program.ssboWrites & 1) != 0},
+                                            {&fsBindings, program.fs.k.numSsbos != 0, (program.ssboWrites & 2) != 0}}) {
         for (const Binding& x : b->buffers) {
             if (x.buffer != nullptr) {
-                use(*x.buffer, writes);
+                use(*x.buffer, writes, stores);
             }
         }
     }
@@ -5474,6 +5489,30 @@ bool CommandBuffer::append(CommandBuffer& other) {
     // attachment is stored by both)
     closePass(nullptr, true);
     other.closePass(nullptr, true);
+    {
+        // (setCull: OTHER's draws left out, their packets now that much further on -- appendStream puts a NOP first --
+        // and the bytes they rest on, held against the buffers at this one's commit)
+        const size_t base = stream_.size() + 1;
+        for (CullDone d : other.cullDone_) {
+            if (d.at != SIZE_MAX) d.at += base;
+            cullDone_.push_back(d);
+        }
+        const uint32_t first = cullSnapshots_.absorb(other.cullSnapshots_);
+        for (const CullCheck& c : other.cullChecks_) cullChecks_.push_back(CullCheck{c.first + first, c.count});
+        for (const CullEvent& e : other.cullEvents_) {
+            if (cullEvents_.size() < kMaxCullEvents) cullEvents_.push_back(CullEvent{~0u, e.draw, e.by, e.box});
+        }
+        cullCounts_.seen += other.cullCounts_.seen;
+        cullCounts_.known += other.cullCounts_.known;
+        cullCounts_.coverers += other.cullCounts_.coverers;
+        cullCounts_.culled += other.cullCounts_.culled;
+        cullCounts_.pixels += other.cullCounts_.pixels;
+        for (uint32_t i = 0; i < cull::kWhyCount; i++) cullCounts_.why[i] += other.cullCounts_.why[i];
+        other.cullDone_.clear();
+        other.cullChecks_.clear();
+        other.cullEvents_.clear();
+        other.cullCounts_ = CullCounts{};
+    }
     appendStream(stream_, other.stream_);
     other.stream_ = pm4::Stream{};
     // (OTHER's run of HSR Z levels now reaches the GPU with this buffer: the clock is this one's until its commit; a
@@ -5530,7 +5569,12 @@ bool CommandBuffer::hsrCloseSegment() {
     if (open_ == nullptr || !open_->hsrSegment) return true;
     OpenPass& o = *open_;
     o.hsrSegment = false;
-    if (o.hsrStarts.empty() || hsrTwin_ == 1) return true;   // (no opaque draw: the hole stays a NOP)
+    if (o.hsrStarts.empty() || hsrTwin_ == 1) {   // (no opaque draw: the hole stays a NOP)
+        // (setCull: a prepass that is not written holds no draw to leave out)
+        for (OpenPass::CullDraw& c : o.cull) c.prepassAt = SIZE_MAX;
+        o.cullFixes.clear();
+        return true;
+    }
     const auto& w = o.hsrPrepass.words();
     // (a buffer of its own from the queue's pool, not a piece of the slab: the draws' tables are cut where they would be
     // without HSR, and a prepass of a few dozen whole draws would take a fair share of a slab)
@@ -5549,8 +5593,20 @@ bool CommandBuffer::hsrCloseSegment() {
     for (size_t k = o.hsrStarts.size(); k-- > 0;) {
         const size_t from = o.hsrStarts[k], to = k + 1 < o.hsrStarts.size() ? o.hsrStarts[k + 1] : w.size();
         std::memcpy(out + put, w.data() + from, 4 * (to - from));
+        // (setCull: where this draw's packet now lies -- of a draw that may yet be covered, and of one left out already,
+        // whose packet is a NOP there to put back if the commit finds its bytes changed)
+        for (OpenPass::CullDraw& c : o.cull) {
+            if (c.prepassAt == SIZE_MAX || c.prepassAt < from || c.prepassAt >= to) continue;
+            c.prepassPtr = out + put + (c.prepassAt - from);
+            c.prepassHeader = w[c.prepassAt];
+            c.prepassAt = SIZE_MAX;
+        }
+        for (const OpenPass::CullFix& f : o.cullFixes) {
+            if (f.prepassAt >= from && f.prepassAt < to && f.done < cullDone_.size()) cullDone_[f.done].ptr = out + put + (f.prepassAt - from);
+        }
         put += to - from;
     }
+    o.cullFixes.clear();
     const uint64_t at = ib->gpuAddress();
     const uint32_t call[4] = {pm4::type7(pm4::kIndirectBuffer, 3), uint32_t(at), uint32_t(at >> 32), uint32_t(w.size())};
     if (!stream_.patch(o.hsrHole, call, 4)) return fail("an HSR segment's hole is not in the stream");
@@ -5568,6 +5624,166 @@ bool CommandBuffer::cancelDraw(uint32_t tag) {
         return done;
     }
     return false;
+}
+
+// --- whole draws left out (CommandBuffer::setCull) --------------------------------------------------------------------------
+void CommandBuffer::cullLeaveOut(OpenPass::CullDraw& x, uint32_t by) {
+    OpenPass& o = *open_;
+    cullCounts_.culled++;
+    cullCounts_.pixels += x.box.pixels();
+    const bool profiled = (profile_ || tuning_) && !profiled_.empty();
+    if (profiled) {
+        profiled_.back().culled++;
+        profiled_.back().culledPixels += x.box.pixels();
+    }
+    if (cullEvents_.size() < kMaxCullEvents) cullEvents_.push_back(CullEvent{profiled ? uint32_t(profiled_.size() - 1) : ~0u, x.index, by, x.box});
+    // what it rests on: its own bytes and those of every draw that covered a piece of it
+    auto rests = [&](const CullCheck& c) {
+        for (const CullCheck& have : cullChecks_) {
+            if (have.first == c.first && have.count == c.count) return;
+        }
+        if (c.count != 0) cullChecks_.push_back(c);
+    };
+    rests(x.evidence);
+    for (uint32_t i = 0; i < x.coverers; i++) rests(x.coverer[i]);
+    if (cull_ != kCullOn) return;
+    // its draw packet a NOP of the same length where it lies: in the pass (a draw drawn in its place), or in its
+    // segment's HSR prepass (an opaque draw's, whose packet in the pass is a NOP already) -- still words of the open
+    // segment's, or the memory they were copied into when the segment closed
+    if (x.at != SIZE_MAX && x.at < stream_.size()) {
+        const uint32_t header = stream_.words()[x.at];
+        if (stream_.nopPacket(x.at, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDX_OFFSET)) cullDone_.push_back(CullDone{x.at, nullptr, header});
+    }
+    if (x.prepassAt != SIZE_MAX && x.prepassAt < o.hsrPrepass.size()) {
+        const uint32_t header = o.hsrPrepass.words()[x.prepassAt];
+        if (o.hsrPrepass.nopPacket(x.prepassAt, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDX_OFFSET)) {
+            cullDone_.push_back(CullDone{SIZE_MAX, nullptr, header});
+            o.cullFixes.push_back(OpenPass::CullFix{x.prepassAt, uint32_t(cullDone_.size() - 1)});
+        }
+    } else if (x.prepassPtr != nullptr) {
+        const pm4::Header h = pm4::decode(x.prepassHeader);
+        if (h.kind == pm4::Header::kCommand && h.opcode == a6xx::CP_DRAW_INDX_OFFSET) {
+            *x.prepassPtr = pm4::type7(pm4::kNop, h.count);
+            cullDone_.push_back(CullDone{SIZE_MAX, x.prepassPtr, x.prepassHeader});
+        }
+    }
+}
+
+void CommandBuffer::cullDraw(const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings, const Bindings& fsBindings,
+                             size_t at, size_t prepassAt) {
+    OpenPass& o = *open_;
+    const uint32_t index = o.draws - 1;
+    const bool profiled = (profile_ || tuning_) && !profiled_.empty();
+    cullCounts_.seen++;
+    if (profiled) profiled_.back().cullSeen++;
+    // a reader: its FS fetches the framebuffer, or a texture either stage has bound lies in an attachment's memory
+    // (what such a read gives is not defined in Metal; here it only has to stop a draw being left out)
+    bool reads = program.fs.fbRead != 0;
+    for (uint32_t i = 0; i < kMaxTextureSlots && i < program.fs.k.numTextureSlots; i++) reads = reads || program.fs.k.textures[i].fbTarget != 0;
+    for (const Bindings* b : {&vsBindings, &fsBindings}) {
+        for (const Texture* t : b->textures) {
+            if (t == nullptr || reads) continue;
+            reads = pass.color0->buffer() == t->buffer();
+            for (const ColorAttachment& a : pass.more) reads = reads || (a.texture != nullptr && a.texture->buffer() == t->buffer());
+        }
+    }
+    if (reads && cullTwin_ != 3) o.cull.clear();
+    // its class, from its Program, the pass and the Draw alone, as HSR's: a barrier is neither covered nor covering
+    const render::HsrClass cls = render::hsrClassOf(program, pass, draw, 0);
+    auto no = [&](cull::Why why) { cullCounts_.why[why < cull::kWhyCount ? why : 0]++; };
+    if (cls == render::kHsrBarrier) return;
+    OpenPass::CullDraw c;
+    uint32_t area[4];
+    // (a draw whose area is nothing draws nothing; it is left as it is)
+    if (!render::drawArea(pass, draw, area)) return no(cull::kShape);
+    const cull::Why captured = cull::capture(program, draw, vsBindings, area, &c.geometry);
+    if (captured != cull::kOk) return no(captured);
+    c.index = index;
+    c.at = at;
+    c.prepassAt = prepassAt;
+    // a coverer, when there is a draw it may cover: an opaque draw with no face culled
+    if ((cls == render::kHsrOpaque || cullTwin_ == 1) && draw.cullMode == 0 && !o.cull.empty()) {
+        cull::Positions p;
+        const uint32_t first = cullSnapshots_.mark();
+        cull::Why why = cull::evaluate(c.geometry, &cullSnapshots_, &p);
+        if (why != cull::kOk) return no(why);   // (where it lands is not known: not to be covered either)
+        cullCounts_.known++;
+        c.evaluated = true;
+        c.evidence = CullCheck{first, cullSnapshots_.mark() - first};
+        c.box = cull::coverBox(c.geometry, p);
+        c.left.set(c.box);
+        cull::Rect r;
+        why = cull::occluderRect(c.geometry, p, &r);
+        if (why == cull::kOk && cullTwin_ == 2) r = c.box;
+        if (why == cull::kNotRect && cullTwin_ == 4) r = c.box, why = cull::kOk;
+        // (too small a rectangle to be worth working out where the draws before it land: cull.hpp)
+        if (why == cull::kOk && (r.x1 - r.x0 + 1 < cull::kMinCoverer || r.y1 - r.y0 + 1 < cull::kMinCoverer)) why = cull::kSmall;
+        if (why != cull::kOk) no(why);
+        if (why == cull::kOk && !r.empty()) {
+            bool covered = false;
+            for (size_t i = 0; i < o.cull.size();) {
+                OpenPass::CullDraw& x = o.cull[i];
+                if (!x.evaluated) {
+                    // (where an earlier draw lands, worked out now that something may cover it)
+                    cull::Positions q;
+                    const uint32_t firstX = cullSnapshots_.mark();
+                    const cull::Why whyX = cull::evaluate(x.geometry, &cullSnapshots_, &q);
+                    if (whyX != cull::kOk) {
+                        no(whyX);
+                        o.cull.erase(o.cull.begin() + ptrdiff_t(i));
+                        continue;
+                    }
+                    cullCounts_.known++;
+                    x.evaluated = true;
+                    x.evidence = CullCheck{firstX, cullSnapshots_.mark() - firstX};
+                    x.box = cull::coverBox(x.geometry, q);
+                    x.left.set(x.box);
+                }
+                bool touches = false;
+                for (uint32_t k = 0; k < x.left.n && !touches; k++) {
+                    const cull::Rect& a = x.left.r[k];
+                    touches = !(r.x0 > a.x1 || r.x1 < a.x0 || r.y0 > a.y1 || r.y1 < a.y0);
+                }
+                if (touches && x.coverers < OpenPass::CullDraw::kMaxCoverers && x.left.subtract(r)) {
+                    x.coverer[x.coverers++] = c.evidence;
+                    covered = true;
+                }
+                // (nothing left of it: every pixel it can touch is filled by the coverers after it -- or it had none to touch)
+                if (x.left.empty()) {
+                    cullLeaveOut(x, index);
+                    o.cull.erase(o.cull.begin() + ptrdiff_t(i));
+                    continue;
+                }
+                i++;
+            }
+            if (covered) {
+                cullCounts_.coverers++;
+                if (profiled) profiled_.back().cullCoverers++;
+            }
+        }
+    }
+    // (the oldest let go a quarter at a time: a pass of hundreds of draws keeps the last few dozen to cover)
+    if (o.cull.size() >= OpenPass::kMaxCullDraws) o.cull.erase(o.cull.begin(), o.cull.begin() + ptrdiff_t(OpenPass::kMaxCullDraws / 4));
+    o.cull.push_back(std::move(c));
+}
+
+void CommandBuffer::cullRevalidate() {
+    if (!cullChecks_.empty()) {
+        bool same = true;
+        for (const CullCheck& c : cullChecks_) same = same && (cullTwin_ == 5 || cullSnapshots_.same(c.first, c.count));
+        if (!same) {
+            // a byte a left-out draw's answer was read from is not what the buffer holds now (written since the draw was
+            // encoded, as Metal allows until the commit): every draw left out is drawn after all
+            for (const CullDone& d : cullDone_) {
+                if (d.at != SIZE_MAX) (void)stream_.patch(d.at, &d.header, 1);
+                else if (d.ptr != nullptr) *d.ptr = d.header;
+            }
+            cullCounts_.undone = cullCounts_.culled;
+        }
+    }
+    cullDone_.clear();
+    cullChecks_.clear();
+    cullSnapshots_.clear();
 }
 
 void CommandBuffer::closePass(const RenderPass* next, bool kept) {

@@ -1038,6 +1038,56 @@ void hakios_metal_cb_cancel_draw(hakios_metal_cb* cb, unsigned tag) {
     (void)cb->cb->cancelDraw(tag);
 }
 
+void hakios_metal_cb_set_cull(hakios_metal_cb* cb, int mode) {
+    const uint8_t m = mode == 1 ? CommandBuffer::kCullOn : mode == 2 ? CommandBuffer::kCullVerify : CommandBuffer::kCullOff;
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, m] { cb->cb->setCull(m); });
+    cb->cb->setCull(m);
+}
+
+void hakios_metal_cb_cull_counts(hakios_metal_cb* cb, unsigned* seen, unsigned* known, unsigned* coverers, unsigned* culled, unsigned long long* pixels,
+                                 unsigned* undone) {
+    syncOne(cb);
+    const CommandBuffer::CullCounts& c = cb->cb->cullCounts();
+    if (seen != nullptr) *seen = c.seen;
+    if (known != nullptr) *known = c.known;
+    if (coverers != nullptr) *coverers = c.coverers;
+    if (culled != nullptr) *culled = c.culled;
+    if (pixels != nullptr) *pixels = c.pixels;
+    if (undone != nullptr) *undone = c.undone;
+}
+
+unsigned hakios_metal_cb_cull_why(hakios_metal_cb* cb, unsigned why, const char** name) {
+    if (why >= cull::kWhyCount) {
+        if (name != nullptr) *name = nullptr;
+        return 0;
+    }
+    syncOne(cb);
+    if (name != nullptr) *name = cull::whyName(cull::Why(why));
+    return cb->cb->cullCounts().why[why];
+}
+
+int hakios_metal_cb_pass_cull(hakios_metal_cb* cb, unsigned i, unsigned* seen, unsigned* coverers, unsigned* culled, unsigned long long* pixels) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    if (i >= t.size()) return -1;
+    if (seen != nullptr) *seen = t[i].cullSeen;
+    if (coverers != nullptr) *coverers = t[i].cullCoverers;
+    if (culled != nullptr) *culled = t[i].culled;
+    if (pixels != nullptr) *pixels = t[i].culledPixels;
+    return 0;
+}
+
+int hakios_metal_cb_cull_event(hakios_metal_cb* cb, unsigned k, unsigned* pass, unsigned* draw, unsigned* by, int box[4]) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::CullEvent>& e = cb->cb->cullEvents();
+    if (k >= e.size()) return -1;
+    if (pass != nullptr) *pass = e[k].pass;
+    if (draw != nullptr) *draw = e[k].draw;
+    if (by != nullptr) *by = e[k].by;
+    if (box != nullptr) box[0] = e[k].box.x0, box[1] = e[k].box.y0, box[2] = e[k].box.x1, box[3] = e[k].box.y1;
+    return 0;
+}
+
 void hakios_metal_cb_set_hsr(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setHsr(on != 0); });
     cb->cb->setHsr(on != 0);

@@ -1498,6 +1498,7 @@ HM_REFUSES_OUT_LOUD
 	NSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */
 	struct hm_ft_rec *_ftrace;               /* metal_trace=frame: this buffer being recorded, else NULL */
 	BOOL _hsr;                               /* metal_hsr: drawn with hidden surface removal by depth */
+	int _cull;                               /* metal_cull: 0 off, 1 covered draws left out, 2 worked out and nothing left out */
 	NSMutableArray *_arenas;                 /* HakiosMetalBuffer: the arenas its encoders' small bytes are in (hm_arena_*) */
 	NSUInteger _arenaUsed;                   /* ...of the last of them */
 }
@@ -1506,6 +1507,7 @@ HM_REFUSES_OUT_LOUD
 - (void)hakiosTurnAtCommit:(id)texture;
 - (hakios_metal_cb *)hakiosCommandBuffer;
 - (double)hakiosCreatedAt;
+- (int)hakiosCull;
 - (struct hm_ft_rec *)hakiosFrameTrace;
 - (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
 - (void)hakiosFtFinish;
@@ -2273,6 +2275,48 @@ hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
 			   HM_FT_NAME(kind, "draw", "copy", "clear", "dispatch"), width, height, draws, us,
 			   kind != 0 ? "-" : tiles > 0 ? "gmem" : "sysmem", MAX(tiles, 0), attached, touched, wrote, read, loaded, stored,
 			   hakios_metal_cb_pass_samples(cb, (unsigned)i), hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
+	}
+}
+
+/* metal_cull's lines of a command buffer the GPU is done with: `cull`, the buffer's counts (on: what was done in this
+ * buffer, 0 nothing, 1 draws left out, 2 counted alone); `gcull`, a timed pass's -- the draws looked at, the coverers,
+ * the draws left out and the pixels of their boxes in Mpx -- for each pass with a draw looked at, i its gpass line's;
+ * `gculled`, a draw left out: its pass (-1: not timed), its number and its last coverer's among the pass's draws, the
+ * pixels it could touch */
+static void
+hm_ft_culls(struct hm_ft_rec *ft, hakios_metal_cb *cb, int on)
+{
+	unsigned seen = 0, known = 0, coverers = 0, culled = 0, undone = 0;
+	unsigned long long pixels = 0;
+	char reasons[400] = "";
+	size_t at = 0;
+	const int n = hakios_metal_cb_pass_time(cb, 0, NULL, NULL, NULL, NULL, NULL);
+
+	hakios_metal_cb_cull_counts(cb, &seen, &known, &coverers, &culled, &pixels, &undone);
+	for (unsigned i = 0; i < 16; i++) {
+		const char *name = NULL;
+		const unsigned count = hakios_metal_cb_cull_why(cb, i, &name);
+
+		if (name == NULL) break;
+		if (count != 0 && at < sizeof(reasons)) at += (size_t)snprintf(reasons + at, sizeof(reasons) - at, " no_%s=%u", name, count);
+	}
+	hm_ft_line(ft, "cull on=%d seen=%u known=%u coverers=%u culled=%u mpx=%.4f undone=%u%s\n", on, seen, known, coverers, culled, (double)pixels / 1e6,
+		   undone, reasons);
+	for (int i = 0; i < n; i++) {
+		unsigned ps = 0, pc = 0, pn = 0;
+		unsigned long long pp = 0;
+
+		if (hakios_metal_cb_pass_cull(cb, (unsigned)i, &ps, &pc, &pn, &pp) < 0) break;
+		if (ps == 0) continue;
+		hm_ft_line(ft, "gcull i=%d seen=%u coverers=%u culled=%u mpx=%.4f\n", i, ps, pc, pn, (double)pp / 1e6);
+	}
+	for (unsigned k = 0;; k++) {
+		unsigned pass = 0, draw = 0, by = 0;
+		int box[4] = { 0, 0, -1, -1 };
+
+		if (hakios_metal_cb_cull_event(cb, k, &pass, &draw, &by, box) < 0) break;
+		hm_ft_line(ft, "gculled pass=%d draw=%u by=%u box=%d,%d,%d,%d px=%lld\n", pass == ~0u ? -1 : (int)pass, draw, by, box[0], box[1], box[2], box[3],
+			   box[2] >= box[0] && box[3] >= box[1] ? (long long)(box[2] - box[0] + 1) * (box[3] - box[1] + 1) : 0LL);
 	}
 }
 
@@ -7275,6 +7319,9 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_hsr(_cb, _hsr);
 		hakios_metal_cb_set_hsr_depth(_cb, hm_hsr_depth() & 3, (hm_hsr_depth() & 4) != 0);
 		hakios_metal_cb_set_hsr_clear_each(_cb, hm_hsr_clear_each());
+		const int cullMode = hm_cull_switch();
+		_cull = cullMode == 3 ? (__atomic_fetch_add(&hm_cull_buffers, 1, __ATOMIC_RELAXED) % 2 == 0 ? 1 : 0) : cullMode;
+		hakios_metal_cb_set_cull(_cb, _cull);
 	}
 	_owesSlot = YES;
 	return self;
@@ -7358,6 +7405,7 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_gmem_counts(_cb, &gmemPasses, &tiles);
 		skipped = hakios_metal_cb_skipped(_cb, &last);
 		hm_ft_gpasses(ft, _cb);
+		if (hm_cull_switch() != 0) hm_ft_culls(ft, _cb, _cull);
 	}
 	hm_ft_line(ft, "endcb seq=%u\n", ft->seq);
 	n = asprintf(&head, "cb seq=%u capture=%u serial=%u label=%s queue=%s qid=%p created=%.6f committed=%.6f scheduled=%.6f completed=%.6f "
@@ -7428,6 +7476,7 @@ HM_REFUSES_OUT_LOUD
  * there is no separate kernel scheduler clock to read on this port. */
 - (CFTimeInterval)GPUStartTime    { return _committedAt; }
 - (double)hakiosCreatedAt         { return _createdAt; }
+- (int)hakiosCull                { return _cull; }
 - (CFTimeInterval)GPUEndTime      { return _committedAt + (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e9; }
 - (CFTimeInterval)kernelStartTime { return [self GPUStartTime]; }
 - (CFTimeInterval)kernelEndTime   { return [self GPUEndTime]; }
@@ -7868,6 +7917,68 @@ static struct {
 	unsigned waitsAt;
 	unsigned long long prepsAt, prepNsAt;     /* GEM_CPU_PREPs (hakios_metal_cpu_prep_counts) at the last commit */
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}}, 0, 0 };
+
+/* boot-arg metal_cull=1: a draw that later opaque rectangles of its pass cover whole is left out (hakios_metal_cb_set_cull;
+ * dev-notes/investigacion/anexos/33-panel-lateral/10-oclusion-exacta.md), where it lands worked out from its vertex stage's
+ * own instructions and the bytes it fetches, the picture the same. metal_cull=2: all of it worked out and counted, nothing
+ * left out. metal_cull=3: as 1 in the command buffers of even number among this process's alone (hm_cull_buffers), for an
+ * A/B interleaved in one run. A recorded buffer (metal_trace=frame) says what was done in its cull, gcull and gculled
+ * lines; every five seconds the totals are printed. Off by default. */
+static unsigned long hm_cull_buffers;
+static int
+hm_cull_switch(void)
+{
+	static dispatch_once_t once;
+	static int mode;
+
+	dispatch_once(&once, ^{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_cull=")) != NULL && at[11] >= '1' && at[11] <= '3') mode = at[11] - '0';
+		if (mode == 1) hm_print("metal_cull=1: draws that later opaque rectangles of their pass cover are left out\n");
+		if (mode == 2) hm_print("metal_cull=2: the draws metal_cull=1 would leave out are counted, and drawn\n");
+		if (mode == 3) hm_print("metal_cull=3: as 1, in the command buffers of even number alone (an A/B within one run)\n");
+	});
+	return mode;
+}
+
+/* a command buffer the GPU is done with: what metal_cull did in it, added to the totals, which are printed every 5 s */
+static void
+hm_cull_note(hakios_metal_cb *cb, int mode)
+{
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	static unsigned long long buffers, seen, known, coverers, culled, pixels, undone, why[16];
+	static double printed;
+	unsigned s = 0, k = 0, c = 0, n = 0, u = 0;
+	unsigned long long px = 0;
+	char reasons[400] = "";
+	size_t at = 0;
+	double now;
+
+	if (mode == 0 || cb == NULL) return;
+	hakios_metal_cb_cull_counts(cb, &s, &k, &c, &n, &px, &u);
+	pthread_mutex_lock(&lock);
+	buffers++, seen += s, known += k, coverers += c, culled += n, pixels += px, undone += u;
+	for (unsigned i = 0; i < 16; i++) {
+		const char *name = NULL;
+		const unsigned count = hakios_metal_cb_cull_why(cb, i, &name);
+
+		if (name == NULL) break;
+		why[i] += count;
+		if (why[i] != 0 && at < sizeof(reasons)) at += (size_t)snprintf(reasons + at, sizeof(reasons) - at, " %s=%llu", name, why[i]);
+	}
+	now = hm_now();
+	if (now - printed > 5) {
+		printed = now;
+		hm_print("metal_cull=%d: %llu draws %s of %llu looked at in %llu command buffers (%.2f Mpx), %llu with positions worked out, "
+			 "%llu coverers, %llu put back at the commit; not looked at further:%s\n", hm_cull_switch(), culled,
+			 hm_cull_switch() == 2 ? "would be left out" : "left out", seen, buffers, (double)pixels / 1e6, known, coverers, undone,
+			 reasons[0] != 0 ? reasons : " none");
+	}
+	pthread_mutex_unlock(&lock);
+}
 
 /* boot-arg metal_hsr=1: hidden surface removal by depth (hakios_metal_cb_set_hsr; dev-notes/investigacion/anexos/
  * 32-interfaz-telegram/02-hsr-por-profundidad.md): in a pass into a compressed target (the screen), the draws a later
@@ -8725,6 +8836,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 		}
 	}
 	hm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);
+	hm_cull_note(cb, [self hakiosCull]);
 	if (hm_ft_enabled) {
 		struct hm_ft_rec *ft = [self hakiosFrameTrace];
 

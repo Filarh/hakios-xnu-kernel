@@ -41,6 +41,7 @@
 #include "fixtures/tri_dpos_vs_air.hpp"
 #include "fixtures/tri_flat_vs_air.hpp"
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/cull.hpp"
 #include "test.hpp"
 
 using namespace hakios::metal;
@@ -1652,3 +1653,73 @@ TEST(a_fragment_stage_that_discards_says_so) {
     CHECK(s->listing.find("kill") != std::string::npos);
     if (s->listing.find("kill") == std::string::npos) std::printf("%s\n", s->listing.c_str());
 }
+
+// tri_mvp_vs and tri_mvpx_vs (hakios-metal-cullcheck's vertex stages: a position that is a matrix times an attribute,
+// contracted to mad.f32 as CoreAnimation's is, and not): compiled here, each is a stage CommandBuffer::setCull's
+// interpreter has a model of, and every instruction of it up to its end reads to the interpreter as it does to ir3's
+// own disassembler (the listing) -- the same bitcode the phone compiles from tests/fixtures/tri_mvp*_vs_bc.hpp
+TEST(the_matrix_vertex_stages_are_ones_cull_interprets_as_ir3_lists_them) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: tri_mvp_vs and tri_mvpx_vs were not compiled)\n");
+        return;
+    }
+    for (const char* name : {"tri_mvp_vs", "tri_mvpx_vs"}) {
+        std::vector<uint8_t> bc = bitcodeOf(name);
+        CHECK(!bc.empty());
+        if (bc.empty()) {
+            std::printf("       out/host/kernels/%s.bc is missing (make test MESA=1 assembles it)\n", name);
+            continue;
+        }
+        std::string why;
+        std::shared_ptr<CompiledStage> s = compileStage(bc.data(), bc.size(), &why);
+        CHECK(s != nullptr);
+        if (s == nullptr) {
+            std::printf("       %s: %s\n", name, why.c_str());
+            continue;
+        }
+        CHECK_EQ(s->stage.kind, uint8_t(kStageVertex));
+        CHECK_EQ(s->stage.k.numUboRanges, 1u);
+        CHECK(s->stage.k.uboRanges[0].block == 1 && s->stage.k.uboRanges[0].sizeDwords == 16);
+        const bool contracted = std::string(name) == "tri_mvp_vs";
+        CHECK((s->listing.find("mad.f32") != std::string::npos) == contracted);
+        CHECK((s->listing.find("add.f") != std::string::npos) == !contracted);
+        Program p{};
+        p.vs = s->stage;
+        p.vertexDescriptor.attributes[0] = VertexAttribute{VertexFormat::kFloat4, 0, 0};
+        p.vertexDescriptor.attributes[1] = VertexAttribute{VertexFormat::kUChar4Normalized, 16, 0};
+        p.vertexDescriptor.layouts[0] = VertexLayout{20, VertexStep::kPerVertex, 1};
+        const std::shared_ptr<const cull::VsModel> m = cull::modelOf(p);
+        CHECK(m->usable);
+        CHECK(m->ranges.size() == 1 && m->sources == 2);
+        // the listing's instructions, one a line after the @in lines: ir3's flags that say nothing of the registers
+        // left out, and an (r) that repeats nothing (ir3 prints it, the interpreter does not)
+        std::vector<std::string> listed;
+        for (size_t at = 0; at < s->listing.size();) {
+            size_t end = s->listing.find('\n', at);
+            if (end == std::string::npos) end = s->listing.size();
+            std::string line = s->listing.substr(at, end - at);
+            at = end + 1;
+            if (line.empty() || line[0] == ';' || line[0] == '@') continue;
+            for (const char* strip : {"(sy)", "(ss)", "(jp)", "(ul)", "(nop1) ", "(nop2) ", "(nop3) ", "(nop1)", "(nop2)", "(nop3)", ".f32f32", ".u32u32", ".s32s32"}) {
+                size_t f;
+                while ((f = line.find(strip)) != std::string::npos) line.erase(f, strlen(strip));
+            }
+            listed.push_back(line);
+        }
+        size_t i = 0;
+        bool ended = false;
+        for (; 2 * i + 1 < s->words.size() && i < listed.size() && !ended; i++) {
+            std::string mine = cull::disassemble(s->words[2 * i], s->words[2 * i + 1]), theirs = listed[i];
+            if (theirs.find("(rpt") == std::string::npos) {
+                size_t f;
+                while ((f = theirs.find("(r)")) != std::string::npos) theirs.erase(f, 3);
+                while ((f = mine.find("(r)")) != std::string::npos) mine.erase(f, 3);
+            }
+            CHECK(mine == theirs);
+            if (mine != theirs) std::printf("       %s, instruction %zu: \"%s\" here, \"%s\" in the listing\n", name, i, mine.c_str(), theirs.c_str());
+            ended = mine == "end";
+        }
+        CHECK(ended);
+    }
+}
+

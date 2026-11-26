@@ -51,7 +51,7 @@ IOS_CXX   ?= $(abspath $(HAKIOS))/xnu-deps/host/bin/xnu-clang++ -arch arm64 -isy
 IOS_AR    ?= llvm-ar --format=darwin rcs
 endif
 
-CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/gmem.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp
+CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/cull.cpp src/gmem.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp
 HOST      = $(CORE) src/fake_gpu.cpp
 TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
 
@@ -151,6 +151,16 @@ out/ios/hakios-metal-hsrcheck: tools/hsrcheck.cpp out/ios/libhakios-metal.a $(HS
 	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/hsrcheck.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
 		-framework IOKit -framework CoreFoundation -framework IOSurface
 
+
+# the culling check (tools/cullcheck.cpp): scenes drawn on the phone's GPU with every draw and with the covered ones left out
+# (CommandBuffer::setCull), compared byte for byte, its twins shown to differ, and what leaving them out saves
+# (its fixtures named, as the HSR check's)
+CULLCHECK_BC = tests/fixtures/tri_attr_vs_bc.hpp tests/fixtures/tri_mvp_vs_bc.hpp tests/fixtures/tri_mvpx_vs_bc.hpp tests/fixtures/tri_color_fs_bc.hpp \
+	tests/fixtures/tri_fb_fs_bc.hpp tests/fixtures/tri_kill_fs_bc.hpp tests/fixtures/tri_mrt_fs_bc.hpp
+out/ios/hakios-metal-cullcheck: tools/cullcheck.cpp out/ios/libhakios-metal.a $(CULLCHECK_BC) \
+		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
+	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/cullcheck.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
+		-framework IOKit -framework CoreFoundation -framework IOSurface
 
 # a kernel's bitcode as a header, for a probe that compiles it on the phone (our own kernels only: tools/kernels/*.ll)
 tests/fixtures/%_bc.hpp: out/host/kernels/%.bc tools/bc-header.py
