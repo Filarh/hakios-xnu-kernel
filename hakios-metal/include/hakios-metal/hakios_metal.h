@@ -568,6 +568,19 @@ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
  * What is then drawn is not what was asked: for timing the draws nobody sees, never in use. */
 void hakios_metal_cb_set_draw_tag(hakios_metal_cb *cb, unsigned tag);
 void hakios_metal_cb_cancel_draw(hakios_metal_cb *cb, unsigned tag);
+/* Whole draws left out when later opaque rectangles of their pass cover them (CommandBuffer::setCull; the plug-in's
+ * metal_cull): MODE 0 off, 1 on, 2 everything worked out and nothing left out. The counts: draws looked at, those whose
+ * positions were worked out, those that covered something, those left out and the pixels of their boxes, and those put
+ * back at the commit because a byte they were read from had changed. cull_why: how many draws were not looked at
+ * further for reason WHY, and its name (NULL past the last reason). pass_cull: the same counts of timed pass I (-1: no
+ * such pass). cull_event: the K-th draw left out -- its pass among the timed ones (~0: not timed), its number and its
+ * last coverer's among the pass's draws, the pixels it could touch (x0 y0 x1 y1) -- or -1 past the last. */
+void hakios_metal_cb_set_cull(hakios_metal_cb *cb, int mode);
+void hakios_metal_cb_cull_counts(hakios_metal_cb *cb, unsigned *seen, unsigned *known, unsigned *coverers, unsigned *culled, unsigned long long *pixels,
+				 unsigned *undone);
+unsigned hakios_metal_cb_cull_why(hakios_metal_cb *cb, unsigned why, const char **name);
+int hakios_metal_cb_pass_cull(hakios_metal_cb *cb, unsigned i, unsigned *seen, unsigned *coverers, unsigned *culled, unsigned long long *pixels);
+int hakios_metal_cb_cull_event(hakios_metal_cb *cb, unsigned k, unsigned *pass, unsigned *draw, unsigned *by, int box[4]);
 /* Hidden surface removal by depth (CommandBuffer::setHsr; the plug-in's metal_hsr): ON non-zero draws the passes it
  * serves -- colour attachment 0 compressed, no depth or stencil attachment, one sample -- with a prepass of their opaque
  * draws and the rest tested against its depth, the picture the same; 0, as by default, draws every pass as it comes. */
