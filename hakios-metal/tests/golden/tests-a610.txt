@@ -20,6 +20,7 @@ a6xx_first_draw_link_and_vfd_words submits 0 words 0 draws 0 loads 0 stream 0000
 a6xx_first_draw_fs_input_output_and_raster_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 c_api_copy_and_callbacks submits 21 words 2070 draws 0 loads 0 stream 47d27f29e65ddf65 state cbf29ce484222325 names 22 860fef900f8e4bc0
 c_api_free_inside_its_callback submits 51 words 1152 draws 0 loads 0 stream 8cd1911eeb1da2f1 state cbf29ce484222325 names 50 ed30de173774d34c
+c_api_a_deferred_buffer_freed_in_its_callback_is_safe submits 1 words 2 draws 0 loads 0 stream ad22116aa8af66b1 state cbf29ce484222325 names 0 0000000000000000
 c_api_fail_ends_in_error submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: the C interface's compile and dispatch did not run)
 c_api_library_and_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
@@ -54,6 +55,7 @@ buffers_are_given_back submits 0 words 0 draws 0 loads 0 stream 0000000000000000
 a_bad_stream_is_a_hang_the_kernel_resets_the_gpu_for submits 2 words 2 draws 0 loads 0 stream 8aecc7613026cc32 state cbf29ce484222325 names 0 0000000000000000 (unread)
 a_command_buffer_behind_a_hang_is_given_up_not_run submits 3 words 207 draws 0 loads 0 stream e5a642e8dfcc148a state cbf29ce484222325 names 2 eac483c37d19272c (unread)
 without_recovery_the_first_hang_ends_every_later_wait submits 3 words 105 draws 0 loads 0 stream 9efcf556390aec4c state cbf29ce484222325 names 1 9ab2aef0511b058f (unread)
+a_hang_with_no_reset_quarantines_the_command_buffers_memory submits 2 words 104 draws 0 loads 0 stream abd7ec52eeedc92c state cbf29ce484222325 names 1 9ab2aef0511b058f (unread)
 a_fence_never_handed_out_is_a_hang submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 big_copies_are_cut_into_packets_the_gpu_takes submits 1 words 1167 draws 0 loads 0 stream fb5fa7318f328cc5 state cbf29ce484222325 names 2 b55fb85efbbb8fa8
        (no compiler in this build: the fixture comparison did not run)
@@ -134,6 +136,7 @@ a_dispatch_of_an_image_only_kernel_puts_a_storage_descriptor_at_ibo_0_and_no_tex
 an_image_kernel_stores_into_a_2d_array_or_a_3d_texture_through_a_layered_descriptor submits 2 words 258 draws 0 loads 4 stream ba92eb5e5a069711 state bfea58ec3ed85d91 names 6 0dca46361c73d6e5
 a_dispatch_of_tex_copy_loads_the_texture_table_with_a_zero_slot_0_and_one_zero_sampler submits 1 words 145 draws 0 loads 4 stream 81da8c285905eeb6 state 04201b3d52ceed6f names 4 c2de5d80274d5008
 a_dispatch_of_tex_sample_gid_loads_the_sampler_it_was_given submits 2 words 290 draws 0 loads 8 stream 64b4395488903095 state 54292e7cd3a69e39 names 8 85bcbb004e9aa010
+a_buffer_slot_the_kernel_declares_nothing_under_gets_a_hole_and_a_declared_one_unbound_is_refused submits 1 words 142 draws 0 loads 4 stream a9642b218ac621ef state 674928df19fabf90 names 0 0000000000000000
 an_image_slot_the_kernel_never_addresses_gets_a_hole_descriptor_over_the_table submits 1 words 142 draws 0 loads 4 stream 64c9a6bc74c199d6 state 89383fb08121181d names 0 0000000000000000
 the_fake_refuses_a_texture_count_the_load_does_not_match submits 1 words 142 draws 0 loads 4 stream f646ad7c4bb852a1 state 04201b3d52ceed6f names 0 0000000000000000
 the_fake_refuses_a_texture_outside_every_buffer submits 1 words 142 draws 0 loads 4 stream 723285e9cefe6832 state c24f4122720d5804 names 0 0000000000000000
@@ -242,7 +245,7 @@ a_draw_tests_and_writes_depth_through_its_attachment submits 2 words 995 draws 1
 a_pass_of_depth_alone_draws_depth submits 1 words 659 draws 1 loads 2 stream fc5a84be53722540 state cb137a44d958688c names 4 0223ab1424be5b7c
 a_draw_refuses_a_depth_setup_it_cannot_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_fake_refuses_a_depth_draw_that_does_not_hold_together submits 6 words 3612 draws 6 loads 12 stream fb6fdb5720a37449 state 54e81470edcf5a2d names 0 0000000000000000
-a_texture_over_an_iosurface_draws_into_the_surfaces_memory submits 2 words 624 draws 0 loads 0 stream bb9f92ecc7565312 state cbf29ce484222325 names 4 6ef4ef7bbfd7fb74
+a_texture_over_an_iosurface_draws_into_the_surfaces_memory submits 2 words 624 draws 0 loads 0 stream 1191fce31bc883ce state cbf29ce484222325 names 4 0c606b6db2977250
 a_two_plane_surface_is_one_ycbcr_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_ycbcr_texture_is_the_two_planes_read_as_cr_y_cb_one submits 1 words 699 draws 1 loads 4 stream 56c542b7f140ba97 state fc0919292643f43a names 5 75a6c75c2ecf170b
 a_texture_over_an_iosurface_refuses_what_the_gpu_cannot_take submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
