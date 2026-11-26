@@ -1003,6 +1003,13 @@ void hakios_metal_cb_kept_counts(hakios_metal_cb* cb, unsigned* kept, unsigned* 
     if (sameProgram) *sameProgram = c.sameProgramDraws;
 }
 
+void hakios_metal_cb_fetch_counts(hakios_metal_cb* cb, unsigned* unordered, unsigned* reordered) {
+    syncOne(cb);
+    const CommandBuffer::Counts& c = cb->cb->counts();
+    if (unordered) *unordered = c.fetchUnordered;
+    if (reordered) *reordered = c.fetchReordered;
+}
+
 void hakios_metal_cb_set_gmem(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setGmem(on != 0); });
     cb->cb->setGmem(on != 0);

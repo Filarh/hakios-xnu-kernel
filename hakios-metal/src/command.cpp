@@ -867,6 +867,11 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     }
     cb->closePass();   // the last pass's tail
     cb->cullRevalidate();   // (setCull: the bytes its draws left out rest on, held against the buffers now)
+    cb->settleFetches();   // (the draws left unordered for what their buffers held: do they still hold it)
+    if (!cb->error_.empty()) {
+        cb->finish(CommandBuffer::kError);
+        return;
+    }
     const int64_t closed = gpu_.transport().nowNs();
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();

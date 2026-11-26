@@ -5151,7 +5151,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     if (joins && open_->dual && !tileable) {
         // (recorded both ways: the pass goes on in sysmem, what it has so far onto the stream)
         gmemWhy_ = whyNotTiled();
-        appendStream(stream_, open_->sysStream);
+        sysStreamToStream();
         open_->sysStream.clear();
         open_->bodies.clear();
         open_->dual = open_->gmem = false;
@@ -5251,6 +5251,27 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
     if (hsr && hsrTwin_ == 8) encodeOptions.lrzWriteAll = true;   // (setHsrTest's twin 8: the hidden draws write the LRZ too)
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
     if (gmemOff_ & kSysmemFetchUnordered) encodeOptions.fbReadOverlap = false;
+    // The rasterizer's ordering among the primitives of a sysmem draw that reads its target is this draw's own to need:
+    // one whose primitives are proved never to overlap each other is drawn without it (overlap.hpp: one primitive; the
+    // two triangles of a quad; lines apart), the barrier before it standing as for any fetching draw. Not a draw that
+    // reads a compressed attachment: there the mode also keeps a block's flags and data in step for the fetch
+    // (a6xx.xml:3171-3181), which no property of the primitives answers. Looked at only for a draw the ordering would
+    // otherwise be written for; a pass of tiles alone has nothing to ask.
+    bool unordered = false;
+    const size_t witnessFrom = fetchWitness_.spans.size(), witnessBytes = fetchWitness_.bytes.size();
+    if (program.fs.fbRead && encodeOptions.fbReadOverlap && (!gmem || dual) && !(gmemOff_ & kSysmemFetchOrdered)) {
+        bool compressed = false;
+        for (uint32_t i = 0; !(gmemOff_ & kSysmemFetchUnorderedUbwc) && i < kMaxTextureSlots && i < program.fs.k.numTextureSlots; i++) {
+            const uint32_t target = program.fs.k.textures[i].fbTarget;
+            if (target == 0) continue;
+            const Texture* t = target == 1 ? pass.color0 : target - 2 < kMaxColorOutputs - 1 ? pass.more[target - 2].texture : nullptr;
+            if (t == nullptr || t->compressed()) compressed = true;
+        }
+        if (!compressed && render::primitivesOverlap(program, d, vsBindings, &fetchWitness_) == render::Overlap::kNever) {
+            unordered = true;
+            encodeOptions.fbReadOverlap = false;
+        }
+    }
     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
     if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
     render::Options sysOptions = encodeOptions;   // (recorded both ways: the sysmem side's)
@@ -5604,6 +5625,30 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         open_->cache->cur[0].forget();
         open_->cache->cur[1].forget();
     }
+    if (unordered) {
+        counts_.fetchUnordered++;
+        if (fetchWitness_.spans.size() != witnessFrom) {
+            // Decided from bytes the program may still write: the draw gets a write of GRAS_SC_CNTL of its own, the
+            // last thing before its draw packet, with the value its state already holds there (so nothing the shadow
+            // or the cursors know changes) -- a word settleFetches can make the ordering mode at commit, whatever
+            // deduplication left of the draw's state. On the sysmem side: the tiles never asked.
+            pm4::Stream& s = open_->dual ? open_->sysStream : into;
+            const size_t at = s.lastPacket(open_->dual ? markSys : markInto, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI);
+            if (at != SIZE_MAX) {
+                static thread_local std::vector<uint32_t> tail;
+                tail.assign(s.words().data() + at, s.words().data() + s.size());
+                s.truncate(at);
+                const uint32_t value = a6xx::grasScCntlSysmem();
+                s.registers(a6xx::REG_A6XX_GRAS_SC_CNTL, &value, 1);
+                s.append(tail.data(), tail.size());
+                (open_->dual ? open_->sysFetches : fetchMarks_).push_back(FetchMark{at + 1, witnessFrom, fetchWitness_.spans.size()});
+            } else {
+                // (no draw packet: nothing is drawn, nothing to settle)
+                fetchWitness_.spans.resize(witnessFrom);
+                fetchWitness_.bytes.resize(witnessBytes);
+            }
+        }
+    }
     if (hsr && hsrClass == render::kHsrOpaque) {
         // (drawn in the prepass: here its state alone, which the draws after it are written against)
         into.nopPacket(into.lastPacket(markInto, a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI), a6xx::CP_DRAW_INDX_OFFSET, a6xx::CP_DRAW_INDIRECT_MULTI);
@@ -5657,6 +5702,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& given, const 
         if (certain) {
             appendStream(stream_, open_->headGmem);
             open_->sysStream.clear();
+            open_->sysFetches.clear();
             open_->dual = false;
             open_->tiledEarly = true;
         }
@@ -5874,6 +5920,16 @@ bool CommandBuffer::append(CommandBuffer& other) {
         other.cullChecks_.clear();
         other.cullEvents_.clear();
         other.cullCounts_ = CullCounts{};
+        // (OTHER's fetch marks and their witness with its stream: appendStream puts one word before it)
+        const size_t words = stream_.size() + 1, spans = fetchWitness_.spans.size(), bytes = fetchWitness_.bytes.size();
+        for (render::OverlapWitness::Span x : other.fetchWitness_.spans) {
+            x.at += bytes;
+            fetchWitness_.spans.push_back(x);
+        }
+        fetchWitness_.bytes.insert(fetchWitness_.bytes.end(), other.fetchWitness_.bytes.begin(), other.fetchWitness_.bytes.end());
+        for (const FetchMark& m : other.fetchMarks_) fetchMarks_.push_back(FetchMark{m.at + words, m.spanFrom + spans, m.spanTo + spans});
+        other.fetchMarks_.clear();
+        other.fetchWitness_.clear();
     }
     appendStream(stream_, other.stream_);
     other.stream_ = pm4::Stream{};
@@ -5908,6 +5964,8 @@ bool CommandBuffer::append(CommandBuffer& other) {
     counts_.binnedPasses += other.counts_.binnedPasses;
     counts_.tiles += other.counts_.tiles;
     counts_.keptDraws += other.counts_.keptDraws;
+    counts_.fetchUnordered += other.counts_.fetchUnordered;
+    counts_.fetchReordered += other.counts_.fetchReordered;
     other.counts_ = Counts{};
     return true;
 }
@@ -5974,6 +6032,35 @@ bool CommandBuffer::hsrCloseSegment() {
     if (!stream_.patch(o.hsrHole, call, 4)) return fail("an HSR segment's hole is not in the stream");
     counts_.hsrPrepasses++;
     return true;
+}
+
+// the sysmem side of a pass recorded both ways onto the stream, its fetch marks placed in it (appendStream puts one
+// word before what it appends)
+void CommandBuffer::sysStreamToStream() {
+    const size_t base = stream_.size() + 1;
+    for (const FetchMark& m : open_->sysFetches) fetchMarks_.push_back(FetchMark{m.at + base, m.spanFrom, m.spanTo});
+    open_->sysFetches.clear();
+    appendStream(stream_, open_->sysStream);
+}
+
+// At commit, with every pass closed: a draw left without the rasterizer's ordering for what its buffers held when it
+// was encoded (overlap.hpp) keeps that only if they still hold it -- Metal lets the program write them until now, and
+// the GPU reads what is there when it runs. One whose bytes changed gets the ordering mode, in the word the draw left
+// for it; the draws after it that wrote no GRAS_SC_CNTL of their own run in that mode too until one does, which costs
+// them time and nothing else.
+void CommandBuffer::settleFetches() {
+    const uint32_t ordered = a6xx::A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | a6xx::A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(a6xx::FLUSH_PER_OVERLAP_AND_OVERWRITE);
+    for (const FetchMark& m : fetchMarks_) {
+        if (fetchWitness_.holds(m.spanFrom, m.spanTo)) continue;
+        if (m.at == 0 || m.at >= stream_.size() || stream_.words().data()[m.at - 1] != pm4::type4(a6xx::REG_A6XX_GRAS_SC_CNTL, 1) ||
+            !stream_.patch(m.at, &ordered, 1)) {
+            fail("a fetching draw's ordering word is not where it was left in the stream");
+            break;
+        }
+        counts_.fetchReordered++;
+    }
+    fetchMarks_.clear();
+    fetchWitness_.clear();
 }
 
 bool CommandBuffer::cancelDraw(uint32_t tag) {
@@ -6224,8 +6311,9 @@ void CommandBuffer::closePass(const RenderPass* next, bool kept) {
         }
         if (tiles) {
             appendStream(stream_, open_->headGmem);
+            open_->sysFetches.clear();
         } else {
-            appendStream(stream_, open_->sysStream);
+            sysStreamToStream();
             open_->gmem = false;
             if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().sysmemWhy = why;
         }

@@ -28,6 +28,7 @@
 #include "hakios-metal/compute.hpp"
 #include "hakios-metal/cull.hpp"
 #include "hakios-metal/render.hpp"
+#include "hakios-metal/overlap.hpp"
 #include "hakios-metal/gpu.hpp"
 #include "hakios-metal/pm4.hpp"
 
@@ -208,6 +209,10 @@ public:
         uint32_t sameProgramDraws = 0;
         // of the passes, those whose head was taken from the heads of the passes before (render.cpp: HeadCache)
         uint32_t keptHeads = 0;
+        // ...and of a sysmem pass's draws that read their target, those drawn without the rasterizer's ordering because
+        // their primitives were proved never to overlap (overlap.hpp), and of those the ones the commit put back in
+        // order because the bytes the proof was read from had changed by then
+        uint32_t fetchUnordered = 0, fetchReordered = 0;
     };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -253,10 +258,16 @@ public:
     // chooses tiles or sysmem for a pass recorded both ways by its draws against the bar and nothing else
     // (render::gmemWorth's criteria off), kSysmemFetchUnordered leaves the primitives of a sysmem draw that reads its
     // target unordered among themselves (render::Options::fbReadOverlap off).
+    // That ordering is otherwise each draw's own: kept unless the draw's primitives are proved never to overlap
+    // (overlap.hpp) and the attachments it reads are not compressed. kSysmemFetchOrdered keeps it for every such draw,
+    // as before the proof (nothing is then looked at: the A/B's other side); kSysmemFetchUnorderedUbwc lets the proof
+    // decide for a draw that reads a compressed attachment too, where NO_FLUSH is documented as able to read a
+    // block's flags and data out of step (a6xx.xml:3171-3181) -- a measurement's switch, not for use.
     // (8, 16 and 32 are the plug-in's own: metal_gmem_off's untuned choice, no binning, null textures.)
     enum : uint32_t {
         kGmemWholeArea = 1, kGmemEveryAttachment = 2, kGmemFetchBarrier = 4, kGmemPlainBody = 64, kGmemNoLeave = 128, kGmemOldTiles = 256,
         kGmemEveryBin = 512, kGmemInlineBarriers = 1024, kGmemAllOrdered = 2048, kGmemByDrawsAlone = 4096, kSysmemFetchUnordered = 8192,
+        kSysmemFetchOrdered = 16384, kSysmemFetchUnorderedUbwc = 32768,
     };
     void setGmemOff(uint32_t bits) { gmemOff_ = bits; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
@@ -447,6 +458,17 @@ private:
                   size_t prepassAt);
     // at the commit, the pass closed: the bytes read still what the buffers hold, or every draw left out put back
     void cullRevalidate();
+    // A draw left without the rasterizer's ordering on the strength of bytes the program may still write (overlap.hpp):
+    // where in the stream its own write of GRAS_SC_CNTL's value lies, and the witness's spans it was decided from.
+    // settleFetches, at commit, writes the ordering mode there for each whose bytes are no longer those.
+    struct FetchMark {
+        size_t at;
+        size_t spanFrom, spanTo;
+    };
+    std::vector<FetchMark> fetchMarks_;
+    render::OverlapWitness fetchWitness_;
+    void settleFetches();
+    void sysStreamToStream();
     bool hsr_ = false, hsrAnyTarget_ = false;   // setHsr's, setHsrTest's
     uint8_t hsrTwin_ = 0;
     uint32_t hsrLimit_ = kHsrMaxDraws;
@@ -603,6 +625,7 @@ private:
         // one the pass's draws call for, now that they are known
         bool dual = false;
         pm4::Stream sysStream, headGmem;
+        std::vector<FetchMark> sysFetches;   // (fetchMarks_ of the draws in SYS_STREAM, placed in it: the stream's when it takes that side)
         // (recorded both ways until its draws left no doubt that it is tiled -- render::gmemWorth's answer could no
         // longer come out sysmem whatever the draws still to come -- and for tiles alone from then on: draw())
         bool tiledEarly = false;

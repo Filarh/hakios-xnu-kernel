@@ -14,7 +14,7 @@ OUT   = out/dev-$(CHIP)
 DEFS  = $(if $(filter a610,$(CHIP)),-DHAKIOS_CHIP_A610)
 CXXFLAGS = $(OPT) -std=c++17 -Wall -Wextra -Werror -Iinclude $(DEFS) -MMD -MP
 
-CORE  = pm4 gpu command compute texture render cull gmem link compiler metallib c_api fake_gpu
+CORE  = pm4 gpu command compute texture render cull overlap gmem link compiler metallib c_api fake_gpu
 TESTS = $(basename $(notdir $(wildcard tests/*_test.cpp))) main
 
 CORE_O = $(CORE:%=$(OUT)/obj/src/%.o)

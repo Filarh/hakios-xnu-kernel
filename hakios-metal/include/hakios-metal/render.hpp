@@ -484,6 +484,8 @@ struct Options {
                                  // barrier before every fetching draw there too
     bool fbReadOverlap = true;   // ...and in sysmem the rasterizer's ordering between the primitives of the fetching draw itself
                                  // (SINGLE_PRIM_MODE FLUSH_PER_OVERLAP_AND_OVERWRITE), the barrier before it kept; off: NO_FLUSH
+                                 // (CommandBuffer::draw writes NO_FLUSH by itself for a draw whose primitives are proved
+                                 // never to overlap, overlap.hpp; encoded alone, a draw is as this says)
     bool tailDepthFlush = true;  // with a depth attachment: PC_CCU_FLUSH_DEPTH_TS writing a value + the wait for it
     bool tailLrzFlush = true;    // LRZ_FLUSH, 1 word
     bool tailCacheFlush = true;  // CACHE_FLUSH_TS + CP_WAIT_MEM_GTE, as compute's tail

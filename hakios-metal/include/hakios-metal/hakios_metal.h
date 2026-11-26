@@ -550,6 +550,11 @@ void hakios_metal_cb_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *dra
 /* of CB's draws, those taken from their program's kept state, and of those the ones whose draw before them in the pass
  * was of the same program (CommandBuffer::Counts::keptDraws, sameProgramDraws); either pointer may be NULL */
 void hakios_metal_cb_kept_counts(hakios_metal_cb *cb, unsigned *kept, unsigned *same_program);
+/* of CB's draws that read their target in a sysmem pass, those left without the rasterizer's ordering because their
+ * primitives were proved never to overlap, and of those the ones put back in order at commit because their buffers had
+ * changed (CommandBuffer::Counts::fetchUnordered, fetchReordered; the second is final once CB is committed); either
+ * pointer may be NULL */
+void hakios_metal_cb_fetch_counts(hakios_metal_cb *cb, unsigned *unordered, unsigned *reordered);
 /* tiled rendering (render::Options::gmem) for CB's passes from now on, on by default; and of what CB holds, the passes
  * drawn in GMEM and their tiles, and pass I's tiles as profiled (0: in sysmem, -1 past them) */
 void hakios_metal_cb_set_gmem(hakios_metal_cb *cb, int on);
