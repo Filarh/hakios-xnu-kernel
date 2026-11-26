@@ -1124,6 +1124,12 @@ void hakios_metal_draw_states(int keep, int verify) {
 }
 
 void hakios_metal_same_program_loads(int skip) { CommandBuffer::skipSameProgramLoads(skip != 0); }
+void hakios_metal_kept_heads(int keep) { CommandBuffer::keepHeads(keep != 0); }
+unsigned hakios_metal_cb_kept_heads(hakios_metal_cb* cb) {
+    if (cb == nullptr) return 0;
+    syncOne(cb);
+    return cb->cb->counts().keptHeads;
+}
 
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setProfileDraws(on != 0); });
@@ -1436,6 +1442,13 @@ hakios_metal_program* hakios_metal_program_specialize_ycbcr(hakios_metal_program
 }   // extern "C"
 
 namespace hakios::metal {
+void hakios_metal_cb_set_hsr_test(hakios_metal_cb* cb, unsigned twin, unsigned limit, int anyTarget) {
+    if (cb == nullptr) return;
+    const uint32_t most = limit < CommandBuffer::kHsrMaxDraws ? limit : CommandBuffer::kHsrMaxDraws;
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, twin, most, anyTarget] { cb->cb->setHsrTest(uint8_t(twin), most, anyTarget != 0); });
+    cb->cb->setHsrTest(uint8_t(twin), most, anyTarget != 0);
+}
+
 hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const Stage& fs, unsigned colorPixelFormat, unsigned fsIboBase, unsigned ssboWrites) {
     if (vs.kind != kStageVertex || fs.kind != kStageFragment) {
         failed("hakios_metal_program_from_stages: a vertex stage and a fragment stage, in that order");
@@ -1677,10 +1690,9 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
     // stage's pushed ranges name and refuses a range with nothing bound by name. (The command buffer's own two tables,
     // emptied: a draw's bindings were six vectors made and let go a draw.)
     auto table = [](Bindings& b, hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count) {
-        b.buffers.clear();
         b.buffers.resize(count);
         for (unsigned i = 0; i < count; i++) {
-            if (buffers != nullptr && buffers[i] != nullptr) b.buffers[i] = Binding{buffers[i]->buffer.get(), offsets != nullptr ? offsets[i] : 0};
+            b.buffers[i] = buffers != nullptr && buffers[i] != nullptr ? Binding{buffers[i]->buffer.get(), offsets != nullptr ? offsets[i] : 0} : Binding{};
         }
         b.textures.clear();
         b.samplers.clear();

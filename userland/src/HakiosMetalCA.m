@@ -3301,6 +3301,21 @@ hm_same_program_switch(void)
 	}
 }
 
+/* Boot-arg metal_heads=0: a pass's head is read back through the register shadow, every pass, as before the heads of
+ * the passes before were kept (hakios_metal_kept_heads; CommandBuffer::keepHeads). On by default; for an A/B -- the
+ * stream is the same either way, the processor's time for a pass is what differs. */
+static void
+hm_kept_heads_switch(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+
+	if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_heads=0") != NULL) {
+		hakios_metal_kept_heads(0);
+		hm_print("metal_heads=0: every pass's head is read back through the register shadow\n");
+	}
+}
+
 static void
 hm_warm_up(void)
 {
@@ -3869,6 +3884,7 @@ hm_boot_arg_set(const char *what)
 		 _targetName);
 	hm_cpu_access_switch();
 	hm_same_program_switch();
+	hm_kept_heads_switch();
 	hm_warm_up();
 	return self;
 }
@@ -7906,7 +7922,7 @@ static struct {
 	double outside, outsideMax;
 	unsigned outsides;
 	double closeCost, copyCost, submitCost, words;
-	unsigned costed, keptDraws, samePrograms;
+	unsigned costed, keptDraws, samePrograms, keptHeads;
 	/* gaps of metal_fps_long=MS or more (50 when not given): how many, how many quiet (a buffer of under 1 ms encoding,
 	 * with nothing of the driver's between the two commits -- a window server with nothing to draw, not a stall), and the
 	 * first few of the others with what the process did of the driver's work in them */
@@ -8180,6 +8196,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				}
 				hm_fps.keptDraws += kept;
 				hm_fps.samePrograms += same;
+				hm_fps.keptHeads += hakios_metal_cb_kept_heads(cb);
 			}
 			hm_fps.draws += draws;
 			hm_fps.dispatches += dispatches;
@@ -8370,9 +8387,9 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			if (ticks[0] != 0 || hm_fps.costed != 0) {
 				hm_print("fps: ... gaps between commits in ticks of 8.33 ms:%s; outside the command buffer %.1f ms on average, %.1f at most; "
 					 "-commit: the last pass's tail %.2f ms, the stream's copy %.2f, the submission in all %.2f, %.0f words a buffer; "
-					 "%u draws from kept states, %u of them with the program of the draw before\n",
+					 "%u draws from kept states, %u of them with the program of the draw before; %u passes' heads from kept ones\n",
 					 ticks, hm_fps.outsides ? hm_fps.outside * 1e3 / hm_fps.outsides : 0.0, hm_fps.outsideMax * 1e3, hm_fps.closeCost * 1e3 / costed,
-					 hm_fps.copyCost * 1e3 / costed, hm_fps.submitCost * 1e3 / costed, hm_fps.words / costed, hm_fps.keptDraws, hm_fps.samePrograms);
+					 hm_fps.copyCost * 1e3 / costed, hm_fps.submitCost * 1e3 / costed, hm_fps.words / costed, hm_fps.keptDraws, hm_fps.samePrograms, hm_fps.keptHeads);
 			}
 			if (hm_fps.longGaps != 0) {
 				hm_print("fps: ... long gaps (%.0f ms or more): %u, %u of them quiet (under 1 ms of encoding, nothing of the driver's between)\n",
@@ -8383,7 +8400,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			hm_fps.outside = hm_fps.outsideMax = 0;
 			hm_fps.outsides = 0;
 			hm_fps.closeCost = hm_fps.copyCost = hm_fps.submitCost = hm_fps.words = 0;
-			hm_fps.costed = hm_fps.keptDraws = hm_fps.samePrograms = 0;
+			hm_fps.costed = hm_fps.keptDraws = hm_fps.samePrograms = hm_fps.keptHeads = 0;
 			hm_fps.longGaps = hm_fps.longQuiet = hm_fps.longShown = 0;
 		}
 		if (hm_sampling()) hm_sample_report();
