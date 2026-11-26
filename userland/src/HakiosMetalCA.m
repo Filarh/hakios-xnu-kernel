@@ -7348,12 +7348,13 @@ HM_REFUSES_OUT_LOUD
 	unsigned passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, skipped = 0;
 	const char *last = "";
 	char label[300], queue[300], error[600], skip[600], refusal[600], *head = NULL, *record;
-	unsigned hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0;
+	unsigned hsrPasses = 0, hsrOpaque = 0, hsrHidden = 0, hsrBarriers = 0, fetchUnordered = 0, fetchReordered = 0;
 	int n;
 
 	_ftrace = NULL;
 	if (_cb != NULL) {
 		hakios_metal_cb_hsr_counts(_cb, &hsrPasses, &hsrOpaque, &hsrHidden, &hsrBarriers);
+		hakios_metal_cb_fetch_counts(_cb, &fetchUnordered, &fetchReordered);
 		hakios_metal_cb_counts(_cb, &passes, &draws, &dispatches, &copies, &clears);
 		hakios_metal_cb_gmem_counts(_cb, &gmemPasses, &tiles);
 		skipped = hakios_metal_cb_skipped(_cb, &last);
@@ -7363,14 +7364,14 @@ HM_REFUSES_OUT_LOUD
 	n = asprintf(&head, "cb seq=%u capture=%u serial=%u label=%s queue=%s qid=%p created=%.6f committed=%.6f scheduled=%.6f completed=%.6f "
 		     "gpu_us=%.1f status=%s error=%s held=%d encoders=%u draws=%u ops=%u core_passes=%u core_draws=%u core_dispatches=%u "
 		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s hsr=%d hsr_passes=%u hsr_opaque=%u "
-		     "hsr_hidden=%u hsr_barriers=%u\n", ft->seq, ft->capture->number,
+		     "hsr_hidden=%u hsr_barriers=%u fetch_unordered=%u fetch_reordered=%u\n", ft->seq, ft->capture->number,
 		     ft->serial, hm_ft_qs(label, sizeof(label), [self label]), hm_ft_qs(queue, sizeof(queue), [_queue label]), (void *)_queue,
 		     ft->created, ft->committed, ft->scheduled, ft->completed, _cb != NULL ? (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e3 : 0.0,
 		     _cb != NULL ? HM_FT_STATUS(hakios_metal_cb_status(_cb)) : "nocb",
 		     hm_ft_q(error, sizeof(error), _cb != NULL ? hakios_metal_cb_error(_cb) : "no command buffer"), ft->held ? 1 : 0, ft->encoders,
 		     ft->draws, ft->ops, passes, draws, dispatches, copies, clears, gmemPasses, tiles, skipped,
 		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""),
-		     _hsr ? 1 : 0, hsrPasses, hsrOpaque, hsrHidden, hsrBarriers);
+		     _hsr ? 1 : 0, hsrPasses, hsrOpaque, hsrHidden, hsrBarriers, fetchUnordered, fetchReordered);
 	record = n > 0 ? malloc((size_t)n + ft->len) : NULL;
 	if (record != NULL) {
 		memcpy(record, head, (size_t)n);
@@ -7858,6 +7859,7 @@ static struct {
 	unsigned outsides;
 	double closeCost, copyCost, submitCost, words;
 	unsigned costed, keptDraws, samePrograms;
+	unsigned fetchUnordered, fetchReordered;   /* (hakios_metal_cb_fetch_counts, summed) */
 	/* gaps of metal_fps_long=MS or more (50 when not given): how many, how many quiet (a buffer of under 1 ms encoding,
 	 * with nothing of the driver's between the two commits -- a window server with nothing to draw, not a stall), and the
 	 * first few of the others with what the process did of the driver's work in them */
@@ -7974,7 +7976,9 @@ hm_fps_draws(void)
 /* boot-arg metal_gmem_off=N: GMEM's refinements off by the bits of N (hakios_metal_cb_set_gmem_off; 8: the choice of GMEM
  * or sysmem by what each costs, hakios_metal_cb_set_gmem_tuned; 16: the hardware's binning,
  * hakios_metal_cb_set_gmem_binning; 32: every fragment texture the null one, wrong pictures but each draw's time without
- * its texture reads, hakios_metal_cb_set_null_fs_textures), for a bisect */
+ * its texture reads, hakios_metal_cb_set_null_fs_textures), for a bisect. 8192: no sysmem draw that reads its target is
+ * ordered among its own primitives; 16384: every one is, as before each draw was looked at (overlap.hpp); 32768: a
+ * draw that reads a COMPRESSED target is looked at too -- a measurement's switch (CommandBuffer::setGmemOff says why) */
 static unsigned
 hm_gmem_off(void)
 {
@@ -8056,7 +8060,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			hm_fps.passes += passes + copies + clears + dispatches;
 			{
 				int64_t closeNs = 0, copyNs = 0, submitNs = 0;
-				unsigned words = 0, kept = 0, same = 0;
+				unsigned words = 0, kept = 0, same = 0, unordered = 0, reordered = 0;
 
 				hakios_metal_cb_submit_cost(cb, &closeNs, &copyNs, &submitNs, &words);
 				hakios_metal_cb_kept_counts(cb, &kept, &same);
@@ -8069,6 +8073,9 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				}
 				hm_fps.keptDraws += kept;
 				hm_fps.samePrograms += same;
+				hakios_metal_cb_fetch_counts(cb, &unordered, &reordered);
+				hm_fps.fetchUnordered += unordered;
+				hm_fps.fetchReordered += reordered;
 			}
 			hm_fps.draws += draws;
 			hm_fps.dispatches += dispatches;
@@ -8259,9 +8266,11 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			if (ticks[0] != 0 || hm_fps.costed != 0) {
 				hm_print("fps: ... gaps between commits in ticks of 8.33 ms:%s; outside the command buffer %.1f ms on average, %.1f at most; "
 					 "-commit: the last pass's tail %.2f ms, the stream's copy %.2f, the submission in all %.2f, %.0f words a buffer; "
-					 "%u draws from kept states, %u of them with the program of the draw before\n",
+					 "%u draws from kept states, %u of them with the program of the draw before; "
+					 "%u fetching draws left unordered, %u of them put back in order at commit\n",
 					 ticks, hm_fps.outsides ? hm_fps.outside * 1e3 / hm_fps.outsides : 0.0, hm_fps.outsideMax * 1e3, hm_fps.closeCost * 1e3 / costed,
-					 hm_fps.copyCost * 1e3 / costed, hm_fps.submitCost * 1e3 / costed, hm_fps.words / costed, hm_fps.keptDraws, hm_fps.samePrograms);
+					 hm_fps.copyCost * 1e3 / costed, hm_fps.submitCost * 1e3 / costed, hm_fps.words / costed, hm_fps.keptDraws, hm_fps.samePrograms,
+					 hm_fps.fetchUnordered, hm_fps.fetchReordered);
 			}
 			if (hm_fps.longGaps != 0) {
 				hm_print("fps: ... long gaps (%.0f ms or more): %u, %u of them quiet (under 1 ms of encoding, nothing of the driver's between)\n",
@@ -8273,6 +8282,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			hm_fps.outsides = 0;
 			hm_fps.closeCost = hm_fps.copyCost = hm_fps.submitCost = hm_fps.words = 0;
 			hm_fps.costed = hm_fps.keptDraws = hm_fps.samePrograms = 0;
+			hm_fps.fetchUnordered = hm_fps.fetchReordered = 0;
 			hm_fps.longGaps = hm_fps.longQuiet = hm_fps.longShown = 0;
 		}
 		if (hm_sampling()) hm_sample_report();

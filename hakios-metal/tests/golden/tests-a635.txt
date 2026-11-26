@@ -158,7 +158,7 @@ a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 word
 a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43886 draws 288 loads 936 stream f56ed7507d70c481 state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
 the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        39922 draws taken, 26981 of them from a kept state; 6158 refused
-random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10438494 draws 83782 loads 235862 stream ed8ad597c8e741b5 state baf162defab8d119 names 39820 9d8a0521e9fd6c52
+random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10437814 draws 83782 loads 235862 stream 09c15fc22a7f6c65 state baf162defab8d119 names 39820 9d8a0521e9fd6c52
 more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream 52ca32fc2f9646cd state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
 end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
@@ -183,6 +183,16 @@ a_no_copy_buffer_off_a_page_is_refused_by_name submits 0 words 0 draws 0 loads 0
 without_the_kernels_sharing_a_no_copy_buffer_is_refused_not_copied submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 the_deallocator_runs_after_the_last_command_buffer_that_used_it submits 1 words 10 draws 0 loads 0 stream 6ee8853323e9d305 state cbf29ce484222325 names 2 701a44c9b971dc94
 a_texture_over_a_no_copy_buffer_reads_the_programs_rows submits 1 words 640 draws 0 loads 0 stream 30284de813e75489 state cbf29ce484222325 names 5 15cc1321d356ef14
+a_quads_two_triangles_are_proved_apart_and_nothing_less_is submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+an_indexed_quad_is_proved_from_its_indices_and_a_restart_among_them_is_not submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_quad_that_could_be_clipped_keeps_its_order submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_vertex_stage_the_walk_cannot_follow_keeps_the_order submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+lines_apart_are_proved_apart_and_runs_that_touch_are_not submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+a_sysmem_draw_that_reads_its_target_is_ordered_only_when_its_primitives_may_overlap submits 3 words 2373 draws 12 loads 46 stream 8d3d4cddff2b2dc9 state 6c79529d41d87930 names 17 a6ec7e5b08f95c0c
+a_draw_whose_vertices_change_before_the_commit_gets_its_order_back submits 2 words 2106 draws 6 loads 24 stream ae2bf73c4dceb33c state ff9af1b0ce80c0e5 names 10 6b62de9704c73bd2
+a_fetch_left_unordered_is_found_again_where_its_words_end_up submits 3 words 3296 draws 11 loads 38 stream 39f417483e951f8b state 9c095454daaccf70 names 21 f7db3746ce4080b2
+       (no Mesa in this build: no compressed target to draw)
+a_fetch_from_a_compressed_target_keeps_its_order_unless_asked submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 parity_is_odd submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 headers_match_mesa submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 decode_round_trips_and_catches_bad_parity submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
