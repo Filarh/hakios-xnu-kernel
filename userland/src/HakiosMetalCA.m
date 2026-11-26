@@ -4005,8 +4005,11 @@ hm_boot_arg_set(const char *what)
 - (uint64_t)maxBufferLength { return 256ULL << 20; }
 
 /* MTLDevice.recommendedMaxWorkingSetSize: "an approximation of how much memory, in bytes, this GPU device can allocate
- * without affecting its runtime performance" (Metal's documentation). Not implemented, the base class answered 0, which
- * a caller sizing its caches by it reads as no memory at all (mediaserverd: the capture plug-in's log read 0 MB).
+ * without affecting its runtime performance" (Metal's documentation; MTLDevice.h: "performance may be improved by
+ * keeping the total size of all resources (texture and buffers) and heaps less than this threshold"). The iOS 16.5
+ * SDK's header marks it unavailable on iOS, so no public caller there asks it; a caller that asks by selector got
+ * nothing from this class (mediaserverd: the capture plug-in's log read 0 MB, which is also what it prints for a
+ * selector that is not answered), and a 0 reads as no memory at all to whoever sizes a cache by it.
  * The GPU's memory here is the phone's (hasUnifiedMemory), and every allocation of this driver is resident from the
  * moment it is made, inside the process that made it. So the answer is the smaller of two budgets: two thirds of the
  * phone's memory (hw.memsize) -- the share Apple's own GPUs answer on their unified-memory machines of up to 32 GB, as
