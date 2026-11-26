@@ -235,8 +235,12 @@ public:
     void setProfileSamples(bool on) { profileSamples_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
     // the counter at both (so the draws no longer overlap: what each costs alone), with its program's name. Which
-    // draws of a heavy frame are heavy is read off these (metal_fps=draws).
-    struct DrawTime { std::string name; double us; uint32_t pass = 0, area[4] = {}; };   // PASS: its pass among passTimes'; AREA render::drawArea's
+    // draws of a heavy frame are heavy is read off these (metal_fps=draws, metal_drawts). A pass recorded both ways
+    // (GMEM and sysmem, CommandBuffer::setGmemMinDraws) has its draws stamped on its sysmem side: timed when it ends in
+    // sysmem, US -1 when it went to tiles (its stamps never ran). A GMEM pass's draws are not timed: each tile runs them
+    // again, and one slot per draw would hold the last tile's (tu_CmdWriteTimestamp2 says the same of a timestamp in a
+    // render pass). Its pass times feed no tuning (CommandQueue::tuned): the waits make every timed pass dearer.
+    struct DrawTime { std::string name; double us; uint32_t pass = 0, area[4] = {}; uint32_t ordinal = 0; };   // PASS: its pass among passTimes'; AREA render::drawArea's; ORDINAL: the buffer's draws before it (Counts::draws then)
     static constexpr uint32_t kMaxProfiledDraws = 512;
     void setProfileDraws(bool on) { profileDraws_ = on; }
     std::vector<DrawTime> drawTimes() const;
@@ -373,7 +377,7 @@ private:
     bool profileDraws_ = false;
     std::vector<DrawTime> drawsProfiled_;
     std::shared_ptr<Buffer> drawStamps_;
-    void drawStamp(uint32_t slot);
+    void drawStamp(uint32_t slot, pm4::Stream& into);
     bool gmem_ = true;
     uint32_t gmemOff_ = 0;
     uint32_t gmemMinDraws_ = 0;

@@ -1600,6 +1600,14 @@ inline constexpr uint32_t A6XX_SP_FS_CTRL_REG0_EARLYPREAMBLE = 0x10000000;      
 // the preemption preamble (fd6_gmem.cc fd6_build_preemption_preamble) adds these two, both = kMagicPcPowerCntl
 inline constexpr uint32_t REG_A6XX_PC_POWER_CNTL = 0x9805;                             // a6xx.xml.h:7467
 inline constexpr uint32_t REG_A6XX_VFD_POWER_CNTL = 0xa0f8;                            // a6xx.xml.h:8034
+// CP_ALWAYS_ON_COUNTER, the 64-bit counter a timestamp is (turnip's tu_CmdWriteTimestamp2, tu_query_pool.cc: a
+// CP_REG_TO_MEM of it, CNT 2, 64B). The same offset on every A6xx (a6xx.xml:2464, no variants), and the one Linux reads
+// on a chip without a GMU such as the A610 (a6xx_gpu.c a6xx_get_timestamp, linux-v6.12:1973-1977).
+inline constexpr uint32_t REG_A6XX_CP_ALWAYS_ON_COUNTER = 0x0980;                      // a6xx.xml.h:2815
+// ...and its rate: the RBBM timer, 19.2 MHz (msm_gpu.c:63-65 sets rbbmtimer_clk to 19200000; turnip's tu_device.cc:959-960
+// ALWAYS_ON_FREQUENCY "CP_ALWAYS_ON_COUNTER is fixed 19.2 MHz"; on this phone 159 999 ticks a 1/120 s vsync,
+// dev-notes/investigacion/09, its time base)
+inline constexpr double kAlwaysOnTicksPerUs = 19.2;                                    // not-in-headers: tu_device.cc:960 19200000 Hz / 1e6
 // CP_SCRATCH_REG[i], 8 of them: emit_marker6 writes (7) and, around an IB, (6)
 inline constexpr uint32_t REG_A6XX_CP_SCRATCH_REG = 0x0883;                            // a6xx.xml.h:2538  the array's first register
 inline constexpr uint32_t REG_A6XX_CP_SCRATCH_REG__STRIDE = 1;                         // a6xx.xml.h:2538
