@@ -88,6 +88,7 @@
 #import <Foundation/Foundation.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
@@ -125,7 +126,37 @@ struct hm_ft_pipe;
  * words of /var/tmp/metal.args, so that one can be tried without building and flashing a boot image -- the file written,
  * then the window server restarted (each switch is read once a process). As sysctlbyname("kern.bootargs"): 0 and the
  * string in ARGS, *SIZE its length with the terminator. Not needed by any kernel; a port's convenience.
+ *
+ * The file is read only when root wrote it and nobody else can change it: a regular file (not a link) owned by root,
+ * neither group- nor other-writable. /private/var/tmp is 1777 (lab report 23 §1.3): any process of any user may make a
+ * file there, and the switches in it reach every process that loads this plug-in, the window server first; a file
+ * that is not root's could arm a trace, open the device to every process or change what the window server draws.
+ * The sticky bit keeps another user from replacing root's file once it is there. A refused file is said once by
+ * -initWithAcceleratorPort: (hm_args_refused), not here: hm_print itself reads the switches.
  */
+static const char *hm_args_refused;   /* why /var/tmp/metal.args was not read, NULL when it was or is absent */
+
+/* FD (open on PATH) is a file this process may take orders from: regular, root's, written by root alone */
+static bool
+hm_root_file(int fd)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		hm_args_refused = "not a regular file";
+		return false;
+	}
+	if (st.st_uid != 0) {
+		hm_args_refused = "not owned by root";
+		return false;
+	}
+	if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+		hm_args_refused = "writable by others than root";
+		return false;
+	}
+	return true;
+}
+
 static int
 hm_bootargs(char *args, size_t *size)
 {
@@ -137,8 +168,13 @@ hm_bootargs(char *args, size_t *size)
 		return -1;
 	}
 	used = strnlen(args, room);
-	fd = open("/var/tmp/metal.args", O_RDONLY);
+	fd = open("/var/tmp/metal.args", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 	if (fd < 0) {
+		if (errno == ELOOP) hm_args_refused = "a symbolic link";
+		return 0;
+	}
+	if (!hm_root_file(fd)) {
+		close(fd);
 		return 0;
 	}
 	if (used + 2 < room) {
@@ -174,7 +210,8 @@ hm_asklog_open(void)
 		char path[160];
 
 		snprintf(path, sizeof(path), "/var/tmp/metal-log-%s-%d.txt", getprogname(), getpid());
-		hm_asklog_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+		/* (not through a link someone else left in /var/tmp under this name) */
+		hm_asklog_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
 	}
 }
 static int hm_print_fd = -1;    /* where hm_print writes: stderr, the console, or (metal_m2v=1) a copy of stderr kept aside */
@@ -1456,6 +1493,7 @@ HM_REFUSES_OUT_LOUD
 	HakiosMetalDevice *_device;
 	hakios_metal_queue *_queue;
 	NSUInteger _gpuPriority, _backgroundGPUPriority;
+	BOOL _backgroundGPUPrioritySet;          /* -setBackgroundGPUPriority: was called (a new queue's is 3 in iOS) */
 	dispatch_queue_t _completionQueue;       /* only where Apple's own ivar is missing */
 	dispatch_queue_t _deferred;              /* commits held for an event, in commit order; made on the first one */
 	long _deferring;                         /* commits on _deferred not yet made (atomic) */
@@ -1465,6 +1503,7 @@ HM_REFUSES_OUT_LOUD
 - (dispatch_queue_t)hakiosCompletionQueue;
 - (BOOL)hakiosDeferring;
 - (void)hakiosDefer:(dispatch_block_t)commit;
+- (BOOL)hakiosRunsWhenDenied;
 @end
 
 @interface HakiosMetalCommandBuffer : _MTLCommandBuffer {
@@ -2145,12 +2184,14 @@ hm_ft_watch(void *unused)
 	}
 	for (;;) {
 		usleep(100000);
-		if (stat(HM_FT_TRIGGER, &st) == 0 &&
+		/* (root's trigger alone, as root's metal.args alone: a regular file of root's that only root writes --
+		 * /var/tmp is everybody's, and a capture writes files in every process that has the switch on) */
+		if (lstat(HM_FT_TRIGGER, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
 		    (st.st_ino != ino || st.st_mtimespec.tv_sec != seen.tv_sec || st.st_mtimespec.tv_nsec != seen.tv_nsec)) {
 			char words[256] = "";
 			unsigned k = hm_ft_cbs;
 			BOOL mine = YES;
-			const int fd = open(HM_FT_TRIGGER, O_RDONLY);
+			const int fd = open(HM_FT_TRIGGER, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 
 			ino = st.st_ino;
 			seen = st.st_mtimespec;
@@ -3515,23 +3556,264 @@ hm_boot_arg_set(const char *what)
 	return hm_bootargs(args, &size) == 0 && strstr(args, what) != NULL;
 }
 
-- (instancetype)initWithAcceleratorPort:(io_service_t)port
+/*
+ * Who is shown the device (lab report 23 §2.5, §2.8, §3.1, §4.2). Three rules, the switches read once a process:
+ *
+ *   (none)          the window server alone, as before: backboardd.
+ *   metal_all=1     every process, as before. For tests only: the GPU of this port has one page table and no register
+ *                   protection (report 23 §1.2), so whatever opens it can reach all of physical memory.
+ *   metal_policy=ios   the processes iOS lets open the GPU, as far as a process can tell it of itself without a
+ *                   sandbox (the port has none, report 23 §1.3): backboardd; a process whose own entitlements name the
+ *                   GPU -- com.apple.security.ts.opengl-or-metal (21 binaries of 20H392: chronod, MapKit's
+ *                   SnapshotService, SBRendererService, InputUI ...) or com.apple.security.iokit-user-client-class
+ *                   listing AGXDeviceUserClient or IOGPUDeviceUserClient (64: SpringBoard, Preferences, Spotlight ...)
+ *                   (multiproceso/B2 §3; entitlements of 2784 binaries); an application or an application extension,
+ *                   which iOS gives the GPU through the container profile with no key of their own (report 23 §2.8);
+ *                   but not a widget extension (extension point com.apple.widgetkit-extension): RunningBoard never
+ *                   grants one the GPU (DomainAttributes, chronod WidgetExtensionRun; 157 deny and 0 allow on the
+ *                   phone, report 23 §1.4) and WidgetKit does not link Metal (§3.2).
+ *   Daemons whose GPU comes from their sandbox profile alone (mediaserverd, WebKit's GPU process) carry no key a
+ *   process can read, and keep getting nil under this rule: what the profile allows is compiled into the kernelcache
+ *   (report 23 §2.8, §5).
+ *
+ * The rule only chooses who has a device. It isolates nothing: until the kernel has a page table per task and
+ * CP_PROTECT (report 23 §4.4, stages 2-3), every process shown the device can reach the others' memory, as with
+ * metal_all=1, only fewer processes are.
+ */
+enum { HM_WHO_SERVER, HM_WHO_ALL, HM_WHO_IOS };
+
+static int
+hm_who_rule(void)
 {
-	/* (hakios) the window server alone is shown the device: every other client of this image's Metal (SpringBoard
-	 * through SiriUICore, mediaserverd, ...) finds pipeline libraries made for Apple's GPUs with no default.metallib
-	 * beside them and aborts, while without a device it takes the road it takes today. Boot-arg metal_all=1: all. */
-	{
-		static int all = -1;
+	static int rule = -1;
+
+	if (rule < 0) {
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
-		const char *name = getprogname();
+		const bool read = hm_bootargs(args, &size) == 0;
 
-		if (all < 0) {
-			all = hm_bootargs(args, &size) == 0 && strstr(args, "metal_all=1") != NULL;
+		rule = read && strstr(args, "metal_all=1") != NULL ? HM_WHO_ALL :
+		       read && strstr(args, "metal_policy=ios") != NULL ? HM_WHO_IOS : HM_WHO_SERVER;
+	}
+	return rule;
+}
+
+static bool
+hm_is_window_server(void)
+{
+	const char *name = getprogname();
+
+	return name != NULL && strcmp(name, "backboardd") == 0;
+}
+
+/* this process's own entitlement KEY (SecTaskCopyValueForEntitlement on itself; the kernel answers from the signature's
+ * XML blob, xnu 0035), retained, or NULL. Security is looked up, not linked: it is in every process that has UIKit. */
+static CFTypeRef
+hm_own_entitlement(CFStringRef key)
+{
+	static CFTypeRef (*create)(CFAllocatorRef);
+	static CFTypeRef (*copy)(CFTypeRef, CFStringRef, CFErrorRef *);
+	static dispatch_once_t once;
+	CFTypeRef task, value;
+
+	dispatch_once(&once, ^{
+		void *security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+
+		if (security != NULL) {
+			create = (CFTypeRef (*)(CFAllocatorRef))dlsym(security, "SecTaskCreateFromSelf");
+			copy = (CFTypeRef (*)(CFTypeRef, CFStringRef, CFErrorRef *))dlsym(security, "SecTaskCopyValueForEntitlement");
 		}
-		if (!all && (name == NULL || strcmp(name, "backboardd") != 0)) {
-			HM_ONCE("%s is not shown the device: the window server alone is (metal_all=1: every process)\n", name ? name : "?");
+	});
+	if (create == NULL || copy == NULL || (task = create(kCFAllocatorDefault)) == NULL) {
+		return NULL;
+	}
+	value = copy(task, key, NULL);
+	CFRelease(task);
+	return value;
+}
+
+/* whether iOS would let this process open the GPU (the metal_policy=ios rule above); WHY says on what */
+static bool
+hm_ios_lets_open_gpu(char *why, size_t size)
+{
+	CFTypeRef value;
+	NSString *path, *point;
+
+	if (hm_is_window_server()) {
+		snprintf(why, size, "the window server");
+		return true;
+	}
+	value = hm_own_entitlement(CFSTR("com.apple.security.ts.opengl-or-metal"));
+	if (value != NULL) {
+		const bool on = CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)value);
+
+		CFRelease(value);
+		if (on) {
+			snprintf(why, size, "entitlement com.apple.security.ts.opengl-or-metal");
+			return true;
+		}
+	}
+	value = hm_own_entitlement(CFSTR("com.apple.security.iokit-user-client-class"));
+	if (value != NULL) {
+		bool named = false;
+
+		if (CFGetTypeID(value) == CFArrayGetTypeID()) {
+			for (id c in (NSArray *)value) {
+				if ([c isKindOfClass:[NSString class]] &&
+				    ([c isEqualToString:@"AGXDeviceUserClient"] || [c isEqualToString:@"IOGPUDeviceUserClient"])) {
+					snprintf(why, size, "entitlement com.apple.security.iokit-user-client-class: %s", [c UTF8String]);
+					named = true;
+					break;
+				}
+			}
+		}
+		CFRelease(value);
+		if (named) {
+			return true;
+		}
+	}
+	path = [[NSBundle mainBundle] bundlePath];
+	if ([path hasSuffix:@".app"]) {
+		snprintf(why, size, "an application (%s)", [[path lastPathComponent] UTF8String]);
+		return true;
+	}
+	if ([path hasSuffix:@".appex"]) {
+		id extension = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSExtension"];
+
+		point = [extension isKindOfClass:[NSDictionary class]] ? [extension objectForKey:@"NSExtensionPointIdentifier"] : nil;
+		if ([point isKindOfClass:[NSString class]] && [point isEqualToString:@"com.apple.widgetkit-extension"]) {
+			snprintf(why, size, "a widget extension: RunningBoard never grants one the GPU");
+			return false;
+		}
+		snprintf(why, size, "an application extension (%s)", [point isKindOfClass:[NSString class]] ? [point UTF8String] : "?");
+		return true;
+	}
+	snprintf(why, size, "no GPU entitlement, not an application");
+	return false;
+}
+
+/*
+ * RunningBoard's "now" (report 23 §2.5): runningboardd sets and clears TF_GPU_DENIED on the tasks it manages with
+ * setpriority(PRIO_DARWIN_GPU, pid, ALLOW|DENY) (it does so on the phone: 157 changes on 14 November), and in iOS a
+ * command buffer of a denied task ends in MTLCommandBufferErrorNotPermitted unless its queue was given a background
+ * priority other than 3 (IOGPUFamily; report 23 §2.5-§2.6). The task asks its own state with getpriority on itself;
+ * stock XNU's getpriority has no PRIO_DARWIN_GPU case (bsd/kern/kern_resource.c, getpriority: EINVAL), so that answer
+ * needs the kernel to give it (draft in the lab, anexos/35-gpu-sistema). Until then the first EINVAL is said once and
+ * nothing is held back. The numbers are XNU's: bsd/sys/resource.h, PRIO_DARWIN_GPU 5, _ALLOW 1, _DENY 2 (private
+ * there, not in the SDK's header).
+ */
+#define HM_PRIO_DARWIN_GPU       5
+#define HM_PRIO_DARWIN_GPU_DENY  2
+/* IOGPU's own words for it (its table, multiproceso/B1 §6.1: code 6 -> MTLCommandBufferErrorNotPermitted); the order of
+ * the parts is report 23 §4.2's */
+#define HM_NOT_PERMITTED_BG "Insufficient Permission (to submit GPU work from background) " \
+	"(00000006:kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted)"
+
+static bool
+hm_gpu_denied_now(void)
+{
+	static _Atomic int answers = -1;   /* -1 not asked yet, 0 the kernel does not answer, 1 it does */
+	int r;
+
+	if (atomic_load_explicit(&answers, memory_order_relaxed) == 0 || hm_is_window_server()) {
+		return false;      /* (backboardd: never managed by RunningBoard, never denied, report 23 §2.5) */
+	}
+	errno = 0;
+	r = getpriority(HM_PRIO_DARWIN_GPU, 0);
+	if (r == -1 && errno != 0) {
+		int expected = -1;
+
+		if (atomic_compare_exchange_strong(&answers, &expected, 0)) {
+			hm_print("getpriority(PRIO_DARWIN_GPU) on itself: %s; RunningBoard's GPU denial is not visible here, and no "
+				 "command buffer is held back for it\n", strerror(errno));
+		}
+		return false;
+	}
+	atomic_store_explicit(&answers, 1, memory_order_relaxed);
+	return r == HM_PRIO_DARWIN_GPU_DENY;
+}
+
+/*
+ * Where the compiled stages go (report 23 §2.9, §4.2.5). The window server keeps HM_CACHE_DIR, as before, with its
+ * stages and recipes and the warm-up that compiles them before its first frame. Every other process gets one of its
+ * own, where Metal keeps a process's cache: <NSCachesDirectory>/<CFBundleIdentifier>/com.apple.metal (Metal's
+ * getCacheMainFolder, report 23 §2.9), a process without a bundle under its name, and in it a directory of this driver's
+ * made 0700; refused when it is not a directory of this user's that only this user can enter (a link, someone else's,
+ * open to others). If that cannot be had, /var/tmp/hakios-metal-<uid>-<name> under the same test (a cache for this
+ * boot), and else none: compiled every time, never a file anyone else writes. The seed in the image is read by
+ * everyone, but only when root owns it and only root writes it.
+ */
+static bool
+hm_private_dir(const char *path)
+{
+	struct stat st;
+
+	(void)mkdir(path, 0700);
+	return lstat(path, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == geteuid() && (st.st_mode & 077) == 0;
+}
+
+static bool
+hm_root_dir(const char *path)
+{
+	struct stat st;
+
+	return lstat(path, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static void
+hm_process_cache(char *out, size_t size)
+{
+	NSString *who = [[NSBundle mainBundle] bundleIdentifier];
+	NSArray *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+	const char *name = getprogname() != NULL ? getprogname() : "unknown";
+
+	if (who == nil || [who length] == 0 || [who containsString:@"/"] || [who hasPrefix:@"."]) {
+		who = [NSString stringWithUTF8String:name];
+	}
+	out[0] = '\0';
+	if ([caches count] != 0 && who != nil) {
+		NSString *metal = [[[caches objectAtIndex:0] stringByAppendingPathComponent:who] stringByAppendingPathComponent:@"com.apple.metal"];
+
+		if ([[NSFileManager defaultManager] createDirectoryAtPath:metal withIntermediateDirectories:YES
+							       attributes:@{ NSFilePosixPermissions: @0700 } error:NULL]) {
+			snprintf(out, size, "%s/HakiosMetal", [metal fileSystemRepresentation]);
+			if (hm_private_dir(out)) {
+				return;
+			}
+		}
+	}
+	snprintf(out, size, "/var/tmp/hakios-metal-%u-%s", (unsigned)geteuid(), name);
+	if (!hm_private_dir(out)) {
+		out[0] = '\0';
+	}
+}
+
+- (instancetype)initWithAcceleratorPort:(io_service_t)port
+{
+	/* (hakios) who is shown the device: the window server alone, every process (metal_all=1) or those iOS lets open
+	 * the GPU (metal_policy=ios); see hm_who_rule above */
+	{
+		const char *name = getprogname() != NULL ? getprogname() : "?";
+		const int rule = hm_who_rule();
+		char why[160] = "";
+
+		if (hm_args_refused != NULL) {
+			HM_ONCE("/var/tmp/metal.args not read: %s (only a regular file of root's that only root writes)\n", hm_args_refused);
+		}
+		if (rule == HM_WHO_SERVER && !hm_is_window_server()) {
+			HM_ONCE("%s is not shown the device: the window server alone is (metal_policy=ios: the processes iOS lets "
+				"open the GPU; metal_all=1: every process)\n", name);
 			return nil;     /* (not released: before -init, _MTLDevice's -dealloc reads what -init never set) */
+		}
+		if (rule == HM_WHO_IOS) {
+			const bool lets = hm_ios_lets_open_gpu(why, sizeof(why));
+
+			HM_ONCE("%s %s the device (metal_policy=ios): %s\n", name, lets ? "is shown" : "is not shown", why);
+			if (!lets) {
+				return nil;
+			}
+		} else if (rule == HM_WHO_ALL && !hm_is_window_server()) {
+			HM_ONCE("%s is shown the device (metal_all=1: every process, nothing isolated)\n", name);
 		}
 	}
 	/* (hakios) metal_m2v=1: the device is UniXNU's Metal on Vulkan instead (AdrenoMetal's frontend over metal2vulkan
@@ -3698,15 +3980,38 @@ hm_boot_arg_set(const char *what)
 	 * tools/metal-cache-seed.sh from an earlier boot's) is looked in after it and never written. */
 	/* (the skeleton makes HM_CACHE_DIR 1777, init.c from var.skel; an image without that line, or a process that may not
 	 * write there, falls back on /var/tmp as before: a cache for this boot only is better than none) */
-	mkdir(HM_CACHE_DIR, 01777);
-	setenv("HAKIOS_METAL_CACHE", access(HM_CACHE_DIR, W_OK | X_OK) == 0 ? HM_CACHE_DIR : (mkdir("/var/tmp/hakios-metal-cache", 0755),
-												 "/var/tmp/hakios-metal-cache"), 0);
-	{
+	if (hm_is_window_server()) {
 		struct stat st;
 
+		/* (made 0755 when absent: the window server's alone to write. One the image's skeleton made 1777 is kept,
+		 * and said: any process of the same user can put GPU code into the window server through it, report 23 §1.3) */
+		mkdir(HM_CACHE_DIR, 0755);
+		if (lstat(HM_CACHE_DIR, &st) == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+			hm_print("%s is writable by others (mode %o): any process can put GPU code into the window server through it\n",
+				 HM_CACHE_DIR, (unsigned)(st.st_mode & 07777));
+		}
+		setenv("HAKIOS_METAL_CACHE", access(HM_CACHE_DIR, W_OK | X_OK) == 0 ? HM_CACHE_DIR : (mkdir("/var/tmp/hakios-metal-cache", 0755),
+													 "/var/tmp/hakios-metal-cache"), 0);
 		if (stat(HM_CACHE_SEED, &st) == 0 && S_ISDIR(st.st_mode)) {
 			setenv("HAKIOS_METAL_CACHE_SEED", HM_CACHE_SEED, 0);
 		}
+	} else {
+		/* (overwritten, not kept: a value inherited from a parent is the parent's cache, not this process's) */
+		char dir[PATH_MAX];
+
+		hm_process_cache(dir, sizeof(dir));
+		if (dir[0] != '\0') {
+			setenv("HAKIOS_METAL_CACHE", dir, 1);
+		} else {
+			unsetenv("HAKIOS_METAL_CACHE");
+		}
+		if (hm_root_dir(HM_CACHE_SEED)) {
+			setenv("HAKIOS_METAL_CACHE_SEED", HM_CACHE_SEED, 1);
+		} else {
+			unsetenv("HAKIOS_METAL_CACHE_SEED");
+		}
+		hm_print("compiled stages: %s%s\n", dir[0] != '\0' ? dir : "none kept (no private directory could be had)",
+			 hm_root_dir(HM_CACHE_SEED) ? ", and the image's seed read-only" : "");
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
 	hm_ensure_spi([self class]);
@@ -3750,7 +4055,11 @@ hm_boot_arg_set(const char *what)
 		 _targetName);
 	hm_cpu_access_switch();
 	hm_same_program_switch();
-	hm_warm_up();
+	/* (the warm-up is the window server's: in another process the seed's recipes are CoreAnimation's, compiled for a
+	 * client that does not draw them) */
+	if (hm_is_window_server()) {
+		hm_warm_up();
+	}
 	return self;
 }
 
@@ -7009,8 +7318,14 @@ HM_REFUSES_OUT_LOUD
 	HM_ONCE("a background GPU priority of %lu was asked for; remembered, not honoured, as the foreground one\n",
 		(unsigned long)priority);
 	_backgroundGPUPriority = priority;
+	_backgroundGPUPrioritySet = YES;
 	return YES;
 }
+
+/* whether this queue's work runs while RunningBoard denies the task the GPU: in iOS, when it was given a background
+ * priority other than 3 (3 is a new queue's, and IOGPUFamily turns it into BackgroundExecutionNotPermitted; report 23
+ * §2.5). Not honoured as a priority -- one ring -- only as the permission it is. */
+- (BOOL)hakiosRunsWhenDenied { return _backgroundGPUPrioritySet && _backgroundGPUPriority != 3; }
 
 - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority offset:(unsigned short)offset
 {
@@ -7246,8 +7561,11 @@ HM_REFUSES_OUT_LOUD
 	@synchronized (self) {
 		if (_error == nil && hakios_metal_cb_status(_cb) == HAKIOS_METAL_ERROR) {
 			NSString *why = [NSString stringWithUTF8String:hakios_metal_cb_error(_cb)];
+			/* (the one error with a code of its own so far: RunningBoard's denial, IOGPU's code 6) */
+			const NSInteger code = strcmp(hakios_metal_cb_error(_cb), HM_NOT_PERMITTED_BG) == 0 ? MTLCommandBufferErrorNotPermitted
+													  : MTLCommandBufferErrorInternal;
 
-			_error = [[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
+			_error = [[NSError errorWithDomain:MTLCommandBufferErrorDomain code:code
 						  userInfo:@{ NSLocalizedDescriptionKey: why != nil ? why : @"(no reason recorded)" }] retain];
 		}
 		return _error;
@@ -8598,6 +8916,16 @@ hm_completed(hakios_metal_cb *cb, void *context)
 	}
 	_committed = YES;
 	_committedAt = hm_now();
+	/* RunningBoard denies this task the GPU now (hm_gpu_denied_now): the buffer ends in NotPermitted, as in iOS, and
+	 * nothing of it reaches the GPU; it still completes, so its handlers run and its waiters return */
+	if (hm_gpu_denied_now() && ![_queue hakiosRunsWhenDenied]) {
+		static _Atomic unsigned long refused;
+
+		if (atomic_fetch_add(&refused, 1) == 0) {
+			hm_print("RunningBoard denies this process the GPU: its command buffers end in NotPermitted (said once)\n");
+		}
+		hakios_metal_cb_fail(_cb, HM_NOT_PERMITTED_BG);
+	}
 	if (ft != NULL) {
 		char label[300];
 
