@@ -115,6 +115,8 @@ a_ycbcr_slots_matrix_is_the_processors_conversion_within_one_step submits 0 word
 a_ycbcr_slot_is_converted_after_its_sample_and_filed_apart submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
        (no compiler in this build: tri_kill_fs was not compiled)
 a_fragment_stage_that_discards_says_so submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+       (no compiler in this build: tri_mvp_vs and tri_mvpx_vs were not compiled)
+the_matrix_vertex_stages_are_ones_cull_interprets_as_ir3_lists_them submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
 a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets submits 1 words 112 draws 0 loads 2 stream 0459b476d8d32e2f state 73d60166aefc2a51 names 4 94a18d98463af819
 an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 181 draws 0 loads 4 stream 514a751e163e70ec state 65ad89869881ce17 names 5 55c16b327fc26836
 a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 112 draws 0 loads 2 stream efb1320aababb718 state 73d60166aefc2a51 names 3 56e6c080795c4956
@@ -150,6 +152,14 @@ the_fake_refuses_a_zero_ibo_descriptor submits 2 words 274 draws 0 loads 6 strea
 a_dispatch_loads_the_ubo_descriptors_an_ldc_reads_through submits 2 words 234 draws 0 loads 4 stream 1c284906c094d544 state 01bfc3782cab1405 names 0 0000000000000000
 a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits 1 words 1130 draws 0 loads 3 stream 8dcbe08bc49a37d2 state 767fa2306040d214 names 4 bb062d7fae986371
 a_surface_textures_cpu_accesses_are_told_to_the_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+cull_decodes_the_position_instructions_as_mesa_writes_them submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+cull_region_is_what_is_left_of_a_rectangle submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+cull_works_out_positions_with_a_bound_on_the_gpus_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+cull_leaves_out_what_later_opaque_rectangles_cover_and_nothing_else submits 184 words 151386 draws 394 loads 1144 stream eca59cff83ba6366 state 2cb5dc277d7fe749 names 1074 052a7f5d697e30a8
+cull_follows_a_matrix_in_the_vertex_stage submits 11 words 7014 draws 18 loads 93 stream 84128f1e73027a0a state d6db8696bfdf1749 names 66 2394405c40f61666
+cull_puts_the_draws_back_when_their_bytes_change_before_the_commit submits 18 words 16186 draws 53 loads 168 stream b545d2d56b5cb77f state 9ed708fc8ae28e01 names 107 78421bf68d416624
+cull_keeps_the_picture_of_scenes_made_at_random submits 500 words 570590 draws 2792 loads 9454 stream 1e924ffb7dc07801 state 2a62705a81e5e673 names 3743 4b55cbd3950bd4fa
+cull_twins_each_change_a_picture submits 174 words 140660 draws 872 loads 2844 stream 0b0ac5ae4bd454e5 state dbd6c334a5dfa7a1 names 1190 aeae35a9d996541e
 a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submits 3 words 2895 draws 11 loads 22 stream 0b1b2ca465b80e3a state 09bde857f6d3d994 names 13 38f44a1414b10600
 a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 17db46b630d582d5 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
 a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 6c62378d52407e41 state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
